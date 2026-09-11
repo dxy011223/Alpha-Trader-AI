@@ -231,11 +231,14 @@ test("emits the files required by Sites packaging", async () => {
 test("provides installable PWA metadata and icons", async () => {
   const manifest = JSON.parse(await readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"));
   const index = await readFile(new URL("../index.html", import.meta.url), "utf8");
+  const serviceWorker = await readFile(new URL("../public/sw.js", import.meta.url), "utf8");
 
   assert.equal(manifest.start_url, "/app");
   assert.equal(manifest.display, "standalone");
   assert.match(index, /<meta name="description" content="安装 Alpha Trader AI，查看实时行情、K 线与 AI 决策分析。" \/>/);
   assert.match(index, /rel="manifest" href="\/manifest\.webmanifest"/);
+  assert.doesNotMatch(serviceWorker, /APP_SHELL\s*=\s*\[[^\]]*"\/app"/);
+  assert.match(serviceWorker, /caches\.match\("\/"\)/);
   assert.deepEqual(manifest.icons.slice(0, 2).map((icon) => icon.sizes), ["192x192", "512x512"]);
   await Promise.all([
     access(new URL("../public/icons/app-icon-192.png", import.meta.url)),

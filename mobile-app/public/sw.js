@@ -1,5 +1,6 @@
-const CACHE_NAME = "alpha-trader-ai-v2";
-const APP_SHELL = ["/", "/app", "/manifest.webmanifest", "/icons/app-icon.svg"];
+const CACHE_NAME = "alpha-trader-ai-v3";
+// 私有站点的后台预加载请求不会继承页面认证头，因此只缓存下载页公共外壳。
+const APP_SHELL = ["/", "/manifest.webmanifest", "/icons/app-icon.svg"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -34,6 +35,6 @@ self.addEventListener("fetch", (event) => {
         }
         return response;
       })
-      .catch(async () => (await caches.match(request)) || (await caches.match("/app")) || Response.error()),
+      .catch(async () => (await caches.match(request)) || (await caches.match("/")) || Response.error()),
   );
 });
