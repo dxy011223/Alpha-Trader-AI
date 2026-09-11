@@ -1,0 +1,9 @@
+{
+  "name": "alpha-trader-ai",
+  "private": true,
+  "version": "1.2.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/ensure-mobile-dependencies.mjs && npm run build:cloudflare --prefix mobile-app && node scripts/prepare-sites-root.mjs"
+  }
+}
