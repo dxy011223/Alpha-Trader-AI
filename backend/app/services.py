@@ -1,12 +1,19 @@
 import logging
+import math
+import statistics
 import time
+from typing import Literal
 
 import httpx
 
-from app.schemas import AnalysisRequest, AnalysisResponse, Candle, MarketSnapshot, NewsItem, PositionSizing, ReviewReport, WalletSnapshot
+from app.news_sources import fetch_live_news
+from app.schemas import AnalysisRequest, AnalysisResponse, Candle, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
 
 logger = logging.getLogger(__name__)
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+BINANCE_FUTURES_URL = "https://fapi.binance.com"
+OKX_API_URL = "https://www.okx.com"
+MarketPlatform = Literal["hyperliquid", "binance", "okx"]
 
 
 MARKETS = {
@@ -21,7 +28,7 @@ def get_market(symbol: str) -> MarketSnapshot | None:
     return MARKETS.get(symbol.upper())
 
 
-async def get_live_markets() -> list[MarketSnapshot]:
+async def _get_hyperliquid_markets() -> list[MarketSnapshot]:
     """单次读取全部永续合约市场，过滤已下架及无有效价格的品种。"""
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
@@ -47,6 +54,7 @@ async def get_live_markets() -> list[MarketSnapshot]:
                     funding_rate=float(context.get("funding") or 0) * 100,
                     open_interest=float(context.get("openInterest") or 0) * price,
                     source="live",
+                    platform="hyperliquid",
                 ))
             except (KeyError, ValueError, TypeError):
                 # 单个市场字段异常时继续扫描，不影响其余候选品种。
@@ -57,33 +65,210 @@ async def get_live_markets() -> list[MarketSnapshot]:
         return list(MARKETS.values())
 
 
-async def get_live_market(symbol: str) -> MarketSnapshot | None:
+async def _get_binance_markets() -> list[MarketSnapshot]:
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        ticker_response = await client.get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr")
+        funding_response = await client.get(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex")
+        ticker_response.raise_for_status()
+        funding_response.raise_for_status()
+    funding_by_symbol = {
+        str(item.get("symbol")): float(item.get("lastFundingRate") or 0) * 100
+        for item in funding_response.json()
+    }
+    markets = []
+    for item in ticker_response.json():
+        instrument = str(item.get("symbol") or "")
+        if not instrument.endswith("USDT"):
+            continue
+        try:
+            price = float(item["lastPrice"])
+            if price <= 0:
+                continue
+            change = float(item.get("priceChangePercent") or 0)
+            markets.append(MarketSnapshot(
+                symbol=instrument.removesuffix("USDT"),
+                price=price,
+                change_24h=change,
+                volume=float(item.get("quoteVolume") or 0),
+                volatility=abs(change),
+                funding_rate=funding_by_symbol.get(instrument, 0),
+                open_interest=0,
+                source="live",
+                platform="binance",
+            ))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return markets
+
+
+async def _get_okx_markets() -> list[MarketSnapshot]:
+    async with httpx.AsyncClient(timeout=6.0) as client:
+        ticker_response = await client.get(
+            f"{OKX_API_URL}/api/v5/market/tickers", params={"instType": "SWAP"}
+        )
+        interest_response = await client.get(
+            f"{OKX_API_URL}/api/v5/public/open-interest", params={"instType": "SWAP"}
+        )
+        ticker_response.raise_for_status()
+        interest_response.raise_for_status()
+    interest_by_instrument = {
+        str(item.get("instId")): float(item.get("oiCcy") or 0)
+        for item in interest_response.json().get("data", [])
+    }
+    markets = []
+    for item in ticker_response.json().get("data", []):
+        instrument = str(item.get("instId") or "")
+        if not instrument.endswith("-USDT-SWAP"):
+            continue
+        try:
+            price = float(item["last"])
+            if price <= 0:
+                continue
+            open_price = float(item.get("open24h") or price)
+            change = (price - open_price) / open_price * 100 if open_price else 0
+            markets.append(MarketSnapshot(
+                symbol=instrument.removesuffix("-USDT-SWAP"),
+                price=price,
+                change_24h=round(change, 4),
+                volume=float(item.get("volCcy24h") or 0) * price,
+                volatility=round(abs(change), 4),
+                funding_rate=0,
+                open_interest=interest_by_instrument.get(instrument, 0) * price,
+                source="live",
+                platform="okx",
+            ))
+        except (KeyError, ValueError, TypeError):
+            continue
+    return markets
+
+
+async def get_live_markets(platform: MarketPlatform = "hyperliquid") -> list[MarketSnapshot]:
+    """读取指定平台的全部永续合约市场。"""
+    try:
+        if platform == "binance":
+            return await _get_binance_markets()
+        if platform == "okx":
+            return await _get_okx_markets()
+        return await _get_hyperliquid_markets()
+    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+        logger.warning("%s 全市场行情获取失败，已回退到演示数据：%s", platform, exc)
+        return [market.model_copy(update={"platform": platform}) for market in MARKETS.values()]
+
+
+async def _get_binance_market(symbol: str) -> MarketSnapshot:
+    instrument = f"{symbol.upper()}USDT"
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        ticker_response = await client.get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr", params={"symbol": instrument})
+        funding_response = await client.get(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": instrument})
+        interest_response = await client.get(f"{BINANCE_FUTURES_URL}/fapi/v1/openInterest", params={"symbol": instrument})
+        for response in (ticker_response, funding_response, interest_response):
+            response.raise_for_status()
+    ticker = ticker_response.json()
+    funding = funding_response.json()
+    interest = interest_response.json()
+    price = float(ticker["lastPrice"])
+    return MarketSnapshot(
+        symbol=symbol.upper(),
+        price=price,
+        change_24h=float(ticker["priceChangePercent"]),
+        volatility=abs(float(ticker["priceChangePercent"])),
+        volume=float(ticker.get("quoteVolume") or 0),
+        funding_rate=float(funding.get("lastFundingRate") or 0) * 100,
+        open_interest=float(interest.get("openInterest") or 0) * price,
+        source="live",
+        platform="binance",
+    )
+
+
+async def _get_okx_market(symbol: str) -> MarketSnapshot:
+    instrument = f"{symbol.upper()}-USDT-SWAP"
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        ticker_response = await client.get(f"{OKX_API_URL}/api/v5/market/ticker", params={"instId": instrument})
+        funding_response = await client.get(f"{OKX_API_URL}/api/v5/public/funding-rate", params={"instId": instrument})
+        interest_response = await client.get(f"{OKX_API_URL}/api/v5/public/open-interest", params={"instId": instrument})
+        for response in (ticker_response, funding_response, interest_response):
+            response.raise_for_status()
+    ticker = ticker_response.json()["data"][0]
+    funding = funding_response.json()["data"][0]
+    interest = interest_response.json()["data"][0]
+    price = float(ticker["last"])
+    open_price = float(ticker.get("open24h") or price)
+    change = (price - open_price) / open_price * 100 if open_price else 0
+    return MarketSnapshot(
+        symbol=symbol.upper(),
+        price=price,
+        change_24h=round(change, 4),
+        volatility=round(abs(change), 4),
+        volume=float(ticker.get("volCcy24h") or 0) * price,
+        funding_rate=float(funding.get("fundingRate") or 0) * 100,
+        open_interest=float(interest.get("oiCcy") or 0) * price,
+        source="live",
+        platform="okx",
+    )
+
+
+async def get_live_market(symbol: str, platform: MarketPlatform = "hyperliquid") -> MarketSnapshot | None:
     """从全市场快照中读取指定品种，网络异常时保留核心币种演示数据。"""
     normalized_symbol = symbol.upper()
-    markets = await get_live_markets()
-    return next((market for market in markets if market.symbol == normalized_symbol), get_market(normalized_symbol))
+    try:
+        if platform == "binance":
+            return await _get_binance_market(normalized_symbol)
+        if platform == "okx":
+            return await _get_okx_market(normalized_symbol)
+        markets = await get_live_markets("hyperliquid")
+        return next((market for market in markets if market.symbol == normalized_symbol), get_market(normalized_symbol))
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+        logger.warning("%s 行情获取失败，已回退到演示数据：%s", platform, exc)
+        fallback = get_market(normalized_symbol)
+        return fallback.model_copy(update={"platform": platform}) if fallback else None
 
 
-async def get_candles(symbol: str, interval: str, limit: int) -> list[Candle]:
+async def get_candles(
+    symbol: str,
+    interval: str,
+    limit: int,
+    platform: MarketPlatform = "hyperliquid",
+) -> list[Candle]:
     interval_ms = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}[interval]
     end_time = int(time.time() * 1000)
-    payload = {"type": "candleSnapshot", "req": {"coin": symbol.upper(), "interval": interval, "startTime": end_time - interval_ms * limit, "endTime": end_time}}
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
-            response = await client.post(HYPERLIQUID_INFO_URL, json=payload)
+            if platform == "binance":
+                response = await client.get(
+                    f"{BINANCE_FUTURES_URL}/fapi/v1/klines",
+                    params={"symbol": f"{symbol.upper()}USDT", "interval": interval, "limit": limit},
+                )
+            elif platform == "okx":
+                okx_interval = {"1h": "1H", "4h": "4H", "1d": "1Dutc"}.get(interval, interval)
+                response = await client.get(
+                    f"{OKX_API_URL}/api/v5/market/candles",
+                    params={"instId": f"{symbol.upper()}-USDT-SWAP", "bar": okx_interval, "limit": min(limit, 300)},
+                )
+            else:
+                payload = {"type": "candleSnapshot", "req": {"coin": symbol.upper(), "interval": interval, "startTime": end_time - interval_ms * limit, "endTime": end_time}}
+                response = await client.post(HYPERLIQUID_INFO_URL, json=payload)
             response.raise_for_status()
-        return [Candle(open_time=item["t"], close_time=item["T"], open=float(item["o"]), high=float(item["h"]), low=float(item["l"]), close=float(item["c"]), volume=float(item["v"])) for item in response.json()]
-    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
-        logger.warning("K 线数据获取失败：%s", exc)
+        data = response.json()
+        if platform == "binance":
+            candles = [
+                Candle(open_time=item[0], close_time=item[6], open=float(item[1]), high=float(item[2]), low=float(item[3]), close=float(item[4]), volume=float(item[5]))
+                for item in data
+            ]
+        elif platform == "okx":
+            candles = [
+                Candle(open_time=int(item[0]), close_time=int(item[0]) + interval_ms - 1, open=float(item[1]), high=float(item[2]), low=float(item[3]), close=float(item[4]), volume=float(item[5]))
+                for item in data["data"]
+            ]
+        else:
+            candles = [Candle(open_time=item["t"], close_time=item["T"], open=float(item["o"]), high=float(item["h"]), low=float(item["l"]), close=float(item["c"]), volume=float(item["v"])) for item in data]
+        return sorted(candles, key=lambda candle: candle.open_time)
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as exc:
+        logger.warning("%s K 线数据获取失败：%s", platform, exc)
         return []
 
 
 def get_news() -> list[NewsItem]:
-    return [
-        NewsItem(id=1, title="美联储官员释放谨慎降息信号", source="Macro Wire", published_at="12 分钟前", impact=4, assets=["BTC", "NASDAQ"], direction="bullish", analysis="流动性预期改善，中期偏利多风险资产。"),
-        NewsItem(id=2, title="现货比特币 ETF 连续三个交易日净流入", source="Crypto Brief", published_at="38 分钟前", impact=4, assets=["BTC"], direction="bullish", analysis="机构买盘提供支撑，但短线涨幅扩大后需警惕获利回吐。"),
-        NewsItem(id=3, title="亚洲市场风险偏好小幅回落", source="Global Markets", published_at="1 小时前", impact=2, assets=["ETH", "SOL"], direction="neutral", analysis="影响有限，尚未改变主要趋势结构。"),
-    ]
+    return fetch_live_news()
 
 
 def round_price(value: float) -> float:
@@ -91,6 +276,92 @@ def round_price(value: float) -> float:
     absolute = abs(value)
     digits = 2 if absolute >= 1_000 else 4 if absolute >= 1 else 6 if absolute >= 0.01 else 8
     return round(value, digits)
+
+
+def _ema(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    value = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
+    for current in values[period:]:
+        value = (current - value) * multiplier + value
+    return value
+
+
+def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators:
+    """只使用已完成 K 线生成企划要求的趋势、动量和波动指标。"""
+    closes = [item.close for item in candles]
+    ema20 = _ema(closes, 20)
+    ema50 = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+
+    rsi14 = None
+    if len(closes) >= 15:
+        changes = [current - previous for previous, current in zip(closes[-15:-1], closes[-14:])]
+        average_gain = sum(max(change, 0) for change in changes) / 14
+        average_loss = sum(max(-change, 0) for change in changes) / 14
+        rsi14 = 100 if average_loss == 0 else 100 - (100 / (1 + average_gain / average_loss))
+
+    ema12 = _ema(closes, 12)
+    ema26 = _ema(closes, 26)
+    macd = ema12 - ema26 if ema12 is not None and ema26 is not None else None
+    macd_series: list[float] = []
+    if len(closes) >= 26:
+        for end in range(26, len(closes) + 1):
+            fast = _ema(closes[:end], 12)
+            slow = _ema(closes[:end], 26)
+            if fast is not None and slow is not None:
+                macd_series.append(fast - slow)
+    macd_signal = _ema(macd_series, 9)
+
+    atr14 = None
+    if len(candles) >= 15:
+        true_ranges = []
+        for previous, current in zip(candles[-15:-1], candles[-14:]):
+            true_ranges.append(max(
+                current.high - current.low,
+                abs(current.high - previous.close),
+                abs(current.low - previous.close),
+            ))
+        atr14 = sum(true_ranges) / 14
+
+    realized_volatility = None
+    positive_closes = [value for value in closes[-31:] if value > 0]
+    if len(positive_closes) >= 3:
+        returns = [math.log(current / previous) for previous, current in zip(positive_closes, positive_closes[1:])]
+        realized_volatility = statistics.pstdev(returns) * math.sqrt(len(returns)) * 100
+
+    last_close = closes[-1] if closes else 0
+    return TechnicalIndicators(
+        ema20=round_price(ema20) if ema20 is not None else None,
+        ema50=round_price(ema50) if ema50 is not None else None,
+        ema200=round_price(ema200) if ema200 is not None else None,
+        rsi14=round(rsi14, 2) if rsi14 is not None else None,
+        macd=round_price(macd) if macd is not None else None,
+        macd_signal=round_price(macd_signal) if macd_signal is not None else None,
+        macd_histogram=round_price(macd - macd_signal) if macd is not None and macd_signal is not None else None,
+        atr14=round_price(atr14) if atr14 is not None else None,
+        atr_percent=round(atr14 / last_close * 100, 4) if atr14 is not None and last_close > 0 else None,
+        realized_volatility=round(realized_volatility, 4) if realized_volatility is not None else None,
+    )
+
+
+def build_execution_levels(
+    market: MarketSnapshot, direction: str, risk: str
+) -> tuple[list[float], float, list[float]]:
+    """按方向生成价格边界，确保空头止损在上、止盈在下。"""
+    stop_distance = {"low": 0.020, "medium": 0.026, "high": 0.035}.get(risk, 0.035)
+    if direction == "SHORT":
+        return (
+            [round_price(market.price * 1.003), round_price(market.price * 1.008)],
+            round_price(market.price * (1 + stop_distance)),
+            [round_price(market.price * 0.965), round_price(market.price * 0.928)],
+        )
+    return (
+        [round_price(market.price * 0.992), round_price(market.price * 0.997)],
+        round_price(market.price * (1 - stop_distance)),
+        [round_price(market.price * 1.035), round_price(market.price * 1.072)],
+    )
 
 
 def calculate_position_sizing(
@@ -155,12 +426,31 @@ def calculate_position_sizing(
     )
 
 
-def analyze_market(payload: AnalysisRequest, market: MarketSnapshot | None = None, total_amount: float = 10_000) -> AnalysisResponse:
+def analyze_market(
+    payload: AnalysisRequest,
+    market: MarketSnapshot | None = None,
+    total_amount: float = 10_000,
+    indicators: TechnicalIndicators | None = None,
+    strategy_version: str = "v1",
+    strategy_parameters: dict | None = None,
+) -> AnalysisResponse:
     market = market or MARKETS[payload.symbol.upper()]
     symbol = market.symbol
     # 五维权重与企划保持一致，总分用于判断机会质量，方向由价格动能单独判断。
-    trend_score = max(0, min(30, round(18 + market.change_24h * 2)))
-    structure_score = max(0, min(25, round(17 + market.change_24h - market.volatility * 0.8)))
+    trend_score = max(0, min(30, round(18 + abs(market.change_24h) * 2)))
+    structure_score = max(0, min(25, round(17 + abs(market.change_24h) - market.volatility * 0.8)))
+    indicator_direction: Literal["LONG", "SHORT", "WAIT"] = "WAIT"
+    if indicators and all(value is not None for value in (indicators.ema20, indicators.ema50, indicators.ema200)):
+        if indicators.ema20 > indicators.ema50 > indicators.ema200:
+            indicator_direction = "LONG"
+            trend_score = 30
+        elif indicators.ema20 < indicators.ema50 < indicators.ema200:
+            indicator_direction = "SHORT"
+            trend_score = 30
+        else:
+            trend_score = min(trend_score, 20)
+        if indicators.rsi14 is not None:
+            structure_score = max(8, min(25, round(25 - abs(indicators.rsi14 - 50) * 0.25)))
     capital_score = max(0, min(20, round(15 - abs(market.funding_rate) * 100)))
     macro_score = 10
     news_score = 7
@@ -172,12 +462,15 @@ def analyze_market(payload: AnalysisRequest, market: MarketSnapshot | None = Non
         "news": news_score,
     }
     score = sum(score_breakdown.values())
-    direction = "LONG" if market.change_24h >= 1 else "SHORT" if market.change_24h <= -1 else "WAIT"
-    if score < 50:
+    direction = indicator_direction
+    if direction == "WAIT":
+        direction = "LONG" if market.change_24h >= 1 else "SHORT" if market.change_24h <= -1 else "WAIT"
+    # 企划将 50–69 分定义为观察区，只有 70 分以上才生成可执行方向。
+    min_trade_score = max(70, min(80, int((strategy_parameters or {}).get("min_trade_score", 70))))
+    if score < min_trade_score:
         direction = "WAIT"
     risk = "high" if market.volatility > 6 else "medium" if market.volatility > 3 else "low"
-    entry_range = [round_price(market.price * 0.992), round_price(market.price * 0.997)]
-    stop_loss = round_price(market.price * 0.974)
+    entry_range, stop_loss, take_profit = build_execution_levels(market, direction, risk)
     leverage = 3 if risk == "medium" else 2
     position_sizing = calculate_position_sizing(
         total_amount=total_amount,
@@ -197,23 +490,26 @@ def analyze_market(payload: AnalysisRequest, market: MarketSnapshot | None = Non
         score_breakdown=score_breakdown,
         entry_range=entry_range,
         stop_loss=stop_loss,
-        take_profit=[round_price(market.price * 1.035), round_price(market.price * 1.072)],
+        take_profit=take_profit,
         leverage=leverage,
         risk=risk,
         position_sizing=position_sizing,
+        indicators=indicators,
         reasons=[
             f"24 小时涨跌 {market.change_24h:.2f}%，趋势维度获得 {trend_score}/30 分",
             f"当前波动率 {market.volatility:.2f}%，技术结构维度获得 {structure_score}/25 分",
             f"资金费率 {market.funding_rate:.4f}%，资金维度获得 {capital_score}/20 分",
-            "宏观与新闻暂未出现否决性风险，重大事件发生时需要重新评估",
+            (
+                f"EMA20/50/200 为 {indicators.ema20}/{indicators.ema50}/{indicators.ema200}，"
+                f"RSI14 为 {indicators.rsi14}，ATR 占比 {indicators.atr_percent}%"
+                if indicators else "K 线指标暂不可用，本次仅使用市场快照评分"
+            ),
+            f"策略版本 {strategy_version}，当前可交易阈值 {min_trade_score} 分",
         ],
         disclaimer="仅供研究与辅助决策，不构成投资建议；系统不会自动下单。",
         source=market.source,
+        platform=market.platform,
     )
-
-
-def get_wallet(address: str) -> WalletSnapshot:
-    return WalletSnapshot(address=address, equity=24380.62, available_balance=18240.17, unrealized_pnl=428.36, positions=[{"symbol": "BTC-PERP", "direction": "LONG", "size": 0.072, "entry_price": 79240.0, "mark_price": 82437.2, "leverage": 3, "pnl": 230.2}], history=[])
 
 
 async def get_live_wallet(address: str) -> WalletSnapshot:
@@ -232,13 +528,62 @@ async def get_live_wallet(address: str) -> WalletSnapshot:
             available_balance=float(state.get("withdrawable") or 0),
             unrealized_pnl=sum(float(item.get("unrealizedPnl") or 0) for item in positions),
             positions=positions,
-            history=history_response.json()[:50],
+            history=history_response.json()[:100],
             source="live",
+            platform="hyperliquid",
         )
     except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
-        logger.warning("钱包数据获取失败，已回退到演示数据：%s", exc)
-        return get_wallet(address)
+        logger.warning("Hyperliquid 钱包数据获取失败：%s", exc)
+        return WalletSnapshot(
+            address=address,
+            equity=0,
+            available_balance=0,
+            unrealized_pnl=0,
+            positions=[],
+            history=[],
+            source="unavailable",
+            error="Hyperliquid 数据暂时不可用",
+            platform="hyperliquid",
+        )
 
 
-def create_review() -> ReviewReport:
-    return ReviewReport(period="近 100 次决策", total=100, correct=63, incorrect=37, win_rate=63.0, findings=["突破策略在高波动环境下胜率下降", "高资金费率环境追多的回撤更大"], adjustments=["降低突破策略权重 15%", "提高资金指标权重 10%"])
+async def get_user_fills_by_time(address: str, start_time: int) -> list[dict]:
+    """读取决策开始后的真实成交，供完成交易时结算使用。"""
+    try:
+        end_time = int(time.time() * 1000)
+        cursor = start_time
+        fills: list[dict] = []
+        seen: set[tuple] = set()
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            # 官方仅保留最近 10,000 条成交；最多读取 20 页，避免异常响应导致死循环。
+            for _ in range(20):
+                response = await client.post(
+                    HYPERLIQUID_INFO_URL,
+                    json={
+                        "type": "userFillsByTime",
+                        "user": address,
+                        "startTime": cursor,
+                        "endTime": end_time,
+                        "aggregateByTime": True,
+                    },
+                )
+                response.raise_for_status()
+                page = response.json()
+                if not isinstance(page, list) or not page:
+                    break
+                for fill in page:
+                    key = (
+                        fill.get("tid"), fill.get("hash"), fill.get("time"),
+                        fill.get("coin"), fill.get("px"), fill.get("sz"), fill.get("side"),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        fills.append(fill)
+                last_time = max(int(fill.get("time") or 0) for fill in page)
+                if last_time < cursor or last_time >= end_time:
+                    break
+                cursor = last_time + 1
+        return sorted(fills, key=lambda fill: int(fill.get("time") or 0))
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        logger.warning("Hyperliquid 成交历史获取失败：%s", exc)
+        return []

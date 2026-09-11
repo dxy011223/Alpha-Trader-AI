@@ -1,6 +1,7 @@
+from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class MarketSnapshot(BaseModel):
@@ -11,7 +12,9 @@ class MarketSnapshot(BaseModel):
     volatility: float
     funding_rate: float
     open_interest: float
+    long_short_ratio: float | None = None
     source: Literal["live", "demo"] = "demo"
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
 
 
 class Candle(BaseModel):
@@ -39,11 +42,13 @@ class NewsArchiveResponse(BaseModel):
     date: str
     total: int
     items: list[NewsItem]
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
 
 
 class AnalysisRequest(BaseModel):
     symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9]+$")
     timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"] = "4h"
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
 
 
 class ScoreBreakdown(BaseModel):
@@ -65,6 +70,19 @@ class PositionSizing(BaseModel):
     capped: bool
 
 
+class TechnicalIndicators(BaseModel):
+    ema20: float | None = None
+    ema50: float | None = None
+    ema200: float | None = None
+    rsi14: float | None = None
+    macd: float | None = None
+    macd_signal: float | None = None
+    macd_histogram: float | None = None
+    atr14: float | None = None
+    atr_percent: float | None = None
+    realized_volatility: float | None = None
+
+
 class AnalysisResponse(BaseModel):
     symbol: str
     instrument: str
@@ -78,9 +96,13 @@ class AnalysisResponse(BaseModel):
     leverage: int
     risk: Literal["low", "medium", "high"]
     position_sizing: PositionSizing
+    indicators: TechnicalIndicators | None = None
     reasons: list[str]
     disclaimer: str
     source: Literal["live", "demo"] = "demo"
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
+    analysis_engine: Literal["openai", "rules"] = "rules"
+    analysis_model: str | None = None
 
 
 class OpportunityScanResponse(BaseModel):
@@ -88,6 +110,8 @@ class OpportunityScanResponse(BaseModel):
     eligible_markets: int
     updated_at: str
     opportunities: list[AnalysisResponse]
+    scan_source: Literal["live_scan", "scheduled_cache"] = "live_scan"
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
 
 
 class CapitalSettingsUpdate(BaseModel):
@@ -106,14 +130,151 @@ class WalletSnapshot(BaseModel):
     unrealized_pnl: float
     positions: list[dict]
     history: list[dict]
-    source: Literal["live", "demo"] = "demo"
+    source: Literal["live", "unavailable"] = "unavailable"
+    error: str | None = None
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
 
 
-class ReviewReport(BaseModel):
-    period: str
-    total: int
-    correct: int
-    incorrect: int
-    win_rate: float
+class WalletSettingsUpdate(BaseModel):
+    address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+
+
+class WalletSettingsResponse(WalletSettingsUpdate):
+    updated_at: str
+
+
+class PlatformCredentialUpdate(BaseModel):
+    api_key: SecretStr = Field(min_length=4, max_length=256)
+    secret_key: SecretStr = Field(min_length=8, max_length=256)
+    passphrase: SecretStr | None = Field(default=None, min_length=1, max_length=256)
+
+
+class PlatformCredentialResponse(BaseModel):
+    platform: Literal["binance", "okx"]
+    configured: bool
+    api_key_hint: str | None = None
+    updated_at: datetime | None = None
+
+
+class ExecutionCreate(BaseModel):
+    analysis: AnalysisResponse
+    timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"]
+    total_amount: float = Field(gt=0, le=1_000_000_000)
+
+
+class DecisionRecordResponse(BaseModel):
+    id: int
+    status: Literal["active", "completed", "cancelled"]
+    analysis: AnalysisResponse
+    timeframe: str
+    total_amount: float
+    allocated_amount: float
+    started_at: datetime
+    completed_at: datetime | None = None
+
+
+class PositionRecordResponse(BaseModel):
+    id: int
+    decision_id: int
+    wallet_address: str | None
+    symbol: str
+    direction: Literal["LONG", "SHORT"]
+    planned_entry: float
+    planned_size: float
+    leverage: int
+    margin_amount: float
+    position_value: float
+    stop_loss: float
+    take_profit: list[float]
+    status: Literal["open", "completed", "cancelled"]
+    created_at: datetime
+    closed_at: datetime | None = None
+
+
+class ExecutionStateResponse(BaseModel):
+    decision: DecisionRecordResponse
+    position: PositionRecordResponse
+
+
+class PositionMonitorResponse(BaseModel):
+    position_id: int
+    decision_id: int
+    symbol: str
+    platform: Literal["hyperliquid", "binance", "okx"]
+    action: Literal["HOLD", "REDUCE", "EXIT", "ADJUST_SL"]
+    current_price: float
+    unrealized_pnl: float
+    reason: str
+    updated_at: datetime
+
+
+class CompletedTradeResponse(BaseModel):
+    id: int
+    decision_id: int
+    position_id: int
+    wallet_address: str
+    symbol: str
+    direction: Literal["LONG", "SHORT"]
+    entry_price: float
+    exit_price: float
+    size: float
+    fee: float
+    gross_pnl: float
+    net_pnl: float
+    pnl_percent: float
+    entry_source: Literal["hyperliquid", "binance", "okx", "plan"]
+    exit_source: Literal["hyperliquid", "binance", "okx"]
+    closed_at: datetime
+    analysis: AnalysisResponse
+    timeframe: str
+    started_at: datetime
+    allocated_amount: float
+    platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
+
+
+class ReviewRecordResponse(BaseModel):
+    id: int
+    trade_id: int | None
+    review_type: Literal["trade", "daily"]
+    review_date: date
+    result: Literal["win", "loss", "breakeven", "no_trades"]
+    summary: str
     findings: list[str]
     adjustments: list[str]
+    metrics: dict
+    created_at: datetime
+
+
+class CompletionResponse(BaseModel):
+    trade: CompletedTradeResponse
+    review: ReviewRecordResponse
+
+
+class SimulatedActiveTradePayload(BaseModel):
+    id: int
+    analysis: AnalysisResponse
+    timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"]
+    entryPrice: float = Field(gt=0)
+    size: float = Field(gt=0)
+    allocatedAmount: float = Field(gt=0)
+    latestPrice: float = Field(gt=0)
+    unrealizedPnl: float
+    startedAt: int = Field(gt=0)
+
+
+class SimulatedCompletedTradePayload(CompletedTradeResponse):
+    is_simulated: Literal[True] = True
+    exit_reason: Literal["take_profit", "stop_loss"]
+
+
+class SimulationWalletUpdate(BaseModel):
+    enabled: bool = False
+    balance: float = Field(default=1_000, ge=0, le=1_000_000_000)
+    activeTrade: SimulatedActiveTradePayload | None = None
+    history: list[SimulatedCompletedTradePayload] = Field(default_factory=list, max_length=500)
+
+
+class SimulationWalletResponse(SimulationWalletUpdate):
+    client_id: str
+    platform: Literal["hyperliquid", "binance", "okx"]
+    updated_at: datetime

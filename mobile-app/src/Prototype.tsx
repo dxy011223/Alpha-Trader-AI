@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityLogIcon,
   BarChartIcon,
@@ -6,6 +6,7 @@ import {
   BookmarkIcon,
   ChevronRightIcon,
   FileTextIcon,
+  GearIcon,
   LockClosedIcon,
   MagicWandIcon,
   PieChartIcon,
@@ -23,42 +24,157 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import {
+  cancelExecution,
+  completePosition,
+  createExecution,
+  getApiAccessToken,
   loadAnalysis,
+  loadActiveExecutions,
   loadCandles,
   loadCapitalSettings,
+  loadCompletedTrades,
   loadMarket,
   loadNews,
   loadOpportunities,
+  loadPlatformAccount,
+  loadPlatformCredentialStatus,
+  loadPositionMonitors,
+  loadReviews,
+  loadSimulationWallet,
+  loadWallet,
+  loadWalletSettings,
   saveCapitalSettings,
+  savePlatformCredentials,
+  saveSimulationWallet,
+  saveWalletSettings,
+  setApiAccessToken,
   type AnalysisResponse,
   type AssetSymbol,
   type Candle,
+  type CompletedTradeRecord,
   type MarketInterval,
+  type MarketPlatform,
   type MarketSnapshot,
   type NewsItem,
+  type PositionMonitor,
+  type ReviewRecord,
+  type WalletSnapshot,
 } from "./alphaApi";
 import { BottomSheet, KeyboardInput, MobileScroll, useKeyboard } from "./mobile";
+import DownloadLanding from "./DownloadLanding";
+import {
+  DEFAULT_SIMULATION_BALANCE,
+  SIMULATION_WALLETS_KEY,
+  closeSimulatedTradeIfTriggered,
+  createDefaultSimulationWallet,
+  getSimulationClientId,
+  hasSimulationData,
+  openSimulatedTrade,
+  restoreSimulationWallet,
+  restoreSimulationWalletBook,
+  simulationPlatforms,
+  updateSimulatedTrade,
+  type SimulatedCompletedTrade,
+  type SimulatedTrade,
+  type SimulationWalletBook,
+  type SimulationWalletState,
+} from "./simulationTrading";
 import "./prototype.css";
 
 type TabId = "market" | "decision" | "news" | "positions" | "review";
 type DataState = "loading" | "live" | "demo" | "offline";
 type RemoteState = "idle" | "loading" | "ready" | "offline";
+type SimulationSyncState = "loading" | "saving" | "synced" | "offline";
 type MarketMode = "free" | "decision";
+const marketPlatformLabels: Record<MarketPlatform, string> = {
+  hyperliquid: "Hyperliquid",
+  binance: "Binance 永续",
+  okx: "OKX 永续",
+};
+type BrowserWalletProvider = {
+  request: (payload: { method: string; params?: unknown[] }) => Promise<unknown>;
+};
 type MarketSelection = { symbol: AssetSymbol; timeframe: MarketInterval };
 type DecisionMarketSelection = MarketSelection & {
   score: number;
   direction: AnalysisResponse["direction"];
 };
 type LockedDecision = {
+  decisionId: number;
+  positionId: number;
   analysis: AnalysisResponse;
   timeframe: MarketInterval;
   startedAt: number;
   totalAmount: number;
   allocatedAmount: number;
 };
-type CompletedTrade = LockedDecision & {
-  completedAt: number;
-};
+
+async function connectWithWalletConnect(projectId: string): Promise<string> {
+  const [{ createAppKit }, { arbitrum }] = await Promise.all([
+    import("@reown/appkit"),
+    import("@reown/appkit/networks"),
+  ]);
+  const modal = createAppKit({
+    projectId,
+    networks: [arbitrum],
+    defaultNetwork: arbitrum,
+    metadata: {
+      name: "Alpha Trader AI",
+      description: "只读市场分析与交易复盘",
+      url: window.location.origin,
+      icons: [`${window.location.origin}/icons/icon-192.png`],
+    },
+    themeMode: "dark",
+    enableWalletConnect: true,
+    features: { analytics: false, email: false, socials: false },
+  });
+  const connectedAddress = modal.getAddress("eip155");
+  if (connectedAddress) return connectedAddress;
+
+  return new Promise<string>((resolve, reject) => {
+    let opened = false;
+    let unsubscribeAccount: () => void = () => undefined;
+    let unsubscribeState: () => void = () => undefined;
+    const finish = (address?: string) => {
+      unsubscribeAccount();
+      unsubscribeState();
+      if (address) resolve(address);
+      else reject(new Error("钱包连接已取消"));
+    };
+    unsubscribeAccount = modal.subscribeAccount((account) => {
+      if (account.isConnected && account.address) finish(account.address);
+    }, "eip155");
+    unsubscribeState = modal.subscribeState((state) => {
+      if (state.open) opened = true;
+      else if (opened && !modal.getAddress("eip155")) finish();
+    });
+    void modal.open({ view: "Connect", namespace: "eip155" }).catch(() => finish());
+  });
+}
+
+function executionToLockedDecision(state: import("./alphaApi").ExecutionState): LockedDecision {
+  return {
+    decisionId: state.decision.id,
+    positionId: state.position.id,
+    analysis: state.decision.analysis,
+    timeframe: state.decision.timeframe,
+    startedAt: new Date(state.decision.started_at).getTime(),
+    totalAmount: state.decision.total_amount,
+    allocatedAmount: state.decision.allocated_amount,
+  };
+}
+
+function simulatedTradeToLockedDecision(trade: SimulatedTrade): LockedDecision {
+  return {
+    decisionId: trade.id,
+    positionId: trade.id,
+    analysis: trade.analysis,
+    timeframe: trade.timeframe,
+    startedAt: trade.startedAt,
+    totalAmount: trade.allocatedAmount,
+    allocatedAmount: trade.allocatedAmount,
+  };
+}
 
 const assets: Record<AssetSymbol, { pair: string; price: string; delta: string; regime: string }> = {
   BTC: { pair: "BTC/USDT", price: "114,320.5", delta: "+2.13%", regime: "温和上涨" },
@@ -226,10 +342,23 @@ const dataStateLabel: Record<DataState, string> = {
   offline: "后端未连接",
 };
 
-function AppHeader({ dataState }: { dataState: DataState }) {
+function AppHeader({
+  dataState,
+  platform,
+  simulationEnabled,
+  onOpenSettings,
+}: {
+  dataState: DataState;
+  platform: MarketPlatform;
+  simulationEnabled: boolean;
+  onOpenSettings: () => void;
+}) {
   return (
     <header className="brand-header">
-      <div>
+      <button className="platform-settings-trigger" type="button" aria-label="行情平台设置" onClick={onOpenSettings}>
+        <GearIcon />
+      </button>
+      <div className="brand-copy">
         <strong><span>Alpha</span> Trader AI</strong>
         <p>用数据，看更远的市场</p>
       </div>
@@ -238,8 +367,8 @@ function AppHeader({ dataState }: { dataState: DataState }) {
         <span>专注 · 理性 · 长期</span>
       </div>
       <div className="readonly-banner">
-        <span><LockClosedIcon /> 只读模式 · 不会自动下单</span>
-        <em className={`source-status ${dataState}`}>{dataStateLabel[dataState]}</em>
+        <span><LockClosedIcon /> {simulationEnabled ? "模拟交易 · 不会真实下单" : "只读模式 · 不会自动下单"}</span>
+        <em className={`source-status ${dataState}`}>{marketPlatformLabels[platform]} · {dataStateLabel[dataState]}</em>
       </div>
     </header>
   );
@@ -268,6 +397,13 @@ function formatMoney(value: number) {
   }).format(value)} USDT`;
 }
 
+function formatUsdc(value: number) {
+  return `${new Intl.NumberFormat("zh-CN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(value)} USDC`;
+}
+
 function formatDecisionTime(timestamp: number) {
   return new Date(timestamp).toLocaleString("zh-CN", {
     month: "2-digit",
@@ -285,6 +421,10 @@ function shiftArchiveDate(value: string, offset: number) {
 function formatCompact(value?: number) {
   if (value === undefined) return "--";
   return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 2 }).format(value);
+}
+
+function isSimulatedTrade(trade: CompletedTradeRecord): trade is SimulatedCompletedTrade {
+  return "is_simulated" in trade && trade.is_simulated === true;
 }
 
 function getMarketRegime(snapshot: MarketSnapshot | null, fallback: string) {
@@ -307,7 +447,7 @@ const riskLabels: Record<AnalysisResponse["risk"], string> = {
   high: "高",
 };
 
-function DecisionMarketChartCard({ selection }: { selection: DecisionMarketSelection }) {
+function DecisionMarketChartCard({ selection, platform }: { selection: DecisionMarketSelection; platform: MarketPlatform }) {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [state, setState] = useState<"loading" | "ready" | "offline">("loading");
 
@@ -317,7 +457,7 @@ function DecisionMarketChartCard({ selection }: { selection: DecisionMarketSelec
     setCandles([]);
 
     const refresh = () => {
-      loadCandles(selection.symbol, selection.timeframe, 80, controller.signal)
+      loadCandles(selection.symbol, selection.timeframe, 80, controller.signal, platform)
         .then((nextCandles) => {
           setCandles(nextCandles);
           setState("ready");
@@ -333,7 +473,7 @@ function DecisionMarketChartCard({ selection }: { selection: DecisionMarketSelec
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [selection.symbol, selection.timeframe]);
+  }, [platform, selection.symbol, selection.timeframe]);
 
   return (
     <article className="decision-market-chart-card">
@@ -359,6 +499,14 @@ function MarketScreen({
   freeSymbol,
   onFreeSymbolChange,
   decisionSelections,
+  platform,
+  onPlatformChange,
+  simulationWallet,
+  simulationSyncState,
+  onSimulationEnabledChange,
+  onResetSimulationWallet,
+  apiAccessToken,
+  onApiAccessTokenChange,
 }: {
   openDetails: (analysis: AnalysisResponse | null, symbol: AssetSymbol, timeframe: MarketInterval) => void;
   mode: MarketMode;
@@ -366,6 +514,14 @@ function MarketScreen({
   freeSymbol: AssetSymbol;
   onFreeSymbolChange: (symbol: AssetSymbol) => void;
   decisionSelections: DecisionMarketSelection[];
+  platform: MarketPlatform;
+  onPlatformChange: (platform: MarketPlatform) => void;
+  simulationWallet: SimulationWalletState;
+  simulationSyncState: SimulationSyncState;
+  onSimulationEnabledChange: (enabled: boolean) => void;
+  onResetSimulationWallet: () => void;
+  apiAccessToken: string;
+  onApiAccessTokenChange: (token: string) => void;
 }) {
   const keyboard = useKeyboard();
   const [symbolDraft, setSymbolDraft] = useState(freeSymbol);
@@ -374,6 +530,8 @@ function MarketScreen({
   const [candles, setCandles] = useState<Candle[]>([]);
   const [dataState, setDataState] = useState<DataState>("loading");
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState(apiAccessToken);
   const symbol = freeSymbol;
   const selected = assets[symbol] ?? {
     pair: `${symbol}/USDT`,
@@ -396,8 +554,8 @@ function MarketScreen({
 
     const refreshMarket = () => {
       Promise.all([
-        loadMarket(symbol, controller.signal),
-        loadCandles(symbol, timeframe, 80, controller.signal),
+        loadMarket(symbol, controller.signal, platform),
+        loadCandles(symbol, timeframe, 80, controller.signal, platform),
       ]).then(([nextSnapshot, nextCandles]) => {
         setSnapshot(nextSnapshot);
         setCandles(nextCandles);
@@ -415,7 +573,7 @@ function MarketScreen({
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [mode, symbol, timeframe]);
+  }, [mode, platform, symbol, timeframe]);
 
   useEffect(() => {
     if (mode !== "free") return;
@@ -423,7 +581,7 @@ function MarketScreen({
     setAnalysis(null);
 
     const refreshAnalysis = () => {
-      loadAnalysis(symbol, timeframe, controller.signal)
+      loadAnalysis(symbol, timeframe, controller.signal, platform)
         .then(setAnalysis)
         .catch(() => {
           if (controller.signal.aborted) return;
@@ -437,7 +595,7 @@ function MarketScreen({
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [mode, symbol, timeframe]);
+  }, [mode, platform, symbol, timeframe]);
 
   const direction = analysis?.direction ?? "WAIT";
   const confidence = analysis?.confidence ?? 68;
@@ -455,7 +613,90 @@ function MarketScreen({
 
   return (
     <>
-      <AppHeader dataState={dataState} />
+      <AppHeader
+        dataState={dataState}
+        platform={platform}
+        simulationEnabled={simulationWallet.enabled}
+        onOpenSettings={() => setSettingsOpen(true)}
+      />
+      <BottomSheet
+        open={settingsOpen}
+        onOpenChange={setSettingsOpen}
+        title="设置"
+        description="管理行情来源与模拟交易；模拟数据同步到数据库，不读取真实钱包交易历史"
+      >
+        <div className="settings-section-title"><strong>后端访问</strong><span>{apiAccessToken ? "已授权" : "未授权"}</span></div>
+        <div className="api-token-settings-card">
+          <KeyboardInput
+            aria-label="个人后端访问令牌"
+            type="password"
+            value={tokenDraft}
+            placeholder="输入 OWNER_API_TOKEN"
+            onChange={(event) => setTokenDraft(event.target.value)}
+          />
+          <button
+            type="button"
+            onClick={() => {
+              const nextToken = tokenDraft.trim();
+              setApiAccessToken(nextToken);
+              onApiAccessTokenChange(nextToken);
+            }}
+          >
+            {tokenDraft.trim() ? "保存本次会话令牌" : "清除令牌"}
+          </button>
+          <small>令牌只保存在当前 App 会话中，不写入安装包或构建配置。</small>
+        </div>
+        <div className="settings-section-title"><strong>模拟交易</strong><span>{simulationSyncState === "synced" ? "数据库已同步" : simulationSyncState === "offline" ? "离线缓存" : simulationSyncState === "saving" ? "正在保存" : "正在读取"}</span></div>
+        <div className={`simulation-settings-card ${simulationWallet.enabled ? "active" : ""}`}>
+          <div>
+            <strong>自动模拟交易</strong>
+            <span>决策开始后按计划入场，触发首个止盈或止损后自动结算</span>
+          </div>
+          <button
+            className="simulation-toggle"
+            type="button"
+            role="switch"
+            aria-checked={simulationWallet.enabled}
+            disabled={simulationWallet.activeTrade !== null}
+            onClick={() => onSimulationEnabledChange(!simulationWallet.enabled)}
+          >
+            <i />
+            {simulationWallet.enabled ? "已开启" : "已关闭"}
+          </button>
+          <div className="simulation-wallet-summary">
+            <span>模拟钱包余额</span>
+            <strong>{formatUsdc(simulationWallet.balance)}</strong>
+            <small>{simulationWallet.activeTrade ? "当前平台有模拟交易执行中，可切换平台，暂不可关闭或重置" : `默认 ${DEFAULT_SIMULATION_BALANCE} USDC · 不影响真实资产`}</small>
+          </div>
+          <button
+            className="simulation-reset-button"
+            type="button"
+            disabled={simulationWallet.activeTrade !== null}
+            onClick={onResetSimulationWallet}
+          >
+            重置为 1000 USDC
+          </button>
+        </div>
+        <div className="settings-section-title"><strong>行情平台</strong><span>公开永续合约行情</span></div>
+        <div className="platform-option-list" role="radiogroup" aria-label="选择行情平台">
+          {(Object.keys(marketPlatformLabels) as MarketPlatform[]).map((item) => (
+            <button
+              className={platform === item ? "active" : ""}
+              type="button"
+              role="radio"
+              aria-checked={platform === item}
+              onClick={() => {
+                onPlatformChange(item);
+                setSettingsOpen(false);
+              }}
+              key={item}
+            >
+              <span><strong>{marketPlatformLabels[item]}</strong><small>公开永续合约行情 · 无需 API Key</small></span>
+              <i>{platform === item ? "使用中" : "切换"}</i>
+            </button>
+          ))}
+        </div>
+      </BottomSheet>
       <section className="market-mode-panel" aria-label="K 线查看模式">
         <div className="market-mode-switcher">
           <button
@@ -510,7 +751,7 @@ function MarketScreen({
             <em>{decisionSelections.slice(0, 4).length}/4</em>
           </div>
           {decisionSelections.slice(0, 4).map((selection) => (
-            <DecisionMarketChartCard selection={selection} key={`${selection.symbol}-${selection.timeframe}`} />
+            <DecisionMarketChartCard selection={selection} platform={platform} key={`${selection.symbol}-${selection.timeframe}`} />
           ))}
         </section>
       ) : (
@@ -602,13 +843,23 @@ function getOpportunity(score: number) {
 function DecisionScreen({
   openDetails,
   lockedDecision,
-  onLockedDecisionChange,
   onMarketSelectionsChange,
+  platform,
+  simulationEnabled,
+  simulationBalance,
+  onStartExecution,
+  onCancelExecution,
+  onContinueScanning,
 }: {
   openDetails: (analysis: AnalysisResponse | null, symbol: AssetSymbol, timeframe: MarketInterval) => void;
   lockedDecision: LockedDecision | null;
-  onLockedDecisionChange: (decision: LockedDecision | null) => void;
   onMarketSelectionsChange: (selections: DecisionMarketSelection[]) => void;
+  platform: MarketPlatform;
+  simulationEnabled: boolean;
+  simulationBalance: number;
+  onStartExecution: (analysis: AnalysisResponse, timeframe: MarketInterval, totalAmount: number) => Promise<LockedDecision>;
+  onCancelExecution: (decision: LockedDecision) => Promise<void>;
+  onContinueScanning: () => void;
 }) {
   const [symbol, setSymbol] = useState<AssetSymbol | null>(lockedDecision?.analysis.symbol ?? null);
   const [timeframe, setTimeframe] = useState<MarketInterval>(lockedDecision?.timeframe ?? "4h");
@@ -620,9 +871,17 @@ function DecisionScreen({
   const [amountDraft, setAmountDraft] = useState("10000");
   const [capitalState, setCapitalState] = useState<"loading" | "ready" | "saving" | "saved" | "error">("loading");
   const [executionConfirmationOpen, setExecutionConfirmationOpen] = useState(false);
+  const [executionMutationState, setExecutionMutationState] = useState<"idle" | "saving" | "error">("idle");
   const isExecuting = lockedDecision !== null;
+  const formatCapital = simulationEnabled ? formatUsdc : formatMoney;
 
   useEffect(() => {
+    if (simulationEnabled) {
+      setTotalAmount(simulationBalance);
+      setAmountDraft(String(simulationBalance));
+      setCapitalState("ready");
+      return;
+    }
     const controller = new AbortController();
     loadCapitalSettings(controller.signal)
       .then((settings) => {
@@ -634,14 +893,14 @@ function DecisionScreen({
         if (!controller.signal.aborted) setCapitalState("error");
       });
     return () => controller.abort();
-  }, []);
+  }, [simulationBalance, simulationEnabled]);
 
   useEffect(() => {
     const controller = new AbortController();
     setRemoteState("loading");
 
     const refresh = () => {
-      loadOpportunities(timeframe, controller.signal)
+      loadOpportunities(timeframe, controller.signal, platform)
         .then((scan) => {
           const results = scan.opportunities;
           setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets });
@@ -666,7 +925,7 @@ function DecisionScreen({
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [isExecuting, lockedDecision, selectionMode, timeframe, totalAmount]);
+  }, [isExecuting, lockedDecision, platform, selectionMode, timeframe, totalAmount]);
 
   const activeSymbol = lockedDecision?.analysis.symbol ?? symbol ?? candidates[0]?.symbol ?? "BTC";
   const analysis = lockedDecision?.analysis ?? candidates.find((item) => item.symbol === activeSymbol) ?? null;
@@ -694,10 +953,12 @@ function DecisionScreen({
   const takeProfit = analysis?.take_profit ?? [fallbackPrice * 1.035, fallbackPrice * 1.072];
   const leverage = analysis?.leverage ?? 3;
   const positionSizing = analysis?.position_sizing;
+  const plannedAllocation = positionSizing?.margin_amount ?? 0;
   const currentAllocation = lockedDecision?.allocatedAmount
-    ?? positionSizing?.margin_amount
-    ?? 0;
-  const nominalExposure = positionSizing?.position_value ?? currentAllocation * leverage;
+    ?? (simulationEnabled ? Math.min(plannedAllocation, simulationBalance) : plannedAllocation);
+  const nominalExposure = simulationEnabled || lockedDecision
+    ? currentAllocation * leverage
+    : positionSizing?.position_value ?? currentAllocation * leverage;
   const maxLossAmount = positionSizing?.max_loss_amount ?? 0;
   const stopDistancePercent = (positionSizing?.stop_distance_rate ?? 0) * 100;
   const riskBudgetPercent = (positionSizing?.risk_budget_rate ?? 0) * 100;
@@ -724,13 +985,15 @@ function DecisionScreen({
       ? "正在分析"
       : remoteState === "offline"
         ? "后端未连接"
-        : analysis?.source === "live" ? "实时行情" : "演示分析";
+        : analysis?.analysis_engine === "openai"
+          ? `${analysis.source === "live" ? "实时行情" : "演示行情"} · OpenAI ${analysis.analysis_model ?? "AI"}`
+          : analysis?.source === "live" ? "实时行情 · 规则分析" : "演示分析 · 规则分析";
   const sourceTone = remoteState === "offline" ? "offline" : analysis?.source === "live" ? "live" : "demo";
   const parsedAmount = Number(amountDraft.replace(/,/g, ""));
   const amountIsValid = Number.isFinite(parsedAmount) && parsedAmount > 0 && parsedAmount <= 1_000_000_000;
 
   const persistTotalAmount = async () => {
-    if (!amountIsValid || capitalState === "saving") return;
+    if (simulationEnabled || !amountIsValid || capitalState === "saving") return;
     setCapitalState("saving");
     try {
       const settings = await saveCapitalSettings(parsedAmount);
@@ -742,23 +1005,23 @@ function DecisionScreen({
     }
   };
 
-  const confirmExecution = () => {
+  const confirmExecution = async () => {
     if (!analysis || direction === "WAIT") return;
-    onLockedDecisionChange({
-      analysis,
-      timeframe,
-      startedAt: Date.now(),
-      totalAmount,
-      allocatedAmount: currentAllocation,
-    });
-    setSymbol(analysis.symbol);
-    setExecutionConfirmationOpen(false);
+    setExecutionMutationState("saving");
+    try {
+      await onStartExecution(analysis, timeframe, totalAmount);
+      setSymbol(analysis.symbol);
+      setExecutionConfirmationOpen(false);
+      setExecutionMutationState("idle");
+    } catch {
+      setExecutionMutationState("error");
+    }
   };
 
   return (
     <>
       <div className="subscreen-header decision-page-header">
-        <span>AI 决策引擎</span>
+        <span>{marketPlatformLabels[platform]} · AI 决策引擎</span>
         <h1>开仓前决策</h1>
         <p>先判断机会质量，再确认执行与风险边界</p>
       </div>
@@ -815,6 +1078,7 @@ function DecisionScreen({
               id="total-capital"
               aria-label="总金额（USDT）"
               inputMode="decimal"
+              disabled={simulationEnabled}
               value={amountDraft}
               onChange={(event) => setAmountDraft(event.target.value.replace(/[^\d.]/g, ""))}
               onKeyDown={(event) => {
@@ -822,18 +1086,18 @@ function DecisionScreen({
               }}
             /><b>USDT</b></div>
           </label>
-          <button type="button" disabled={!amountIsValid || capitalState === "saving"} onClick={() => void persistTotalAmount()}>
-            {capitalState === "saving" ? "保存中" : "保存"}
+          <button type="button" disabled={simulationEnabled || !amountIsValid || capitalState === "saving"} onClick={() => void persistTotalAmount()}>
+            {simulationEnabled ? "模拟钱包" : capitalState === "saving" ? "保存中" : "保存"}
           </button>
         </div>
         <small className={capitalState === "error" ? "error" : ""}>
-          {capitalState === "loading" ? "正在读取资金设置" : capitalState === "saved" ? "总金额已保存，正在重新计算仓位" : capitalState === "error" ? "保存失败，请检查后端连接" : "按风险预算与止损距离反推投入资金"}
+          {simulationEnabled ? "当前使用本地模拟钱包余额，不读取或修改真实钱包" : capitalState === "loading" ? "正在读取资金设置" : capitalState === "saved" ? "总金额已保存，正在重新计算仓位" : capitalState === "error" ? "保存失败，请检查后端连接" : "按风险预算与止损距离反推投入资金"}
         </small>
         <div className="capital-budget-summary" aria-label="资金预算规则">
-          <div><span>高风险预算<small>总资金 0.5%</small></span><strong>{formatMoney(totalAmount * 0.005)}</strong></div>
-          <div><span>中风险预算<small>总资金 0.75%</small></span><strong>{formatMoney(totalAmount * 0.0075)}</strong></div>
-          <div><span>低风险预算<small>总资金 1%</small></span><strong>{formatMoney(totalAmount * 0.01)}</strong></div>
-          <div><span>保证金上限<small>单笔最多 30%</small></span><strong>{formatMoney(totalAmount * 0.3)}</strong></div>
+          <div><span>高风险预算<small>总资金 0.5%</small></span><strong>{formatCapital(totalAmount * 0.005)}</strong></div>
+          <div><span>中风险预算<small>总资金 0.75%</small></span><strong>{formatCapital(totalAmount * 0.0075)}</strong></div>
+          <div><span>低风险预算<small>总资金 1%</small></span><strong>{formatCapital(totalAmount * 0.01)}</strong></div>
+          <div><span>保证金上限<small>单笔最多 30%</small></span><strong>{formatCapital(totalAmount * 0.3)}</strong></div>
         </div>
       </section>
 
@@ -889,38 +1153,55 @@ function DecisionScreen({
           <div><span>风险等级</span><strong className="risk">{risk}</strong></div>
           <div className="capital-result">
             <span>本次投入资金<small>{isExecuting ? "执行快照已锁定" : direction === "WAIT" ? "等待信号，不投入" : `开仓价值 ÷ ${leverage} 倍杠杆`}</small></span>
-            <strong>{formatMoney(currentAllocation)}</strong>
+            <strong>{formatCapital(currentAllocation)}</strong>
           </div>
           <div className="capital-result">
             <span>开仓总价值<small>{direction === "WAIT" ? "等待信号，不开仓" : `${riskBudgetPercent.toFixed(2)}% 风险预算 ÷ ${stopDistancePercent.toFixed(2)}% 止损`}</small></span>
-            <strong>{formatMoney(nominalExposure)}</strong>
+            <strong>{formatCapital(nominalExposure)}</strong>
           </div>
           <div className="wide capital-risk-note">
-            <span>最大计划亏损</span><strong>{formatMoney(maxLossAmount)}</strong>
+            <span>最大计划亏损</span><strong>{formatCapital(maxLossAmount)}</strong>
           </div>
         </div>
         <div className={`decision-execution-control ${isExecuting ? "executing" : ""}`}>
           <div>
             <strong>{isExecuting ? `${activeSymbol} 决策执行中` : `执行 ${activeSymbol} 决策`}</strong>
-            <span>{isExecuting ? "已固定当前币种、周期与决策快照，行情扫描不会将其替换" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
+            <span>{isExecuting ? "已固定当前币种、周期与决策快照，行情扫描不会将其替换" : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
           </div>
           <button
             type="button"
             aria-pressed={isExecuting}
             disabled={!analysis || (!isExecuting && direction === "WAIT")}
-            onClick={() => {
+            onClick={() => void (async () => {
               if (isExecuting) {
-                onLockedDecisionChange(null);
-                setSelectionMode("auto");
-                setSymbol(candidates[0]?.symbol ?? null);
+                setExecutionMutationState("saving");
+                try {
+                  await onCancelExecution(lockedDecision);
+                  setSelectionMode("auto");
+                  setSymbol(candidates[0]?.symbol ?? null);
+                  setExecutionMutationState("idle");
+                } catch {
+                  setExecutionMutationState("error");
+                }
                 return;
               }
               setExecutionConfirmationOpen(true);
-            }}
+            })()}
           >
             <LockClosedIcon />
             {isExecuting ? "结束执行并恢复智能优选" : `开始执行 ${activeSymbol}`}
           </button>
+          {isExecuting && !simulationEnabled && (
+            <button
+              type="button"
+              className="continue-scanning-button"
+              onClick={() => {
+                onContinueScanning();
+                setSelectionMode("auto");
+                setSymbol(candidates[0]?.symbol ?? null);
+              }}
+            >继续添加其他币种</button>
+          )}
         </div>
       </section>
 
@@ -931,20 +1212,23 @@ function DecisionScreen({
         description={`${activeSymbol}-PERP · ${directionLabels[direction]} · ${timeframe}`}
       >
         <div className="execution-confirm-summary">
-          <div><span>本次投入资金</span><strong>{formatMoney(currentAllocation)}</strong></div>
-          <div><span>开仓总价值</span><strong>{formatMoney(nominalExposure)}</strong></div>
+          <div><span>本次投入资金</span><strong>{formatCapital(currentAllocation)}</strong></div>
+          <div><span>开仓总价值</span><strong>{formatCapital(nominalExposure)}</strong></div>
           <div><span>建议杠杆</span><strong>{leverage}×</strong></div>
-          <div><span>最大计划亏损</span><strong className="loss">{formatMoney(maxLossAmount)}</strong></div>
+          <div><span>最大计划亏损</span><strong className="loss">{formatCapital(maxLossAmount)}</strong></div>
         </div>
         <div className="execution-confirm-risk">
           <strong>请确认风险边界</strong>
           <span>计划入场 {entryRange.map(formatPrice).join(" – ")} · 结构止损 {formatPrice(stopLoss)}</span>
-          <small>确认后将固定当前决策并同步到持仓页，仅用于执行跟踪，不会向交易所下单。</small>
+          <small>{simulationEnabled ? "确认后按计划中间价模拟开仓，触发首个止盈或止损时自动结算盈亏。" : "确认后将固定当前决策并同步到持仓页，仅用于执行跟踪，不会向交易所下单。"}</small>
         </div>
         <div className="execution-confirm-actions">
           <button type="button" onClick={() => setExecutionConfirmationOpen(false)}>取消</button>
-          <button type="button" onClick={confirmExecution}>确认开始执行</button>
+          <button type="button" disabled={executionMutationState === "saving"} onClick={() => void confirmExecution()}>
+            {executionMutationState === "saving" ? "保存中…" : "确认开始执行"}
+          </button>
         </div>
+        {executionMutationState === "error" && <small className="execution-save-error">保存失败，请检查后端连接或是否已有执行中的决策。</small>}
       </BottomSheet>
 
       <section className="decision-detail-card" aria-labelledby="score-breakdown-title">
@@ -956,6 +1240,14 @@ function DecisionScreen({
             </div>
           ))}
         </div>
+        {analysis?.indicators && (
+          <div className="technical-indicator-grid" aria-label="实时技术指标">
+            <div><span>EMA 20 / 50 / 200</span><strong>{[analysis.indicators.ema20, analysis.indicators.ema50, analysis.indicators.ema200].map((value) => value === null ? "--" : formatPrice(value)).join(" / ")}</strong></div>
+            <div><span>RSI 14</span><strong>{analysis.indicators.rsi14?.toFixed(2) ?? "--"}</strong></div>
+            <div><span>MACD 柱</span><strong>{analysis.indicators.macd_histogram === null ? "--" : formatPrice(analysis.indicators.macd_histogram)}</strong></div>
+            <div><span>ATR 14</span><strong>{analysis.indicators.atr_percent?.toFixed(2) ?? "--"}%</strong></div>
+          </div>
+        )}
       </section>
 
       <section className="decision-detail-card" aria-labelledby="evidence-title">
@@ -972,7 +1264,7 @@ function DecisionScreen({
         <div className="decision-section-title"><div><span>04</span><h2 id="invalidation-title">失效与重评条件</h2></div><em>先定义退出</em></div>
         <div className="invalidation-list">
           <p>价格触及结构止损 {formatPrice(stopLoss)}，当前计划立即失效</p>
-          <p>综合评分跌破 50 分，禁止新增交易</p>
+          <p>综合评分低于 70 分，进入观察区并禁止新增交易</p>
           <p>政策、央行或黑天鹅事件出现时，重新生成决策</p>
         </div>
       </section>
@@ -985,21 +1277,60 @@ function DecisionScreen({
 function SecondaryScreen({
   tab,
   lockedDecision,
+  activeDecisions,
   completedTrades,
+  reviews,
   onOpenDecision,
   onCompletePosition,
+  onSelectDecision,
+  platform,
+  simulationWallet,
+  simulationSyncState,
 }: {
   tab: Exclude<TabId, "market" | "decision">;
   lockedDecision: LockedDecision | null;
-  completedTrades: CompletedTrade[];
+  activeDecisions: LockedDecision[];
+  completedTrades: CompletedTradeRecord[];
+  reviews: ReviewRecord[];
   onOpenDecision: () => void;
-  onCompletePosition: () => void;
+  onCompletePosition: (decision: LockedDecision) => Promise<void>;
+  onSelectDecision: (decision: LockedDecision) => void;
+  platform: MarketPlatform;
+  simulationWallet: SimulationWalletState;
+  simulationSyncState: SimulationSyncState;
 }) {
   const info = tabLabels[tab];
   const [newsItems, setNewsItems] = useState<NewsItem[]>([]);
   const [newsDate, setNewsDate] = useState(() => formatLocalDate(new Date()));
   const [newsTotal, setNewsTotal] = useState(0);
   const [remoteState, setRemoteState] = useState<RemoteState>("idle");
+  const [walletDraft, setWalletDraft] = useState("");
+  const [walletAddress, setWalletAddress] = useState("");
+  const [walletSnapshot, setWalletSnapshot] = useState<WalletSnapshot | null>(null);
+  const [walletState, setWalletState] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [walletError, setWalletError] = useState("");
+  const [credentialApiKey, setCredentialApiKey] = useState("");
+  const [credentialSecret, setCredentialSecret] = useState("");
+  const [credentialPassphrase, setCredentialPassphrase] = useState("");
+  const [completionState, setCompletionState] = useState<"idle" | "loading" | "error">("idle");
+  const [positionMonitors, setPositionMonitors] = useState<PositionMonitor[]>([]);
+
+  useEffect(() => {
+    if (tab !== "positions" || simulationWallet.enabled) {
+      setPositionMonitors([]);
+      return;
+    }
+    const controller = new AbortController();
+    const refresh = () => loadPositionMonitors(controller.signal, platform)
+      .then(setPositionMonitors)
+      .catch(() => undefined);
+    refresh();
+    const intervalId = window.setInterval(refresh, 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+      controller.abort();
+    };
+  }, [platform, simulationWallet.enabled, tab]);
 
   useEffect(() => {
     if (tab !== "news") {
@@ -1009,7 +1340,8 @@ function SecondaryScreen({
 
     const controller = new AbortController();
     setRemoteState("loading");
-    loadNews(newsDate, controller.signal)
+    setNewsItems([]);
+    loadNews(newsDate, controller.signal, platform)
       .then((archive) => {
         setNewsItems(archive.items);
         setNewsTotal(archive.total);
@@ -1020,7 +1352,166 @@ function SecondaryScreen({
       });
 
     return () => controller.abort();
-  }, [newsDate, tab]);
+  }, [newsDate, platform, tab]);
+
+  useEffect(() => {
+    if (tab !== "positions" || simulationWallet.enabled) {
+      if (simulationWallet.enabled) {
+        setWalletState("idle");
+        setWalletSnapshot(null);
+        setWalletAddress("");
+        setWalletError("");
+      }
+      return;
+    }
+    const controller = new AbortController();
+    setWalletState("loading");
+    setWalletSnapshot(null);
+    setWalletAddress("");
+    setWalletError("");
+    if (platform !== "hyperliquid") {
+      const privatePlatform = platform;
+      loadPlatformCredentialStatus(privatePlatform, controller.signal)
+        .then((status) => {
+          if (!status.configured) {
+            setWalletState("idle");
+            return;
+          }
+          setWalletAddress(status.api_key_hint ?? "已配置");
+          return loadPlatformAccount(
+            privatePlatform,
+            lockedDecision?.analysis.symbol,
+            controller.signal,
+          ).then((snapshot) => {
+            setWalletSnapshot(snapshot);
+            setWalletState(snapshot.source === "live" ? "ready" : "error");
+            if (snapshot.error) setWalletError(snapshot.error);
+          });
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            setWalletState("error");
+            setWalletError(error instanceof Error ? error.message : "只读账户同步失败。");
+          }
+        });
+      return () => controller.abort();
+    }
+    loadWalletSettings(controller.signal)
+      .then((settings) => {
+        if (!settings) {
+          setWalletState("idle");
+          return;
+        }
+        setWalletAddress(settings.address);
+        setWalletDraft(settings.address);
+        return loadWallet(settings.address, controller.signal).then((snapshot) => {
+          setWalletSnapshot(snapshot);
+          setWalletState(snapshot.source === "live" ? "ready" : "error");
+        });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setWalletState("error");
+      });
+    return () => controller.abort();
+  }, [lockedDecision?.analysis.symbol, platform, simulationWallet.enabled, tab]);
+
+  const persistWallet = async (address = walletDraft) => {
+    if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+      setWalletState("error");
+      setWalletError("钱包地址格式不正确，请检查后重试。");
+      return;
+    }
+    setWalletState("loading");
+    setWalletError("");
+    try {
+      const settings = await saveWalletSettings(address);
+      const snapshot = await loadWallet(settings.address);
+      setWalletAddress(settings.address);
+      setWalletDraft(settings.address);
+      setWalletSnapshot(snapshot);
+      setWalletState(snapshot.source === "live" ? "ready" : "error");
+      if (snapshot.source !== "live") {
+        setWalletError(snapshot.error ?? "Hyperliquid 数据暂时不可用。");
+      }
+    } catch {
+      setWalletState("error");
+      setWalletError("钱包地址保存失败，或 Hyperliquid 数据暂时不可用。");
+    }
+  };
+
+  const connectBrowserWallet = async () => {
+    const provider = (window as Window & { ethereum?: BrowserWalletProvider }).ethereum;
+    setWalletState("loading");
+    setWalletError("");
+    try {
+      let address = "";
+      if (provider) {
+        const accounts = await provider.request({ method: "eth_requestAccounts" });
+        address = Array.isArray(accounts) ? String(accounts[0] ?? "") : "";
+      } else {
+        const projectId = import.meta.env.VITE_WALLETCONNECT_PROJECT_ID?.trim();
+        if (!projectId) {
+          throw new Error("WALLETCONNECT_NOT_CONFIGURED");
+        }
+        address = await connectWithWalletConnect(projectId);
+      }
+      await persistWallet(address);
+    } catch (error) {
+      const rejected = typeof error === "object" && error !== null && "code" in error
+        && Number((error as { code?: unknown }).code) === 4001;
+      const notConfigured = error instanceof Error && error.message === "WALLETCONNECT_NOT_CONFIGURED";
+      setWalletState("error");
+      setWalletError(notConfigured
+        ? "App 钱包连接尚未配置 Project ID，请暂时填写公开地址。"
+        : rejected ? "已取消钱包连接授权。" : "钱包连接失败，请重试或手动填写公开地址。");
+    }
+  };
+
+  const persistPlatformCredential = async () => {
+    if (platform === "hyperliquid") return;
+    if (credentialApiKey.trim().length < 4 || credentialSecret.trim().length < 8) {
+      setWalletState("error");
+      setWalletError("请完整填写 API Key 和 Secret Key。");
+      return;
+    }
+    if (platform === "okx" && !credentialPassphrase.trim()) {
+      setWalletState("error");
+      setWalletError("OKX 还需要填写 Passphrase。");
+      return;
+    }
+    setWalletState("loading");
+    setWalletError("");
+    try {
+      const status = await savePlatformCredentials(platform, {
+        apiKey: credentialApiKey.trim(),
+        secretKey: credentialSecret.trim(),
+        passphrase: credentialPassphrase.trim(),
+      });
+      setCredentialApiKey("");
+      setCredentialSecret("");
+      setCredentialPassphrase("");
+      setWalletAddress(status.api_key_hint ?? "已配置");
+      const snapshot = await loadPlatformAccount(platform, lockedDecision?.analysis.symbol);
+      setWalletSnapshot(snapshot);
+      setWalletState(snapshot.source === "live" ? "ready" : "error");
+      if (snapshot.error) setWalletError(snapshot.error);
+    } catch (error) {
+      setCredentialSecret("");
+      setCredentialPassphrase("");
+      setWalletState("error");
+      setWalletError(error instanceof Error ? error.message : "只读凭证保存失败。");
+    }
+  };
+
+  const completeTrackedPosition = async (decision: LockedDecision) => {
+    setCompletionState("loading");
+    try {
+      await onCompletePosition(decision);
+      setCompletionState("idle");
+    } catch {
+      setCompletionState("error");
+    }
+  };
 
   const fallbackContent: Record<Exclude<TabId, "market" | "decision">, string[][]> = {
     news: [["10:12 · 宏观", "美国通胀数据受关注", "短线波动可能放大，关注重要宏观事件"], ["09:46 · 链上", "大额链上资金发生转移", "交易所净流入上升，注意短线供给"], ["08:31 · ETF", "现货 ETF 延续净流入", "机构需求保持韧性"]],
@@ -1039,10 +1530,15 @@ function SecondaryScreen({
   const activePosition = lockedDecision?.analysis;
   const positionSizing = activePosition?.position_sizing;
   const startedAt = lockedDecision ? formatDecisionTime(lockedDecision.startedAt) : "";
+  const simulatedTrade = simulationWallet.activeTrade;
+  const simulatedTotalPnl = simulationWallet.history.reduce((sum, trade) => sum + trade.net_pnl, 0);
+  const selectedMonitor = lockedDecision
+    ? positionMonitors.find((item) => item.position_id === lockedDecision.positionId)
+    : undefined;
 
   return (
     <>
-      <div className="subscreen-header"><span>{info.eyebrow}</span><h1>{info.title}</h1><p>{info.summary}</p></div>
+      <div className="subscreen-header"><span>{marketPlatformLabels[platform]} · {info.eyebrow}</span><h1>{info.title}</h1><p>{info.summary}</p></div>
       {tab === "news" && (
         <div className="news-archive-toolbar" aria-label="新闻归档日期">
           <button type="button" onClick={() => setNewsDate((current) => shiftArchiveDate(current, -1))}>‹ 前一天</button>
@@ -1053,10 +1549,143 @@ function SecondaryScreen({
       <section className="focus-panel">
         <div className="focus-status">
           <span>{tab === "news" ? newsDate : new Date().toLocaleDateString("zh-CN")} · {tab === "positions" ? "决策同步" : tab === "review" ? "完成交易复盘" : remoteLabel}</span>
-          <strong>{tab === "positions" ? lockedDecision ? "1 个执行中" : "暂无执行" : tab === "review" ? `${completedTrades.length} 笔已完成` : `${newsTotal} 条`}</strong>
+          <strong>{tab === "positions" ? activeDecisions.length > 0 ? `${activeDecisions.length} 个执行中` : "暂无执行" : tab === "review" ? `${completedTrades.length} 笔已完成` : `${newsTotal} 条`}</strong>
         </div>
+        {tab === "positions" && (simulationWallet.enabled ? (
+          <div className="wallet-live-panel simulation-wallet-panel">
+            <div className="wallet-live-heading">
+              <div><strong>模拟交易钱包</strong><span>数据库同步 · 不读取真实钱包地址与交易历史</span></div>
+              <em className={simulationSyncState === "offline" ? "error" : "live"}>{simulationSyncState === "synced" ? "已同步" : simulationSyncState === "offline" ? "离线缓存" : "同步中"}</em>
+            </div>
+            <div className="wallet-balance-grid">
+              <div><span>钱包余额</span><strong>{formatUsdc(simulationWallet.balance)}</strong></div>
+              <div><span>浮动盈亏</span><strong className={(simulatedTrade?.unrealizedPnl ?? 0) < 0 ? "loss" : "profit"}>{formatUsdc(simulatedTrade?.unrealizedPnl ?? 0)}</strong></div>
+              <div><span>累计已结算</span><strong className={simulatedTotalPnl < 0 ? "loss" : "profit"}>{formatUsdc(simulatedTotalPnl)}</strong></div>
+            </div>
+            <small className="wallet-connected-address">已完成 {simulationWallet.history.length} 笔模拟交易 · 当前平台数据独立保存</small>
+          </div>
+        ) : (
+          <div className="wallet-live-panel">
+            <div className="wallet-live-heading">
+              <div>
+                <strong>{platform === "hyperliquid" ? "Hyperliquid 只读钱包" : `${marketPlatformLabels[platform]} 只读 API`}</strong>
+                <span>{platform === "hyperliquid" ? "公开地址查询，不需要私钥或签名" : "仅调用账户、持仓和成交历史接口"}</span>
+              </div>
+              <em className={walletState === "ready" ? "live" : walletState === "error" ? "error" : ""}>
+                {walletState === "loading" ? "同步中" : walletState === "ready" ? "实时" : walletState === "error" ? "不可用" : "未连接"}
+              </em>
+            </div>
+            {platform === "hyperliquid" ? (
+              <>
+                <button className="wallet-connect-button" type="button" disabled={walletState === "loading"} onClick={() => void connectBrowserWallet()}>
+                  {walletState === "loading" ? "正在连接…" : walletAddress ? "切换钱包" : "连接钱包"}
+                </button>
+                <div className="wallet-divider"><span>或使用公开地址</span></div>
+                <div className="wallet-address-editor">
+                  <KeyboardInput
+                    aria-label="Hyperliquid 钱包地址"
+                    placeholder="输入 0x 开头的公开钱包地址"
+                    value={walletDraft}
+                    onChange={(event) => setWalletDraft(event.target.value.trim())}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") void persistWallet();
+                    }}
+                  />
+                  <button type="button" disabled={walletState === "loading"} onClick={() => void persistWallet()}>保存并同步</button>
+                </div>
+              </>
+            ) : (
+              <div className="credential-editor">
+                <KeyboardInput
+                  aria-label={`${marketPlatformLabels[platform]} API Key`}
+                  autoComplete="off"
+                  placeholder="API Key"
+                  value={credentialApiKey}
+                  onChange={(event) => setCredentialApiKey(event.target.value)}
+                />
+                <KeyboardInput
+                  aria-label={`${marketPlatformLabels[platform]} Secret Key`}
+                  autoComplete="new-password"
+                  placeholder="Secret Key"
+                  type="password"
+                  value={credentialSecret}
+                  onChange={(event) => setCredentialSecret(event.target.value)}
+                />
+                {platform === "okx" && (
+                  <KeyboardInput
+                    aria-label="OKX Passphrase"
+                    autoComplete="new-password"
+                    placeholder="Passphrase"
+                    type="password"
+                    value={credentialPassphrase}
+                    onChange={(event) => setCredentialPassphrase(event.target.value)}
+                  />
+                )}
+                <button type="button" disabled={walletState === "loading"} onClick={() => void persistPlatformCredential()}>
+                  {walletState === "loading" ? "正在验证…" : walletAddress ? "更新凭证并同步" : "保存凭证并同步"}
+                </button>
+                <small>请创建只读权限密钥，关闭交易与提币权限，并设置 IP 白名单。</small>
+              </div>
+            )}
+            {walletError && <small className="wallet-error" role="alert">{walletError}</small>}
+            {walletSnapshot?.source === "live" && (
+              <>
+                <div className="wallet-balance-grid">
+                  <div><span>账户权益</span><strong>{formatMoney(walletSnapshot.equity)}</strong></div>
+                  <div><span>可用余额</span><strong>{formatMoney(walletSnapshot.available_balance)}</strong></div>
+                  <div><span>未实现盈亏</span><strong className={walletSnapshot.unrealized_pnl < 0 ? "loss" : "profit"}>{formatMoney(walletSnapshot.unrealized_pnl)}</strong></div>
+                </div>
+                <div className="exchange-data-section">
+                  <strong>交易所实际持仓 · {walletSnapshot.positions.length}</strong>
+                  {walletSnapshot.positions.length === 0 ? <span>当前没有永续合约持仓</span> : walletSnapshot.positions.map((position, index) => {
+                    const size = Number(position.szi ?? 0);
+                    return (
+                      <div className="exchange-data-row" key={`${position.coin}-${index}`}>
+                        <span>{position.coin}-PERP · {size >= 0 ? "多" : "空"}</span>
+                        <strong>{Math.abs(size)} @ {formatPrice(Number(position.entryPx ?? 0))}</strong>
+                        <small>未实现 {formatMoney(Number(position.unrealizedPnl ?? 0))}</small>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="exchange-data-section">
+                  <strong>最近成交 · {walletSnapshot.history.length}</strong>
+                  {walletSnapshot.history.slice(0, 5).map((fill, index) => (
+                    <div className="exchange-data-row" key={fill.tid ?? fill.hash ?? index}>
+                      <span>{fill.coin} · {fill.dir ?? (fill.side === "B" ? "买入" : "卖出")}</span>
+                      <strong>{fill.sz} @ {formatPrice(Number(fill.px ?? 0))}</strong>
+                      <small>手续费 {formatMoney(Number(fill.fee ?? 0))}</small>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {walletAddress && (
+              <small className="wallet-connected-address">
+                {platform === "hyperliquid" ? `当前地址 ${walletAddress.slice(0, 8)}…${walletAddress.slice(-6)}` : `当前凭证 ${walletAddress}`}
+              </small>
+            )}
+          </div>
+        ))}
         {tab === "news" && remoteState === "ready" && content.length === 0 && <div className="news-empty">当天暂无归档新闻</div>}
-        {tab === "positions" && !lockedDecision && (
+        {tab === "positions" && activeDecisions.length > 1 && (
+          <div className="active-position-switcher" role="tablist" aria-label="执行中持仓">
+            {activeDecisions.map((decision) => (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={lockedDecision?.decisionId === decision.decisionId}
+                className={lockedDecision?.decisionId === decision.decisionId ? "active" : ""}
+                onClick={() => onSelectDecision(decision)}
+                key={decision.decisionId}
+              >
+                <strong>{decision.analysis.symbol}</strong>
+                <span>{directionLabels[decision.analysis.direction]} · {decision.timeframe}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {tab === "positions" && activeDecisions.length === 0 && (
           <div className="position-empty">
             <PieChartIcon />
             <strong>暂无执行中的决策</strong>
@@ -1068,24 +1697,41 @@ function SecondaryScreen({
           <article className="execution-position-card" aria-label={`${activePosition.instrument} 决策持仓`}>
             <div className="position-card-heading">
               <div><span>{activePosition.instrument}</span><strong>{directionLabels[activePosition.direction]} · {activePosition.direction}</strong></div>
-              <em>执行跟踪中</em>
+              <em>{simulationWallet.enabled ? "自动模拟中" : "执行跟踪中"}</em>
             </div>
-            <p className="position-started-at">{startedAt} 开始 · {lockedDecision.timeframe} 周期 · 非交易所订单</p>
+            <p className="position-started-at">{startedAt} 开始 · {lockedDecision.timeframe} 周期 · {simulationWallet.enabled ? "模拟订单" : "非交易所订单"}</p>
             <div className="position-value-grid">
-              <div><span>本次投入资金</span><strong>{formatMoney(lockedDecision.allocatedAmount)}</strong></div>
-              <div><span>开仓总价值</span><strong>{formatMoney(positionSizing?.position_value ?? lockedDecision.allocatedAmount * activePosition.leverage)}</strong></div>
-              <div><span>建议杠杆</span><strong>{activePosition.leverage}×</strong></div>
-              <div><span>最大计划亏损</span><strong className="loss">{formatMoney(positionSizing?.max_loss_amount ?? 0)}</strong></div>
+              <div><span>本次投入资金</span><strong>{simulationWallet.enabled ? formatUsdc(lockedDecision.allocatedAmount) : formatMoney(lockedDecision.allocatedAmount)}</strong></div>
+              <div><span>开仓总价值</span><strong>{simulationWallet.enabled ? formatUsdc(lockedDecision.allocatedAmount * activePosition.leverage) : formatMoney(positionSizing?.position_value ?? lockedDecision.allocatedAmount * activePosition.leverage)}</strong></div>
+              <div><span>{simulationWallet.enabled ? "模拟入场价" : "建议杠杆"}</span><strong>{simulationWallet.enabled && simulatedTrade ? formatPrice(simulatedTrade.entryPrice) : `${activePosition.leverage}×`}</strong></div>
+              <div><span>{simulationWallet.enabled ? "当前标记价" : "最大计划亏损"}</span><strong className={simulationWallet.enabled && (simulatedTrade?.unrealizedPnl ?? 0) >= 0 ? "profit" : "loss"}>{simulationWallet.enabled && simulatedTrade ? formatPrice(simulatedTrade.latestPrice) : formatMoney(positionSizing?.max_loss_amount ?? 0)}</strong></div>
             </div>
+            {simulationWallet.enabled && simulatedTrade && (
+              <div className="simulation-pnl-strip">
+                <span>当前浮动盈亏</span>
+                <strong className={simulatedTrade.unrealizedPnl < 0 ? "loss" : "profit"}>{formatUsdc(simulatedTrade.unrealizedPnl)}</strong>
+                <small>每 30 秒检查止盈止损</small>
+              </div>
+            )}
             <div className="position-levels">
               <div><span>计划入场</span><strong>{activePosition.entry_range.map(formatPrice).join(" – ")}</strong></div>
               <div><span>结构止损</span><strong className="loss">{formatPrice(activePosition.stop_loss)}</strong></div>
               <div><span>止盈目标</span><strong>{activePosition.take_profit.map(formatPrice).join(" / ")}</strong></div>
             </div>
+            {!simulationWallet.enabled && selectedMonitor && (
+              <div className={`position-monitor-strip ${selectedMonitor.action.toLowerCase()}`}>
+                <div><span>动态管理建议</span><strong>{selectedMonitor.action}</strong></div>
+                <p>{selectedMonitor.reason}</p>
+                <small>标记价 {formatPrice(selectedMonitor.current_price)} · 浮动盈亏 {formatMoney(selectedMonitor.unrealized_pnl)}</small>
+              </div>
+            )}
             <div className="position-actions">
-              <button type="button" className="position-complete-button" onClick={onCompletePosition}>标记交易完成</button>
+              {!simulationWallet.enabled && <button type="button" className="position-complete-button" disabled={completionState === "loading"} onClick={() => void completeTrackedPosition(lockedDecision)}>
+                {completionState === "loading" ? "核对真实成交…" : "按真实成交完成"}
+              </button>}
               <button type="button" className="position-decision-link" onClick={onOpenDecision}>查看对应决策<ChevronRightIcon /></button>
             </div>
+            {completionState === "error" && <div className="position-completion-error">未找到真实平仓成交，或交易所中仍有该币种持仓。</div>}
           </article>
         )}
         {tab === "review" && completedTrades.length === 0 && (
@@ -1097,25 +1743,34 @@ function SecondaryScreen({
         )}
         {tab === "review" && completedTrades.map((trade) => {
           const decision = trade.analysis;
+          const review = reviews.find((item) => item.trade_id === trade.id);
+          const simulated = isSimulatedTrade(trade);
           return (
-            <article className="review-trade-card" aria-label={`${decision.instrument} 交易复盘`} key={`${decision.symbol}-${trade.completedAt}`}>
+            <article className="review-trade-card" aria-label={`${decision.instrument} 交易复盘`} key={trade.id}>
               <div className="position-card-heading">
                 <div><span>{decision.instrument}</span><strong>{directionLabels[decision.direction]} · {decision.direction}</strong></div>
-                <em>已完成</em>
+                <em>{simulated ? trade.exit_reason === "take_profit" ? "止盈完成" : "止损完成" : "已完成"}</em>
               </div>
-              <p className="review-trade-time">{formatDecisionTime(trade.startedAt)} 开始 · {formatDecisionTime(trade.completedAt)} 完成</p>
+              <p className="review-trade-time">{formatDecisionTime(new Date(trade.started_at).getTime())} 开始 · {formatDecisionTime(new Date(trade.closed_at).getTime())} 完成</p>
               <div className="review-score-grid">
-                <div><span>决策评分</span><strong>{decision.score}/100</strong></div>
-                <div><span>置信度</span><strong>{decision.confidence}%</strong></div>
-                <div><span>投入资金</span><strong>{formatMoney(trade.allocatedAmount)}</strong></div>
-                <div><span>计划最大亏损</span><strong className="loss">{formatMoney(decision.position_sizing.max_loss_amount)}</strong></div>
+                <div><span>{simulated ? "模拟入场价" : "真实入场均价"}</span><strong>{formatPrice(trade.entry_price)}</strong></div>
+                <div><span>{simulated ? "模拟退出价" : "真实退出均价"}</span><strong>{formatPrice(trade.exit_price)}</strong></div>
+                <div><span>手续费</span><strong className="loss">{simulated ? formatUsdc(trade.fee) : formatMoney(trade.fee)}</strong></div>
+                <div><span>净盈亏</span><strong className={trade.net_pnl < 0 ? "loss" : "profit"}>{simulated ? formatUsdc(trade.net_pnl) : formatMoney(trade.net_pnl)}</strong></div>
               </div>
               <div className="review-plan-summary">
                 <span>原决策计划</span>
                 <p>入场 {decision.entry_range.map(formatPrice).join(" – ")} · 止损 {formatPrice(decision.stop_loss)} · {decision.leverage}×</p>
                 <small>{decision.reasons[0]}</small>
               </div>
-              <div className="review-data-note"><strong>已进入复盘</strong><span>当前记录决策与风控快照；真实退出价和盈亏需由交易账户数据补全。</span></div>
+              <div className="review-data-note">
+                <small className="review-engine-badge">
+                  {simulated ? "模拟结算" : review?.metrics.analysis_engine === "openai" ? "AI 复盘" : "规则复盘"}
+                </small>
+                <strong>{simulated ? `已按${trade.exit_reason === "take_profit" ? "首个止盈" : "止损"}计划价自动结束交易` : review?.summary ?? "已按真实成交生成复盘"}</strong>
+                <span>{review?.findings.join(" ") ?? `毛盈亏 ${simulated ? formatUsdc(trade.gross_pnl) : formatMoney(trade.gross_pnl)}，净收益率 ${trade.pnl_percent.toFixed(2)}%。`}</span>
+                {review?.adjustments.map((item) => <span key={item}>建议：{item}</span>)}
+              </div>
             </article>
           );
         })}
@@ -1125,7 +1780,7 @@ function SecondaryScreen({
           </button>
         ))}
       </section>
-      <div className="readonly-footer"><LockClosedIcon /> 只读分析 · 不会自动下单</div>
+      <div className="readonly-footer"><LockClosedIcon /> {simulationWallet.enabled ? "模拟交易 · 不会真实下单" : "只读分析 · 不会自动下单"}</div>
     </>
   );
 }
@@ -1160,11 +1815,39 @@ function DecisionSheet({
   );
 }
 
-export default function Prototype() {
+function TradingPrototype() {
   const [activeTab, setActiveTab] = useState<TabId>("market");
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [lockedDecision, setLockedDecision] = useState<LockedDecision | null>(null);
-  const [completedTrades, setCompletedTrades] = useState<CompletedTrade[]>([]);
+  const [activeExecutions, setActiveExecutions] = useState<LockedDecision[]>([]);
+  const [completedTrades, setCompletedTrades] = useState<CompletedTradeRecord[]>([]);
+  const [reviews, setReviews] = useState<ReviewRecord[]>([]);
+  const [apiAccessToken, setApiAccessTokenState] = useState(getApiAccessToken);
+  const [marketPlatform, setMarketPlatform] = useState<MarketPlatform>(() => {
+    const stored = window.localStorage.getItem("alpha-market-platform");
+    return stored === "binance" || stored === "okx" ? stored : "hyperliquid";
+  });
+  const [simulationWallets, setSimulationWallets] = useState<SimulationWalletBook>(() => (
+    restoreSimulationWalletBook(
+      window.localStorage.getItem(SIMULATION_WALLETS_KEY),
+      window.localStorage.getItem("alpha-simulation-wallet"),
+      marketPlatform,
+    )
+  ));
+  const [simulationClientId] = useState(getSimulationClientId);
+  const [simulationHydrated, setSimulationHydrated] = useState(false);
+  const [simulationSyncStates, setSimulationSyncStates] = useState<Record<MarketPlatform, SimulationSyncState>>({
+    hyperliquid: "loading",
+    binance: "loading",
+    okx: "loading",
+  });
+  const simulationWallet = simulationWallets[marketPlatform];
+  const simulationSyncState = simulationSyncStates[marketPlatform];
+  const simulationWalletsRef = useRef(simulationWallets);
+  const lastSyncedSimulationRef = useRef<Partial<Record<MarketPlatform, string>>>({});
+  const activeSimulationKey = simulationPlatforms.map((platform) => (
+    simulationWallets[platform].enabled ? simulationWallets[platform].activeTrade?.id ?? "" : ""
+  )).join("|");
   const [marketMode, setMarketMode] = useState<MarketMode>("free");
   const [freeMarketSymbol, setFreeMarketSymbol] = useState<AssetSymbol>("BTC");
   const [decisionMarketSelections, setDecisionMarketSelections] = useState<DecisionMarketSelection[]>([
@@ -1179,6 +1862,216 @@ export default function Prototype() {
     timeframe: MarketInterval;
   }>({ analysis: null, symbol: "BTC", timeframe: "1h" });
 
+  useEffect(() => {
+    if (simulationWallet.enabled) {
+      setLockedDecision(simulationWallet.activeTrade
+        ? simulatedTradeToLockedDecision(simulationWallet.activeTrade)
+        : null);
+      return;
+    }
+    const controller = new AbortController();
+    loadActiveExecutions(controller.signal, marketPlatform)
+      .then((states) => {
+        const decisions = states.map(executionToLockedDecision);
+        setActiveExecutions(decisions);
+        setLockedDecision((current) => (
+          decisions.find((item) => item.decisionId === current?.decisionId) ?? decisions[0] ?? null
+        ));
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [apiAccessToken, marketPlatform, simulationWallet.activeTrade?.id, simulationWallet.enabled]);
+
+  useEffect(() => {
+    if (simulationWallet.enabled) {
+      setCompletedTrades([]);
+      setReviews([]);
+      return;
+    }
+    const controller = new AbortController();
+    setCompletedTrades([]);
+    setReviews([]);
+    loadCompletedTrades(controller.signal, marketPlatform).then(setCompletedTrades).catch(() => undefined);
+    loadReviews(controller.signal, marketPlatform).then(setReviews).catch(() => undefined);
+    return () => controller.abort();
+  }, [apiAccessToken, marketPlatform, simulationWallet.enabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem("alpha-market-platform", marketPlatform);
+  }, [marketPlatform]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SIMULATION_WALLETS_KEY, JSON.stringify(simulationWallets));
+    simulationWalletsRef.current = simulationWallets;
+  }, [simulationWallets]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const localSnapshot = JSON.stringify(simulationWalletsRef.current);
+    setSimulationSyncStates({ hyperliquid: "loading", binance: "loading", okx: "loading" });
+    Promise.allSettled(simulationPlatforms.map(async (platform) => ({
+      platform,
+      stored: await loadSimulationWallet(simulationClientId, platform, controller.signal),
+    })))
+      .then((results) => {
+        if (controller.signal.aborted) return;
+        setSimulationWallets((current) => {
+          if (JSON.stringify(simulationWalletsRef.current) !== localSnapshot) return current;
+          let next = current;
+          for (const result of results) {
+            if (result.status !== "fulfilled") continue;
+            const { platform, stored } = result.value;
+            const remoteState = restoreSimulationWallet(JSON.stringify(stored), platform);
+            lastSyncedSimulationRef.current[platform] = JSON.stringify(remoteState);
+            if (hasSimulationData(remoteState) || !hasSimulationData(current[platform])) {
+              if (next === current) next = { ...current };
+              next[platform] = remoteState;
+            }
+          }
+          return next;
+        });
+        setSimulationSyncStates((current) => {
+          const next = { ...current };
+          results.forEach((result, index) => {
+            next[simulationPlatforms[index]] = result.status === "fulfilled" ? "synced" : "offline";
+          });
+          return next;
+        });
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setSimulationHydrated(true);
+      });
+    return () => controller.abort();
+  }, [apiAccessToken, simulationClientId]);
+
+  useEffect(() => {
+    if (!simulationHydrated) return;
+    const changedPlatforms = simulationPlatforms.filter((platform) => (
+      lastSyncedSimulationRef.current[platform] !== JSON.stringify(simulationWallets[platform])
+    ));
+    if (changedPlatforms.length === 0) return;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      setSimulationSyncStates((current) => {
+        const next = { ...current };
+        changedPlatforms.forEach((platform) => { next[platform] = "saving"; });
+        return next;
+      });
+      Promise.allSettled(changedPlatforms.map((platform) => (
+        saveSimulationWallet(simulationClientId, platform, simulationWallets[platform], controller.signal)
+      ))).then((results) => {
+        if (controller.signal.aborted) return;
+        setSimulationSyncStates((current) => {
+          const next = { ...current };
+          results.forEach((result, index) => {
+            const platform = changedPlatforms[index];
+            next[platform] = result.status === "fulfilled" ? "synced" : "offline";
+            if (result.status === "fulfilled") {
+              lastSyncedSimulationRef.current[platform] = JSON.stringify(simulationWallets[platform]);
+            }
+          });
+          return next;
+        });
+      });
+    }, 350);
+    return () => {
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [apiAccessToken, simulationClientId, simulationHydrated, simulationWallets]);
+
+  useEffect(() => {
+    const activeTrades = simulationPlatforms.flatMap((platform) => {
+      const wallet = simulationWallets[platform];
+      return wallet.enabled && wallet.activeTrade ? [{ platform, trade: wallet.activeTrade }] : [];
+    });
+    if (activeTrades.length === 0) return;
+    const controller = new AbortController();
+    let checking = false;
+
+    const refreshSimulation = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const results = await Promise.allSettled(activeTrades.map(async ({ platform, trade }) => ({
+          platform,
+          trade,
+          snapshot: await loadMarket(trade.analysis.symbol, controller.signal, platform),
+        })));
+        setSimulationWallets((current) => {
+          let next = current;
+          for (const result of results) {
+            if (result.status !== "fulfilled") continue;
+            const { platform, trade, snapshot } = result.value;
+            const wallet = next[platform];
+            if (wallet.activeTrade?.id !== trade.id) continue;
+            const completed = closeSimulatedTradeIfTriggered(trade, snapshot.price);
+            const updatedWallet = completed ? {
+              ...wallet,
+              balance: Math.max(0, wallet.balance + completed.net_pnl),
+              activeTrade: null,
+              history: [completed, ...wallet.history].slice(0, 500),
+            } : {
+              ...wallet,
+              activeTrade: updateSimulatedTrade(wallet.activeTrade, snapshot.price),
+            };
+            if (next === current) next = { ...current };
+            next[platform] = updatedWallet;
+          }
+          return next;
+        });
+      } catch {
+        // 行情暂不可用时保留各平台模拟仓位，下一轮继续检查。
+      } finally {
+        checking = false;
+      }
+    };
+
+    void refreshSimulation();
+    const intervalId = window.setInterval(() => void refreshSimulation(), 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+      controller.abort();
+    };
+  }, [activeSimulationKey]);
+
+  const startExecution = async (analysis: AnalysisResponse, timeframe: MarketInterval, totalAmount: number) => {
+    if (!simulationWallet.enabled) {
+      const state = await createExecution(analysis, timeframe, totalAmount);
+      const decision = executionToLockedDecision(state);
+      setActiveExecutions((current) => [
+        decision,
+        ...current.filter((item) => item.decisionId !== decision.decisionId),
+      ]);
+      setLockedDecision(decision);
+      return decision;
+    }
+    const trade = openSimulatedTrade(analysis, timeframe, simulationWallet.balance);
+    const decision = simulatedTradeToLockedDecision(trade);
+    setSimulationWallets((current) => ({
+      ...current,
+      [marketPlatform]: { ...current[marketPlatform], activeTrade: trade },
+    }));
+    setLockedDecision(decision);
+    return decision;
+  };
+
+  const cancelTrackedExecution = async (decision: LockedDecision) => {
+    if (simulationWallet.enabled) {
+      setSimulationWallets((current) => current[marketPlatform].activeTrade?.id === decision.decisionId
+        ? { ...current, [marketPlatform]: { ...current[marketPlatform], activeTrade: null } }
+        : current);
+      setLockedDecision(null);
+      return;
+    }
+    await cancelExecution(decision.decisionId);
+    setActiveExecutions((current) => {
+      const next = current.filter((item) => item.decisionId !== decision.decisionId);
+      setLockedDecision(next[0] ?? null);
+      return next;
+    });
+  };
+
   return (
     <div className="alpha-app">
       <MobileScroll className="alpha-scroll">
@@ -1191,6 +2084,27 @@ export default function Prototype() {
               freeSymbol={freeMarketSymbol}
               onFreeSymbolChange={setFreeMarketSymbol}
               decisionSelections={decisionMarketSelections}
+              platform={marketPlatform}
+              onPlatformChange={setMarketPlatform}
+              simulationWallet={simulationWallet}
+              simulationSyncState={simulationSyncState}
+              apiAccessToken={apiAccessToken}
+              onApiAccessTokenChange={setApiAccessTokenState}
+              onSimulationEnabledChange={(enabled) => {
+                if (simulationWallet.activeTrade) return;
+                setLockedDecision(null);
+                setSimulationWallets((current) => ({
+                  ...current,
+                  [marketPlatform]: { ...current[marketPlatform], enabled },
+                }));
+              }}
+              onResetSimulationWallet={() => {
+                if (simulationWallet.activeTrade) return;
+                setSimulationWallets((current) => ({
+                  ...current,
+                  [marketPlatform]: createDefaultSimulationWallet(simulationWallet.enabled),
+                }));
+              }}
               openDetails={(analysis, symbol, timeframe) => {
                 setSheetContext({ analysis, symbol, timeframe });
                 setDetailsOpen(true);
@@ -1198,23 +2112,44 @@ export default function Prototype() {
             />
           ) : activeTab === "decision" ? (
             <DecisionScreen
-              lockedDecision={lockedDecision}
-              onLockedDecisionChange={setLockedDecision}
+              lockedDecision={lockedDecision?.analysis.platform === marketPlatform ? lockedDecision : null}
               onMarketSelectionsChange={setDecisionMarketSelections}
+              platform={marketPlatform}
+              simulationEnabled={simulationWallet.enabled}
+              simulationBalance={simulationWallet.balance}
+              onStartExecution={startExecution}
+              onCancelExecution={cancelTrackedExecution}
+              onContinueScanning={() => setLockedDecision(null)}
               openDetails={(analysis, symbol, timeframe) => {
                 setSheetContext({ analysis, symbol, timeframe });
                 setDetailsOpen(true);
               }}
             />
           ) : <SecondaryScreen
+            key={`${activeTab}-${marketPlatform}-${apiAccessToken ? "authorized" : "anonymous"}`}
             tab={activeTab}
-            lockedDecision={lockedDecision}
-            completedTrades={completedTrades}
+            lockedDecision={lockedDecision?.analysis.platform === marketPlatform
+              ? lockedDecision
+              : activeExecutions[0] ?? null}
+            activeDecisions={simulationWallet.enabled
+              ? simulationWallet.activeTrade ? [simulatedTradeToLockedDecision(simulationWallet.activeTrade)] : []
+              : activeExecutions}
+            completedTrades={simulationWallet.enabled ? simulationWallet.history : completedTrades}
+            reviews={reviews}
+            platform={marketPlatform}
+            simulationWallet={simulationWallet}
+            simulationSyncState={simulationSyncState}
             onOpenDecision={() => setActiveTab("decision")}
-            onCompletePosition={() => {
-              if (!lockedDecision) return;
-              setCompletedTrades((current) => [{ ...lockedDecision, completedAt: Date.now() }, ...current]);
-              setLockedDecision(null);
+            onSelectDecision={setLockedDecision}
+            onCompletePosition={async (decision) => {
+              const result = await completePosition(decision.positionId);
+              setCompletedTrades((current) => [result.trade, ...current.filter((item) => item.id !== result.trade.id)]);
+              setReviews((current) => [result.review, ...current.filter((item) => item.id !== result.review.id)]);
+              setActiveExecutions((current) => {
+                const next = current.filter((item) => item.decisionId !== decision.decisionId);
+                setLockedDecision(next[0] ?? null);
+                return next;
+              });
               setActiveTab("review");
             }}
           />}
@@ -1230,4 +2165,18 @@ export default function Prototype() {
       <DecisionSheet open={detailsOpen} onOpenChange={setDetailsOpen} {...sheetContext} />
     </div>
   );
+}
+
+export default function Prototype() {
+  const isAndroidBundle = import.meta.env.VITE_APP_TARGET === "android";
+
+  useLayoutEffect(() => {
+    if (!isAndroidBundle) return;
+
+    // APK 直接使用系统屏幕，不显示网页原型的设备外框与模拟系统控件。
+    document.documentElement.classList.add("native-android");
+    return () => document.documentElement.classList.remove("native-android");
+  }, [isAndroidBundle]);
+
+  return isAndroidBundle || window.location.pathname.startsWith("/app") ? <TradingPrototype /> : <DownloadLanding />;
 }

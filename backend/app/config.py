@@ -13,6 +13,20 @@ class Settings(BaseSettings):
     market_api_key: str | None = None
     news_api_key: str | None = None
     ai_api_key: str | None = None
+    owner_api_token: str | None = None
+    credential_encryption_key: str | None = None
+    ai_model: str = "gpt-5-mini"
+    ai_base_url: str = "https://api.openai.com/v1"
+    ai_timeout_seconds: float = 20.0
+    ai_requests_per_minute: int = 12
+    ai_requests_per_day: int = 300
+    ai_max_concurrency: int = 2
+    news_refresh_seconds: int = 300
+    market_scan_interval_seconds: int = 300
+    market_scan_cache_seconds: int = 360
+    daily_review_hour: int = 0
+    daily_review_minute: int = 10
+    max_active_executions: int = 3
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -20,4 +34,3 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
-

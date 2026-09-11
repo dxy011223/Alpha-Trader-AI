@@ -1,11 +1,19 @@
+import os
+
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
+
+os.environ["OWNER_API_TOKEN"] = "test-owner-token-abcdefghijklmnopqrstuvwxyz"
+get_settings.cache_clear()
+
 from app.main import app
-from app.schemas import MarketSnapshot
-from app.services import calculate_position_sizing
+from app.schemas import AnalysisRequest, MarketSnapshot
+from app.services import analyze_market, calculate_position_sizing
 
 
-client = TestClient(app)
+AUTH_HEADERS = {"Authorization": "Bearer test-owner-token-abcdefghijklmnopqrstuvwxyz"}
+client = TestClient(app, headers=AUTH_HEADERS)
 
 
 def test_market_snapshot():
@@ -15,7 +23,8 @@ def test_market_snapshot():
 
 
 def test_unsupported_market(monkeypatch):
-    async def fake_get_live_market(_symbol: str):
+    async def fake_get_live_market(_symbol: str, platform: str):
+        assert platform == "hyperliquid"
         return None
 
     monkeypatch.setattr("app.api.get_live_market", fake_get_live_market)
@@ -24,8 +33,8 @@ def test_unsupported_market(monkeypatch):
 
 
 def test_mobile_candle_periods(monkeypatch):
-    async def fake_get_candles(symbol: str, interval: str, limit: int):
-        assert (symbol, interval, limit) == ("BTC", "1m", 80)
+    async def fake_get_candles(symbol: str, interval: str, limit: int, platform: str):
+        assert (symbol, interval, limit, platform) == ("BTC", "1m", 80, "hyperliquid")
         return []
 
     monkeypatch.setattr("app.api.get_candles", fake_get_candles)
@@ -39,7 +48,23 @@ def test_rejects_unknown_candle_period():
     assert response.status_code == 422
 
 
-def test_ai_analysis_has_risk_controls():
+def test_rejects_unknown_market_platform():
+    response = client.get("/api/v1/market/BTC?platform=unknown")
+    assert response.status_code == 422
+
+
+def test_protected_routes_reject_missing_owner_token():
+    response = TestClient(app).get("/api/v1/settings/capital")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "访问令牌无效或缺失"
+
+
+def test_ai_analysis_has_risk_controls(monkeypatch):
+    monkeypatch.setattr(
+        "app.api.read_capital_settings",
+        lambda: type("Capital", (), {"total_amount": 10_000})(),
+    )
     response = client.post("/api/v1/ai/analyze", json={"symbol": "BTC", "timeframe": "4h"})
     payload = response.json()
     assert response.status_code == 200
@@ -49,6 +74,7 @@ def test_ai_analysis_has_risk_controls():
     assert payload["score"] == sum(payload["score_breakdown"].values())
     assert payload["score_breakdown"].keys() == {"trend", "structure", "capital", "macro", "news"}
     assert payload["source"] in {"live", "demo"}
+    assert payload["analysis_engine"] in {"openai", "rules"}
     assert payload["position_sizing"]["margin_amount"] >= 0
     assert payload["position_sizing"]["position_value"] >= payload["position_sizing"]["margin_amount"]
     assert "不会自动下单" in payload["disclaimer"]
@@ -102,6 +128,25 @@ def test_position_sizing_caps_margin_and_blocks_wait():
     assert waiting.position_value == 0
 
 
+def test_rule_short_plan_has_correct_price_boundaries():
+    market = MarketSnapshot(
+        symbol="TEST",
+        price=100,
+        change_24h=-4,
+        volume=2_000_000,
+        volatility=4,
+        funding_rate=0,
+        open_interest=1_000_000,
+        source="live",
+    )
+
+    decision = analyze_market(AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000)
+
+    assert decision.direction == "SHORT"
+    assert decision.stop_loss > decision.entry_range[1]
+    assert decision.take_profit[0] < decision.entry_range[0]
+
+
 def test_ai_opportunities_are_ranked(monkeypatch):
     markets = [
         MarketSnapshot(symbol="BTC", price=100, change_24h=0.2, volume=1_000_000, volatility=0.2, funding_rate=0.001, open_interest=2_000_000, source="live"),
@@ -110,10 +155,21 @@ def test_ai_opportunities_are_ranked(monkeypatch):
         MarketSnapshot(symbol="THIN", price=1, change_24h=20, volume=10_000, volatility=20, funding_rate=0, open_interest=5_000, source="live"),
     ]
 
-    async def fake_get_live_markets():
+    async def fake_get_live_markets(platform: str):
+        assert platform == "hyperliquid"
         return markets
 
-    monkeypatch.setattr("app.api.get_live_markets", fake_get_live_markets)
+    async def fake_get_candles(_symbol: str, _interval: str, _limit: int, _platform: str):
+        return []
+
+    monkeypatch.setattr("app.market_scanner.read_scan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.write_timeframe_scan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.get_live_markets", fake_get_live_markets)
+    monkeypatch.setattr("app.market_scanner.get_candles", fake_get_candles)
+    monkeypatch.setattr(
+        "app.market_scanner.read_capital_settings",
+        lambda: type("Capital", (), {"total_amount": 10_000})(),
+    )
     response = client.get("/api/v1/ai/opportunities?timeframe=4h")
     payload = response.json()
 

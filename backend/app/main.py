@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,17 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    if settings.environment.lower() == "production" and len((settings.owner_api_token or "").strip()) < 32:
+        raise RuntimeError("生产环境必须配置至少 32 位的 OWNER_API_TOKEN")
+    if settings.environment.lower() == "production":
+        from alembic import command
+        from alembic.config import Config
+
+        migration_config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        command.upgrade(migration_config, "head")
+        logger.info("数据库迁移已升级到最新版本")
+    else:
+        Base.metadata.create_all(bind=engine)
     logger.info("数据库模型初始化完成")
     yield
     logger.info("Alpha Trader AI 服务已停止")

@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-alpha_trader}
       POSTGRES_USER: ${POSTGRES_USER:-alpha}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,8 +22,30 @@ services:
   backend:
     build: ./backend
     env_file: .env
-    ports:
-      - "8000:8000"
+    environment:
+      ENVIRONMENT: production
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  celery-worker:
+    build: ./backend
+    command: celery -A app.celery_app:celery_app worker --loglevel=INFO
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  celery-beat:
+    build: ./backend
+    command: celery -A app.celery_app:celery_app beat --loglevel=INFO
+    env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
@@ -33,11 +55,11 @@ services:
   frontend:
     build: ./frontend
     ports:
-      - "5173:80"
+      # 默认仅供本机访问；公网部署必须在前方配置 HTTPS 终止层。
+      - "127.0.0.1:5173:80"
     depends_on:
       - backend
 
 volumes:
   postgres_data:
   redis_data:
-

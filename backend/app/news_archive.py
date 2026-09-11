@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.models import ArchivedNews
+from app.news_sources import current_news_date, news_archive_date
 from app.schemas import NewsArchiveResponse, NewsItem
 from app.services import get_news
 
@@ -46,8 +47,13 @@ def archive_news(session: Session, items: list[NewsItem], archive_date: date) ->
 def get_news_archive(target_date: date) -> NewsArchiveResponse:
     """返回指定日期的全部归档；读取今天时先同步当前新闻源。"""
     with SessionLocal() as session:
-        if target_date == date.today():
-            archive_news(session, get_news(), target_date)
+        if target_date == current_news_date():
+            # RSS 通常包含最近数日的条目，同步时按真实发布时间回填对应日期。
+            grouped_items: dict[date, list[NewsItem]] = {}
+            for item in get_news():
+                grouped_items.setdefault(news_archive_date(item), []).append(item)
+            for archive_date, items in grouped_items.items():
+                archive_news(session, items, archive_date)
         rows = session.scalars(
             select(ArchivedNews)
             .where(ArchivedNews.archive_date == target_date)

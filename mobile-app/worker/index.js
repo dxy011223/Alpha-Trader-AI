@@ -6,16 +6,85 @@ const FALLBACK_MARKETS = [
   { symbol: "SOL", price: 179.42, change_24h: -0.74, volume: 3960000000, volatility: 5.14, funding_rate: -0.0021, open_interest: 2180000000, source: "demo" },
   { symbol: "HYPE", price: 39.28, change_24h: 4.63, volume: 642000000, volatility: 6.42, funding_rate: 0.0148, open_interest: 782000000, source: "demo" },
 ];
-const NEWS = [
-  { id: 1, title: "美联储官员释放谨慎降息信号", source: "Macro Wire", published_at: "12 分钟前", impact: 4, assets: ["BTC", "NASDAQ"], direction: "bullish", analysis: "流动性预期改善，中期偏利多风险资产。" },
-  { id: 2, title: "现货比特币 ETF 连续三个交易日净流入", source: "Crypto Brief", published_at: "38 分钟前", impact: 4, assets: ["BTC"], direction: "bullish", analysis: "机构买盘提供支撑，但短线涨幅扩大后需警惕获利回吐。" },
-  { id: 3, title: "亚洲市场风险偏好小幅回落", source: "Global Markets", published_at: "1 小时前", impact: 2, assets: ["ETH", "SOL"], direction: "neutral", analysis: "影响有限，尚未改变主要趋势结构。" },
-];
-
-let totalAmount = 10_000;
-
 function json(data, status = 200) {
   return Response.json(data, { status, headers: { "cache-control": "no-store" } });
+}
+
+function shanghaiDate() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date());
+}
+
+async function fingerprint(value) {
+  const data = new TextEncoder().encode(value);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash), (item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+async function fetchLiveNews() {
+  try {
+    const response = await fetch("https://min-api.cryptocompare.com/data/v2/news/?lang=EN");
+    if (!response.ok) throw new Error(`新闻源请求失败：${response.status}`);
+    const body = await response.json();
+    const items = Array.isArray(body.Data) ? body.Data : [];
+    return items.map((item, index) => {
+      const categories = String(item.categories || "").split("|").filter(Boolean).slice(0, 8);
+      return {
+        id: Number(item.id || index + 1),
+        title: String(item.title || "未命名新闻"),
+        source: String(item.source_info?.name || item.source || "CryptoCompare"),
+        published_at: new Date(Number(item.published_on || 0) * 1000).toISOString(),
+        impact: 3,
+        assets: categories,
+        direction: "neutral",
+        analysis: "实时新闻已归档；请结合价格结构、成交量与资金数据判断影响。",
+      };
+    });
+  } catch (error) {
+    console.error("实时新闻获取失败", error);
+    return [];
+  }
+}
+
+async function archiveNews(env, date, items) {
+  if (!env.DB || items.length === 0) return;
+  const statements = await Promise.all(items.map(async (item) => env.DB.prepare(`
+    INSERT OR IGNORE INTO archived_news
+      (fingerprint, archive_date, source_id, title, source, published_at, impact, assets, direction, analysis)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    await fingerprint(`${item.source}|${item.title}|${item.published_at}`),
+    date,
+    item.id,
+    item.title,
+    item.source,
+    item.published_at,
+    item.impact,
+    JSON.stringify(item.assets),
+    item.direction,
+    item.analysis,
+  )));
+  await env.DB.batch(statements);
+}
+
+async function readNewsArchive(env, date) {
+  if (!env.DB) return date === shanghaiDate() ? fetchLiveNews() : [];
+  if (date === shanghaiDate()) await archiveNews(env, date, await fetchLiveNews());
+  const result = await env.DB.prepare(`
+    SELECT source_id, title, source, published_at, impact, assets, direction, analysis
+    FROM archived_news WHERE archive_date = ? ORDER BY published_at DESC
+  `).bind(date).all();
+  return (result.results || []).map((item) => ({
+    id: Number(item.source_id),
+    title: item.title,
+    source: item.source,
+    published_at: item.published_at,
+    impact: Number(item.impact),
+    assets: JSON.parse(item.assets || "[]"),
+    direction: item.direction,
+    analysis: item.analysis,
+  }));
 }
 
 async function requestHyperliquid(payload) {
@@ -78,7 +147,7 @@ function roundPrice(value) {
   return Number(value.toFixed(digits));
 }
 
-function positionSizing({ direction, confidence, risk, entryRange, stopLoss, leverage }) {
+function positionSizing({ direction, confidence, risk, entryRange, stopLoss, leverage, totalAmount }) {
   const marginCapRate = 0.3;
   const empty = { risk_budget_rate: 0, risk_budget_amount: 0, stop_distance_rate: 0, margin_amount: 0, position_value: 0, max_loss_amount: 0, margin_cap_rate: marginCapRate, capped: false };
   if (direction === "WAIT" || leverage <= 0) return empty;
@@ -100,23 +169,30 @@ function positionSizing({ direction, confidence, risk, entryRange, stopLoss, lev
   };
 }
 
-function analyzeMarket(market) {
-  const trend = Math.max(0, Math.min(30, Math.round(18 + market.change_24h * 2)));
-  const structure = Math.max(0, Math.min(25, Math.round(17 + market.change_24h - market.volatility * 0.8)));
+function analyzeMarket(market, totalAmount) {
+  const trend = Math.max(0, Math.min(30, Math.round(18 + Math.abs(market.change_24h) * 2)));
+  const structure = Math.max(0, Math.min(25, Math.round(17 + Math.abs(market.change_24h) - market.volatility * 0.8)));
   const capital = Math.max(0, Math.min(20, Math.round(15 - Math.abs(market.funding_rate) * 100)));
   const scoreBreakdown = { trend, structure, capital, macro: 10, news: 7 };
   const score = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
   let direction = market.change_24h >= 1 ? "LONG" : market.change_24h <= -1 ? "SHORT" : "WAIT";
-  if (score < 50) direction = "WAIT";
+  if (score < 70) direction = "WAIT";
   const risk = market.volatility > 6 ? "high" : market.volatility > 3 ? "medium" : "low";
-  const entryRange = [roundPrice(market.price * 0.992), roundPrice(market.price * 0.997)];
-  const stopLoss = roundPrice(market.price * 0.974);
+  const entryRange = direction === "SHORT"
+    ? [roundPrice(market.price * 1.003), roundPrice(market.price * 1.008)]
+    : [roundPrice(market.price * 0.992), roundPrice(market.price * 0.997)];
+  const stopDistance = { low: 0.02, medium: 0.026, high: 0.035 }[risk] ?? 0.035;
+  const stopLoss = roundPrice(market.price * (direction === "SHORT" ? 1 + stopDistance : 1 - stopDistance));
   const leverage = risk === "medium" ? 3 : 2;
   return {
     symbol: market.symbol, instrument: `${market.symbol}-PERP`, direction, confidence: score, score,
     score_breakdown: scoreBreakdown, entry_range: entryRange, stop_loss: stopLoss,
-    take_profit: [roundPrice(market.price * 1.035), roundPrice(market.price * 1.072)], leverage, risk,
-    position_sizing: positionSizing({ direction, confidence: score, risk, entryRange, stopLoss, leverage }),
+    take_profit: direction === "SHORT"
+      ? [roundPrice(market.price * 0.965), roundPrice(market.price * 0.928)]
+      : [roundPrice(market.price * 1.035), roundPrice(market.price * 1.072)],
+    leverage, risk,
+    position_sizing: positionSizing({ direction, confidence: score, risk, entryRange, stopLoss, leverage, totalAmount }),
+    indicators: null,
     reasons: [
       `24 小时涨跌 ${market.change_24h.toFixed(2)}%，趋势维度获得 ${trend}/30 分`,
       `当前波动率 ${market.volatility.toFixed(2)}%，技术结构维度获得 ${structure}/25 分`,
@@ -124,10 +200,11 @@ function analyzeMarket(market) {
       "宏观与新闻暂未出现否决性风险，重大事件发生时需要重新评估",
     ],
     disclaimer: "仅供研究与辅助决策，不构成投资建议；系统不会自动下单。", source: market.source,
+    platform: "hyperliquid", analysis_engine: "rules", analysis_model: null,
   };
 }
 
-async function handleApi(request, url) {
+async function handleApi(request, url, env) {
   const candleMatch = url.pathname.match(/^\/api\/v1\/market\/([A-Za-z0-9]+)\/candles$/);
   if (request.method === "GET" && candleMatch) {
     const interval = url.searchParams.get("interval") || "1h";
@@ -148,33 +225,29 @@ async function handleApi(request, url) {
     const symbol = String(payload.symbol || "").toUpperCase();
     if (!/^[A-Z0-9]{1,32}$/.test(symbol)) return json({ detail: "币种格式不正确" }, 422);
     const market = (await getMarkets()).find((item) => item.symbol === symbol);
-    return market ? json(analyzeMarket(market)) : json({ detail: "暂不支持该交易品种" }, 404);
+    const totalAmount = Number(request.headers.get("x-alpha-owner-capital") || 0);
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
+    return market ? json(analyzeMarket(market, totalAmount)) : json({ detail: "暂不支持该交易品种" }, 404);
   }
 
   if (url.pathname === "/api/v1/ai/opportunities" && request.method === "GET") {
+    const totalAmount = Number(request.headers.get("x-alpha-owner-capital") || 0);
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
     const markets = await getMarkets();
     const eligible = markets.filter((market) => market.volume >= 500_000 && market.open_interest >= 250_000);
     const limit = Math.min(20, Math.max(4, Number(url.searchParams.get("limit") || 8)));
-    const opportunities = eligible.map(analyzeMarket).sort((a, b) => b.score - a.score).slice(0, limit);
-    return json({ scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities });
-  }
-
-  if (url.pathname === "/api/v1/settings/capital" && request.method === "GET") {
-    return json({ total_amount: totalAmount, currency: "USDT", updated_at: new Date().toISOString() });
-  }
-  if (url.pathname === "/api/v1/settings/capital" && request.method === "PUT") {
-    const payload = await request.json();
-    const nextAmount = Number(payload.total_amount);
-    if (!Number.isFinite(nextAmount) || nextAmount <= 0 || nextAmount > 1_000_000_000) return json({ detail: "总金额格式不正确" }, 422);
-    totalAmount = nextAmount;
-    return json({ total_amount: totalAmount, currency: "USDT", updated_at: new Date().toISOString() });
+    const opportunities = eligible.map((market) => analyzeMarket(market, totalAmount)).sort((a, b) => b.score - a.score).slice(0, limit);
+    return json({ scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "live_scan", platform: "hyperliquid" });
   }
 
   if (url.pathname === "/api/v1/news" && request.method === "GET") {
-    const date = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
-    return json({ date, total: NEWS.length, items: NEWS });
+    const date = url.searchParams.get("date") || shanghaiDate();
+    const items = await readNewsArchive(env, date);
+    return json({ date, total: items.length, items, platform: "hyperliquid" });
   }
-  if (url.pathname === "/api/v1/news/latest" && request.method === "GET") return json(NEWS);
+  if (url.pathname === "/api/v1/news/latest" && request.method === "GET") {
+    return json(await readNewsArchive(env, shanghaiDate()));
+  }
 
   return json({ detail: "接口不存在" }, 404);
 }
@@ -182,7 +255,7 @@ async function handleApi(request, url) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) return handleApi(request, url);
+    if (url.pathname.startsWith("/api/")) return handleApi(request, url, env);
 
     const response = await env.ASSETS.fetch(request);
     const acceptsHtml = request.headers.get("accept")?.includes("text/html");

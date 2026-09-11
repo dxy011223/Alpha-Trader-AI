@@ -29,14 +29,11 @@ export function BottomSheet({
   const [dragY, setDragY] = useState(0);
 
   useEffect(() => {
-    if (open) keyboard.hide();
+    keyboard.hide();
   }, [open]);
 
   const handleOpenChange = (nextOpen: boolean) => {
-    if (nextOpen) {
-      keyboard.hide();
-    }
-
+    keyboard.hide();
     onOpenChange(nextOpen);
   };
 
@@ -91,7 +88,11 @@ export function BottomSheet({
                   transition={{ duration: 0.16 }}
                 />
               </Dialog.Overlay>
-              <Dialog.Content asChild forceMount>
+              <Dialog.Content
+                asChild
+                forceMount
+                onOpenAutoFocus={(event) => event.preventDefault()}
+              >
                 <motion.div
                   className="bottom-sheet"
                   data-testid="bottom-sheet"

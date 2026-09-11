@@ -1,0 +1,5 @@
+/downloads/*.apk
+  Content-Disposition: attachment; filename="alpha-trader-ai.apk"
+  Content-Type: application/vnd.android.package-archive
+  X-Content-Type-Options: nosniff
+  Cache-Control: no-store
