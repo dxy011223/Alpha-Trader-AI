@@ -57,7 +57,42 @@ test("does not turn missing API or write requests into the app shell", async () 
     });
 
     assert.equal(response.status, 404);
-    assert.equal(calls, 1);
+    assert.equal(calls, new URL(request.url).pathname.startsWith("/api/") ? 0 : 1);
+  }
+});
+
+test("serves market and AI APIs without the local Python backend", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    if (payload.type === "metaAndAssetCtxs") {
+      return Response.json([
+        { universe: [{ name: "BTC" }, { name: "ETH" }, { name: "SOL" }, { name: "HYPE" }] },
+        [
+          { markPx: "100", prevDayPx: "98", dayNtlVlm: "1000000", funding: "0.0001", openInterest: "50000" },
+          { markPx: "50", prevDayPx: "49", dayNtlVlm: "900000", funding: "0.0001", openInterest: "50000" },
+          { markPx: "25", prevDayPx: "24", dayNtlVlm: "800000", funding: "0.0001", openInterest: "50000" },
+          { markPx: "10", prevDayPx: "9", dayNtlVlm: "700000", funding: "0.0001", openInterest: "50000" },
+        ],
+      ]);
+    }
+    return Response.json([{ t: 1, T: 2, o: "99", h: "101", l: "98", c: "100", v: "42" }]);
+  };
+
+  try {
+    const market = await worker.fetch(new Request("https://example.test/api/v1/market/BTC"), {});
+    assert.equal(market.status, 200);
+    assert.equal((await market.json()).source, "live");
+
+    const candles = await worker.fetch(new Request("https://example.test/api/v1/market/BTC/candles?interval=1h&limit=5"), {});
+    assert.deepEqual(await candles.json(), [{ open_time: 1, close_time: 2, open: 99, high: 101, low: 98, close: 100, volume: 42 }]);
+
+    const opportunities = await worker.fetch(new Request("https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4"), {});
+    const scan = await opportunities.json();
+    assert.equal(scan.opportunities.length, 4);
+    assert.equal(scan.opportunities[0].instrument.endsWith("-PERP"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
