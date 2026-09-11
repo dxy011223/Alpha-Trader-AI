@@ -83,6 +83,8 @@ Docker Compose 会同时启动 PostgreSQL、Redis、API、Celery Worker 与 Cele
 
 Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定，发布时会执行 `mobile-app/drizzle/` 中的 D1 迁移。`OWNER_API_TOKEN` 必须作为运行时 secret 配置；如需完整的钱包、成交与复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。没有完整后端时，Worker 只提供 Hyperliquid 公共行情、D1 新闻归档、资金设置和模拟钱包，并对其余功能明确返回不可用。
 
+可在 `mobile-app` 目录运行 `node scripts/ensure-owner-token.mjs` 生成或保留本机 `.env.local` 中的所有者令牌；脚本不会打印令牌，且该文件不会提交到 Git。
+
 Android release 构建读取 `mobile-app/android/signing.properties`，该文件和 keystore 已被 Git 忽略。必须安全备份同一 keystore 与密码，后续版本才能覆盖安装：
 
 ```powershell
