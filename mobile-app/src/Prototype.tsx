@@ -339,7 +339,7 @@ const dataStateLabel: Record<DataState, string> = {
   loading: "正在同步行情",
   live: "实时数据",
   demo: "演示数据",
-  offline: "后端未连接",
+  offline: "行情暂不可用",
 };
 
 function AppHeader({
@@ -486,7 +486,7 @@ function DecisionMarketChartCard({ selection, platform }: { selection: DecisionM
       </div>
       <MarketChart symbol={selection.symbol} interval={selection.timeframe} candles={candles} />
       <div className={`decision-chart-source ${state}`}>
-        {state === "loading" ? "正在同步 K 线" : state === "offline" ? "后端未连接 · 展示演示走势" : "决策行情已同步"}
+        {state === "loading" ? "正在同步 K 线" : state === "offline" ? "K 线暂不可用 · 展示演示走势" : "决策行情已同步"}
       </div>
     </article>
   );
@@ -553,17 +553,18 @@ function MarketScreen({
     setCandles([]);
 
     const refreshMarket = () => {
-      Promise.all([
-        loadMarket(symbol, controller.signal, platform),
-        loadCandles(symbol, timeframe, 80, controller.signal, platform),
-      ]).then(([nextSnapshot, nextCandles]) => {
-        setSnapshot(nextSnapshot);
-        setCandles(nextCandles);
-        setDataState(nextSnapshot.source);
-      }).catch(() => {
-        if (controller.signal.aborted) return;
-        setDataState("offline");
-      });
+      // 行情快照与 K 线独立容错，避免单个慢请求把整个后端误报为离线。
+      loadMarket(symbol, controller.signal, platform)
+        .then((nextSnapshot) => {
+          setSnapshot(nextSnapshot);
+          setDataState(nextSnapshot.source);
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) setDataState("offline");
+        });
+      loadCandles(symbol, timeframe, 80, controller.signal, platform)
+        .then(setCandles)
+        .catch(() => undefined);
     };
     refreshMarket();
     // 后端恢复后自动重新连接，避免用户停留在降级状态。
@@ -984,7 +985,7 @@ function DecisionScreen({
     : remoteState === "loading"
       ? "正在分析"
       : remoteState === "offline"
-        ? "后端未连接"
+        ? "分析暂不可用"
         : analysis?.analysis_engine === "openai"
           ? `${analysis.source === "live" ? "实时行情" : "演示行情"} · OpenAI ${analysis.analysis_model ?? "AI"}`
           : analysis?.source === "live" ? "实时行情 · 规则分析" : "演示分析 · 规则分析";
@@ -1526,7 +1527,7 @@ function SecondaryScreen({
       `${item.analysis} · 影响 ${item.impact}/5`,
     ]);
   }
-  const remoteLabel = { idle: "本地摘要", loading: "正在更新", ready: "后端已更新", offline: "后端未连接" }[remoteState];
+  const remoteLabel = { idle: "本地摘要", loading: "正在更新", ready: "后端已更新", offline: "数据暂不可用" }[remoteState];
   const activePosition = lockedDecision?.analysis;
   const positionSizing = activePosition?.position_sizing;
   const startedAt = lockedDecision ? formatDecisionTime(lockedDecision.startedAt) : "";

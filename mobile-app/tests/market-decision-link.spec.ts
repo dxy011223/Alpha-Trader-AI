@@ -210,6 +210,16 @@ test("市场 K 线支持自由搜索并跟随决策页币种", async ({ page }) 
   }
 });
 
+test("K 线失败时仍按成功的行情快照显示后端已连接", async ({ page }) => {
+  await page.route("**/api/v1/market/BTC/candles**", async (route) => {
+    await route.fulfill({ status: 504, json: { detail: "测试 K 线超时" } });
+  });
+  await page.reload();
+
+  await expect(page.locator(".source-status")).toContainText("实时数据");
+  await expect(page.locator(".source-status")).not.toContainText("后端未连接");
+});
+
 test("模拟交易不读取真实钱包历史并在决策执行后自动开仓", async ({ page }) => {
   await page.getByRole("button", { name: "行情平台设置" }).click();
   const databaseSave = page.waitForRequest((request) => request.method() === "PUT" && request.url().includes("/simulation/wallet/"));

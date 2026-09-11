@@ -38,21 +38,22 @@ class AIBudgetUnavailable(RuntimeError):
     """模型预算不可用或已经耗尽，调用方必须保留规则分析结果。"""
 
 
-def _configured_token() -> str:
-    token = (get_settings().owner_api_token or "").strip()
-    if not token:
+def require_owner(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> str:
+    """校验个人部署的唯一所有者令牌，不在日志或响应中暴露令牌。"""
+    settings = get_settings()
+    expected = (settings.owner_api_token or "").strip()
+    client_host = request.client.host if request.client else ""
+    if not expected:
+        # 仅方便本机开发；生产环境或非回环请求仍必须配置访问令牌。
+        if settings.environment.lower() != "production" and client_host in {"127.0.0.1", "::1", "testclient"}:
+            return hashlib.sha256(b"local-development-owner").hexdigest()[:24]
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="服务端尚未配置访问令牌",
         )
-    return token
-
-
-def require_owner(
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> str:
-    """校验个人部署的唯一所有者令牌，不在日志或响应中暴露令牌。"""
-    expected = _configured_token()
     supplied = credentials.credentials if credentials and credentials.scheme.lower() == "bearer" else ""
     if not supplied or not secrets.compare_digest(supplied, expected):
         raise HTTPException(

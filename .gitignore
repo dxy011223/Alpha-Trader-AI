@@ -8,6 +8,8 @@ dist/
 *.tsbuildinfo
 *.db
 *.db-*
+*.log
 *.sqlite
 *.sqlite3
+.local-*.log
 .DS_Store
