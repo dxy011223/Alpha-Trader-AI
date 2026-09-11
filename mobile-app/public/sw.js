@@ -1,8 +1,15 @@
-const CACHE_NAME = "alpha-trader-ai-v1";
+const CACHE_NAME = "alpha-trader-ai-v2";
 const APP_SHELL = ["/", "/app", "/manifest.webmanifest", "/icons/app-icon.svg"];
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)));
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => Promise.allSettled(
+      APP_SHELL.map(async (path) => {
+        const response = await fetch(path, { cache: "reload" });
+        if (response.ok) await cache.put(path, response);
+      }),
+    )),
+  );
   self.skipWaiting();
 });
 

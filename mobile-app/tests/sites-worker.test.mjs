@@ -139,6 +139,27 @@ test("falls back to index.html for an unknown app route", async () => {
   assert.deepEqual(calls, ["/flow/step-two?source=share", "/index.html"]);
 });
 
+test("serves the app shell to service-worker preload requests", async () => {
+  const calls = [];
+  const response = await worker.fetch(
+    new Request("https://example.test/app", { headers: { accept: "*/*" } }),
+    {
+      ASSETS: {
+        fetch: async (request) => {
+          const pathname = new URL(request.url).pathname;
+          calls.push(pathname);
+          return new Response(pathname === "/index.html" ? "app" : "missing", {
+            status: pathname === "/index.html" ? 200 : 404,
+          });
+        },
+      },
+    },
+  );
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, ["/app", "/index.html"]);
+});
+
 test("does not turn missing API or write requests into the app shell", async () => {
   for (const request of [
     new Request("https://example.test/api/missing", { headers: { accept: "application/json" } }),
@@ -202,6 +223,9 @@ test("emits the files required by Sites packaging", async () => {
   await access(new URL("../dist/client/index.html", import.meta.url));
   await access(new URL("../dist/server/index.js", import.meta.url));
   await access(new URL("../dist/.openai/hosting.json", import.meta.url));
+
+  const builtIndex = await readFile(new URL("../dist/client/index.html", import.meta.url), "utf8");
+  assert.match(builtIndex, /<script type="module" crossorigin src="\/assets\/[^\"]+\.js"><\/script>/);
 });
 
 test("provides installable PWA metadata and icons", async () => {
@@ -210,6 +234,7 @@ test("provides installable PWA metadata and icons", async () => {
 
   assert.equal(manifest.start_url, "/app");
   assert.equal(manifest.display, "standalone");
+  assert.match(index, /<meta name="description" content="安装 Alpha Trader AI，查看实时行情、K 线与 AI 决策分析。" \/>/);
   assert.match(index, /rel="manifest" href="\/manifest\.webmanifest"/);
   assert.deepEqual(manifest.icons.slice(0, 2).map((icon) => icon.sizes), ["192x192", "512x512"]);
   await Promise.all([

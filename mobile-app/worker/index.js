@@ -259,7 +259,11 @@ export default {
 
     const response = await env.ASSETS.fetch(request);
     const acceptsHtml = request.headers.get("accept")?.includes("text/html");
-    if (response.status !== 404 || !acceptsHtml || !["GET", "HEAD"].includes(request.method)) return response;
+    // Service Worker 预缓存请求的 Accept 可能是 */*，应用入口仍需回退到 index.html。
+    const isAppEntry = url.pathname === "/" || url.pathname === "/app";
+    if (response.status !== 404 || (!acceptsHtml && !isAppEntry) || !["GET", "HEAD"].includes(request.method)) {
+      return response;
+    }
 
     const indexUrl = new URL(request.url);
     indexUrl.pathname = "/index.html";
