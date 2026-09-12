@@ -883,6 +883,8 @@ function DecisionScreen({
   const [timeframe, setTimeframe] = useState<MarketInterval>(lockedDecision?.timeframe ?? "4h");
   const [candidates, setCandidates] = useState<AnalysisResponse[]>([]);
   const [scanStats, setScanStats] = useState({ scanned: 0, eligible: 0 });
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanRetry, setScanRetry] = useState(0);
   const [selectionMode, setSelectionMode] = useState<"auto" | "manual">("auto");
   const [remoteState, setRemoteState] = useState<RemoteState>("loading");
   const [totalAmount, setTotalAmount] = useState(10_000);
@@ -921,6 +923,7 @@ function DecisionScreen({
   useEffect(() => {
     const controller = new AbortController();
     setRemoteState("loading");
+    setScanError(null);
 
     const refresh = () => {
       loadOpportunities(timeframe, controller.signal, platform)
@@ -928,9 +931,12 @@ function DecisionScreen({
           const results = scan.opportunities;
           setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets });
           if (results.length === 0) {
+            setCandidates([]);
+            setScanError("当前没有通过流动性筛选的市场");
             setRemoteState("offline");
             return;
           }
+          setScanError(null);
           setCandidates(results);
           setSymbol((current) => {
             const currentSymbol = current ?? lockedDecision?.analysis.symbol;
@@ -941,8 +947,13 @@ function DecisionScreen({
           });
           setRemoteState("ready");
         })
-        .catch(() => {
-          if (!controller.signal.aborted) setRemoteState("offline");
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            setCandidates([]);
+            setScanStats({ scanned: 0, eligible: 0 });
+            setScanError(error instanceof Error ? error.message : "机会扫描暂时不可用");
+            setRemoteState("offline");
+          }
         });
     };
     refresh();
@@ -952,7 +963,7 @@ function DecisionScreen({
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [activeDecisionKey, lockedDecision, platform, selectionMode, timeframe, totalAmount]);
+  }, [activeDecisionKey, lockedDecision, platform, scanRetry, selectionMode, timeframe, totalAmount]);
 
   const analysis = activeDecision?.analysis ?? candidates.find((item) => item.symbol === activeSymbol) ?? null;
   const visibleCandidates = candidates.slice(0, 4);
@@ -1057,7 +1068,7 @@ function DecisionScreen({
         <div className="opportunity-radar-heading">
           <div>
             <strong id="opportunity-radar-title">全市场机会雷达</strong>
-            <span>{scanStats.scanned > 0 ? `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选` : "正在读取全部永续合约市场"}</span>
+            <span>{remoteState === "offline" ? "扫描未完成 · 可手动重试" : scanStats.scanned > 0 ? `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选` : "正在读取全部永续合约市场"}</span>
           </div>
           <button
             type="button"
@@ -1090,7 +1101,12 @@ function DecisionScreen({
                 <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.direction}`} </em>
               </button>
             );
-          }) : <div className="opportunity-loading">正在扫描并计算机会评分…</div>}
+          }) : remoteState === "offline" ? (
+            <div className="opportunity-loading error" role="alert">
+              <span>{scanError ?? "机会扫描暂时不可用"}</span>
+              <button type="button" onClick={() => setScanRetry((current) => current + 1)}>重新扫描</button>
+            </div>
+          ) : <div className="opportunity-loading">正在扫描并计算机会评分…</div>}
         </div>
       </section>
 

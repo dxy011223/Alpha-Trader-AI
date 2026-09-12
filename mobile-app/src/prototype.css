@@ -330,6 +330,9 @@
 .opportunity-switcher > button.active em { color: #d5b875; }
 .opportunity-switcher > button:disabled, .decision-filter-row button:disabled { cursor: not-allowed; opacity: 0.5; }
 .opportunity-loading { grid-column: 1 / -1; padding: 12px 4px; color: var(--muted); font-size: 10px; text-align: center; }
+.opportunity-loading.error { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--coral); text-align: left; }
+.opportunity-loading.error > span { min-width: 0; }
+.opportunity-loading.error > button { flex: 0 0 auto; min-height: 30px; padding: 0 9px; border: 1px solid rgba(255, 104, 91, 0.35); border-radius: 7px; background: rgba(255, 104, 91, 0.1); color: var(--coral); font-size: 9px; font-weight: 700; }
 
 .capital-settings-card { margin: 10px 0; padding: 11px; border: 1px solid rgba(247, 190, 67, 0.22); border-radius: 12px; background: linear-gradient(145deg, rgba(247, 190, 67, 0.07), var(--surface) 48%); }
 .capital-settings-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }

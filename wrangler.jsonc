@@ -1,11 +1,14 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "alpha-trader-ai",
-  "main": "worker/app.js",
+  "main": "./mobile-app/worker/app.js",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": ["OWNER_API_TOKEN"]
+  },
   "assets": {
-    "directory": "./dist/client",
+    "directory": "./mobile-app/dist/client",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
     "run_worker_first": true
@@ -15,7 +18,7 @@
       "binding": "DB",
       "database_name": "alpha-trader-ai-db",
       "database_id": "ca0e5485-0c5a-4de0-910c-e447f9f45631",
-      "migrations_dir": "./migrations"
+      "migrations_dir": "./mobile-app/migrations"
     }
   ],
   "routes": [

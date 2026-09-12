@@ -262,6 +262,15 @@ test("emits the files required by Sites packaging", async () => {
   assert.match(builtIndex, /<script type="module" crossorigin src="\/assets\/[^\"]+\.js"><\/script>/);
 });
 
+test("keeps the Cloudflare deployment contract at the repository root", async () => {
+  const config = JSON.parse(await readFile(new URL("../../wrangler.jsonc", import.meta.url), "utf8"));
+
+  assert.equal(config.main, "./mobile-app/worker/app.js");
+  assert.equal(config.assets.directory, "./mobile-app/dist/client");
+  assert.equal(config.d1_databases[0].migrations_dir, "./mobile-app/migrations");
+  assert.deepEqual(config.secrets.required, ["OWNER_API_TOKEN"]);
+});
+
 test("provides installable PWA metadata and icons", async () => {
   const manifest = JSON.parse(await readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"));
   const index = await readFile(new URL("../index.html", import.meta.url), "utf8");

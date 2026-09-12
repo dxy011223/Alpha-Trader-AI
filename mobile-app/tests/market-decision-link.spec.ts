@@ -142,6 +142,22 @@ test.beforeEach(async ({ page }) => {
   await page.goto("/app");
 });
 
+test("机会扫描失败会显示原因并可手动重试", async ({ page }) => {
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "服务端尚未配置访问令牌" }),
+    });
+  }, { times: 1 });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+  await expect(page.getByRole("alert")).toContainText("服务端尚未配置访问令牌");
+
+  await page.getByRole("button", { name: "重新扫描" }).click();
+  await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
+});
+
 test("持仓页可连接浏览器钱包并同步 Hyperliquid 数据", async ({ page }) => {
   await page.getByRole("button", { name: "持仓", exact: true }).click();
   await page.getByRole("button", { name: "连接钱包", exact: true }).click();

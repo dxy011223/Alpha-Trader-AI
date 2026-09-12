@@ -14,7 +14,7 @@
     "prebuild": "npm run check:runtime",
     "build": "tsc && vite build && node scripts/prepare-sites-build.mjs",
     "build:cloudflare": "npm run check:runtime && tsc && vite build --mode cloudflare && node scripts/prepare-sites-build.mjs",
-    "deploy:cloudflare": "npm run build:cloudflare && npx wrangler@4.131.0 deploy --keep-vars",
+    "deploy:cloudflare": "npm run build:cloudflare && npx wrangler@4.131.0 deploy --config ../wrangler.jsonc --keep-vars",
     "build:android:web": "npm run check:runtime && tsc && vite build --mode android",
     "android:sync": "npm run build:android:web && node scripts/prepare-android-assets.mjs && cap sync android",
     "android:apk": "npm run android:sync && cd android && gradlew.bat assembleRelease",
