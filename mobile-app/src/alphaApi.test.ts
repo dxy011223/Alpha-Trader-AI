@@ -4,7 +4,8 @@ import { cancelExecution, completePosition, createExecution, loadActiveExecution
 
 const apiBase = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
 
-afterEach(() => {
+afterEach(async () => {
+  await setApiAccessToken("");
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -29,7 +30,7 @@ describe("Alpha Trader API 适配器", () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
-    setApiAccessToken("test-owner-token");
+    await setApiAccessToken("test-owner-token");
     await loadCapitalSettings();
 
     expect(fetchMock).toHaveBeenCalledWith(`${apiBase}/settings/capital`, expect.objectContaining({

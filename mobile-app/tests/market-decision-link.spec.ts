@@ -241,6 +241,30 @@ test("模拟交易不读取真实钱包历史并在决策执行后自动开仓",
   expect(requestedUrls.some((raw) => /\/settings\/wallet$|\/wallet\/0x|\/trades\/completed|\/reviews|\/executions\/active/.test(new URL(raw).pathname))).toBe(false);
 });
 
+test("执行决策只锁定对应币种，其他候选仍可操作", async ({ page }) => {
+  await page.getByRole("button", { name: "行情平台设置" }).click();
+  await page.getByRole("switch", { name: "已关闭" }).click();
+  await page.keyboard.press("Escape");
+
+  await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
+  await page.getByRole("button", { name: /开始执行 ETH/ }).click();
+  await page.getByRole("button", { name: "确认开始执行" }).click();
+
+  const ethDecision = page.getByRole("tab").filter({ hasText: "ETH" });
+  const solDecision = page.getByRole("tab").filter({ hasText: "SOL" });
+  await expect(ethDecision).toContainText("执行中 · 快照已锁定");
+  await expect(solDecision).toBeEnabled();
+  await solDecision.click();
+  await expect(page.getByText("SOL-PERP", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "1h", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "1h", exact: true }).click();
+  await expect(page.getByRole("button", { name: "1h", exact: true })).toHaveAttribute("aria-pressed", "true");
+
+  await ethDecision.click();
+  await expect(page.getByText("ETH-PERP", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "4h", exact: true })).toBeDisabled();
+});
+
 test("切换平台时模拟余额与持仓互不串用", async ({ page }) => {
   await page.getByRole("button", { name: "行情平台设置" }).click();
   await page.getByRole("switch", { name: "已关闭" }).click();

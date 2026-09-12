@@ -1,5 +1,32 @@
 import baseWorker from "./index.js";
 
+const APP_ORIGINS = new Set(["https://localhost", "http://localhost"]);
+
+function appendVary(headers, value) {
+  const values = (headers.get("vary") || "").split(",").map((item) => item.trim().toLowerCase());
+  if (!values.includes(value.toLowerCase())) {
+    headers.set("vary", [...values.filter(Boolean), value].join(", "));
+  }
+}
+
+function withAppCors(request, response) {
+  const url = new URL(request.url);
+  const origin = request.headers.get("origin") || "";
+  if (!url.pathname.startsWith("/api/") || !APP_ORIGINS.has(origin)) return response;
+
+  const headers = new Headers(response.headers);
+  headers.set("access-control-allow-origin", origin);
+  headers.set("access-control-allow-methods", "GET, HEAD, POST, PUT, OPTIONS");
+  headers.set("access-control-allow-headers", "Authorization, Content-Type");
+  headers.set("access-control-max-age", "86400");
+  appendVary(headers, "Origin");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function json(data, status = 200) {
   return Response.json(data, { status, headers: { "cache-control": "no-store" } });
 }
@@ -150,8 +177,7 @@ async function proxyBackend(request, env) {
   return fetch(new Request(target, request));
 }
 
-export default {
-  async fetch(request, env, ctx) {
+async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const simulationMatch = url.pathname.match(/^\/api\/v1\/simulation\/wallet\/([A-Za-z0-9_-]{8,64})$/);
     const protectedLocally = simulationMatch || url.pathname === "/api/v1/settings/capital";
@@ -188,5 +214,14 @@ export default {
       return baseWorker.fetch(new Request(request, { headers }), env, ctx);
     }
     return baseWorker.fetch(request, env, ctx);
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS" && url.pathname.startsWith("/api/") && APP_ORIGINS.has(request.headers.get("origin") || "")) {
+      return withAppCors(request, new Response(null, { status: 204 }));
+    }
+    return withAppCors(request, await handleRequest(request, env, ctx));
   },
 };

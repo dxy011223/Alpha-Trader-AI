@@ -30,6 +30,7 @@ import {
   getApiAccessToken,
   loadAnalysis,
   loadActiveExecutions,
+  loadApiAccessToken,
   loadCandles,
   loadCapitalSettings,
   loadCompletedTrades,
@@ -532,6 +533,7 @@ function MarketScreen({
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [tokenDraft, setTokenDraft] = useState(apiAccessToken);
+  const [tokenSaveState, setTokenSaveState] = useState<"idle" | "saving" | "error">("idle");
   const symbol = freeSymbol;
   const selected = assets[symbol] ?? {
     pair: `${symbol}/USDT`,
@@ -539,6 +541,10 @@ function MarketScreen({
     delta: "0%",
     regime: "等待行情",
   };
+
+  useEffect(() => {
+    setTokenDraft(apiAccessToken);
+  }, [apiAccessToken]);
   const hasFallbackQuote = Boolean(assets[symbol]);
   const fallbackChange = Number(selected.delta.replace("%", ""));
   const price = snapshot?.price ?? Number(selected.price.replace(/,/g, ""));
@@ -637,15 +643,24 @@ function MarketScreen({
           />
           <button
             type="button"
-            onClick={() => {
+            disabled={tokenSaveState === "saving"}
+            onClick={() => void (async () => {
               const nextToken = tokenDraft.trim();
-              setApiAccessToken(nextToken);
-              onApiAccessTokenChange(nextToken);
-            }}
+              setTokenSaveState("saving");
+              try {
+                await setApiAccessToken(nextToken);
+                onApiAccessTokenChange(nextToken);
+                setTokenSaveState("idle");
+              } catch {
+                setTokenSaveState("error");
+              }
+            })()}
           >
-            {tokenDraft.trim() ? "保存本次会话令牌" : "清除令牌"}
+            {tokenSaveState === "saving" ? "保存中…" : tokenDraft.trim() ? "安全保存令牌" : "清除令牌"}
           </button>
-          <small>令牌只保存在当前 App 会话中，不写入安装包或构建配置。</small>
+          <small className={tokenSaveState === "error" ? "error" : ""}>
+            {tokenSaveState === "error" ? "安全存储操作失败，请重试" : "Android 使用系统 Keystore 加密持久化；网页端仅保存当前会话。"}
+          </small>
         </div>
         <div className="settings-section-title"><strong>模拟交易</strong><span>{simulationSyncState === "synced" ? "数据库已同步" : simulationSyncState === "offline" ? "离线缓存" : simulationSyncState === "saving" ? "正在保存" : "正在读取"}</span></div>
         <div className={`simulation-settings-card ${simulationWallet.enabled ? "active" : ""}`}>
@@ -844,6 +859,7 @@ function getOpportunity(score: number) {
 function DecisionScreen({
   openDetails,
   lockedDecision,
+  activeDecisions,
   onMarketSelectionsChange,
   platform,
   simulationEnabled,
@@ -854,6 +870,7 @@ function DecisionScreen({
 }: {
   openDetails: (analysis: AnalysisResponse | null, symbol: AssetSymbol, timeframe: MarketInterval) => void;
   lockedDecision: LockedDecision | null;
+  activeDecisions: LockedDecision[];
   onMarketSelectionsChange: (selections: DecisionMarketSelection[]) => void;
   platform: MarketPlatform;
   simulationEnabled: boolean;
@@ -873,7 +890,12 @@ function DecisionScreen({
   const [capitalState, setCapitalState] = useState<"loading" | "ready" | "saving" | "saved" | "error">("loading");
   const [executionConfirmationOpen, setExecutionConfirmationOpen] = useState(false);
   const [executionMutationState, setExecutionMutationState] = useState<"idle" | "saving" | "error">("idle");
-  const isExecuting = lockedDecision !== null;
+  const activeSymbol = symbol ?? lockedDecision?.analysis.symbol ?? candidates[0]?.symbol ?? "BTC";
+  const activeDecision = activeDecisions.find((item) => item.analysis.symbol === activeSymbol) ?? null;
+  const isExecuting = activeDecision !== null;
+  const selectedTimeframe = activeDecision?.timeframe ?? timeframe;
+  const simulationExecutionBlocked = simulationEnabled && !isExecuting && activeDecisions.length > 0;
+  const activeDecisionKey = activeDecisions.map((item) => item.decisionId).join("|");
   const formatCapital = simulationEnabled ? formatUsdc : formatMoney;
 
   useEffect(() => {
@@ -910,9 +932,13 @@ function DecisionScreen({
             return;
           }
           setCandidates(results);
-          setSymbol((current) => isExecuting
-            ? lockedDecision.analysis.symbol
-            : selectionMode === "auto" || current === null ? results[0].symbol : current);
+          setSymbol((current) => {
+            const currentSymbol = current ?? lockedDecision?.analysis.symbol;
+            if (currentSymbol && activeDecisions.some((item) => item.analysis.symbol === currentSymbol)) {
+              return currentSymbol;
+            }
+            return selectionMode === "auto" || currentSymbol == null ? results[0].symbol : currentSymbol;
+          });
           setRemoteState("ready");
         })
         .catch(() => {
@@ -926,10 +952,9 @@ function DecisionScreen({
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [isExecuting, lockedDecision, platform, selectionMode, timeframe, totalAmount]);
+  }, [activeDecisionKey, lockedDecision, platform, selectionMode, timeframe, totalAmount]);
 
-  const activeSymbol = lockedDecision?.analysis.symbol ?? symbol ?? candidates[0]?.symbol ?? "BTC";
-  const analysis = lockedDecision?.analysis ?? candidates.find((item) => item.symbol === activeSymbol) ?? null;
+  const analysis = activeDecision?.analysis ?? candidates.find((item) => item.symbol === activeSymbol) ?? null;
   const visibleCandidates = candidates.slice(0, 4);
 
   useEffect(() => {
@@ -955,9 +980,9 @@ function DecisionScreen({
   const leverage = analysis?.leverage ?? 3;
   const positionSizing = analysis?.position_sizing;
   const plannedAllocation = positionSizing?.margin_amount ?? 0;
-  const currentAllocation = lockedDecision?.allocatedAmount
+  const currentAllocation = activeDecision?.allocatedAmount
     ?? (simulationEnabled ? Math.min(plannedAllocation, simulationBalance) : plannedAllocation);
-  const nominalExposure = simulationEnabled || lockedDecision
+  const nominalExposure = simulationEnabled || activeDecision
     ? currentAllocation * leverage
     : positionSizing?.position_value ?? currentAllocation * leverage;
   const maxLossAmount = positionSizing?.max_loss_amount ?? 0;
@@ -1012,6 +1037,7 @@ function DecisionScreen({
     try {
       await onStartExecution(analysis, timeframe, totalAmount);
       setSymbol(analysis.symbol);
+      setSelectionMode("manual");
       setExecutionConfirmationOpen(false);
       setExecutionMutationState("idle");
     } catch {
@@ -1036,24 +1062,24 @@ function DecisionScreen({
           <button
             type="button"
             aria-pressed={selectionMode === "auto"}
-            className={isExecuting ? "locked" : selectionMode === "auto" ? "active" : ""}
-            disabled={isExecuting}
+            className={selectionMode === "auto" ? "active" : ""}
             onClick={() => {
               setSelectionMode("auto");
               setSymbol(candidates[0]?.symbol ?? null);
             }}
           >
-            {isExecuting ? "执行锁定" : selectionMode === "auto" ? "自动跟随" : "恢复智能优选"}
+            {selectionMode === "auto" ? "自动跟随" : "恢复智能优选"}
           </button>
         </div>
         <div className="opportunity-switcher" role="tablist" aria-label="AI 机会排名">
-          {visibleCandidates.length > 0 ? visibleCandidates.map((candidate, index) => (
+          {visibleCandidates.length > 0 ? visibleCandidates.map((candidate, index) => {
+            const candidateIsExecuting = activeDecisions.some((item) => item.analysis.symbol === candidate.symbol);
+            return (
               <button
                 type="button"
                 role="tab"
-                aria-selected={symbol === candidate.symbol}
-                className={symbol === candidate.symbol ? "active" : ""}
-                disabled={isExecuting}
+                aria-selected={activeSymbol === candidate.symbol}
+                className={[activeSymbol === candidate.symbol ? "active" : "", candidateIsExecuting ? "executing" : ""].filter(Boolean).join(" ")}
                 onClick={() => {
                   setSymbol(candidate.symbol);
                   setSelectionMode("manual");
@@ -1061,9 +1087,10 @@ function DecisionScreen({
                 key={candidate.symbol}
               >
                 <span><small>#{index + 1}</small><strong>{candidate.symbol}</strong></span>
-                <em>{candidate.score} · {candidate.direction} </em>
+                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.direction}`} </em>
               </button>
-            )) : <div className="opportunity-loading">正在扫描并计算机会评分…</div>}
+            );
+          }) : <div className="opportunity-loading">正在扫描并计算机会评分…</div>}
         </div>
       </section>
 
@@ -1108,13 +1135,13 @@ function DecisionScreen({
           {(["1m", "5m", "1h", "4h", "1d"] as MarketInterval[]).map((item) => (
             <button
               type="button"
-              aria-pressed={timeframe === item}
-              className={timeframe === item ? "active" : ""}
+              aria-pressed={selectedTimeframe === item}
+              className={selectedTimeframe === item ? "active" : ""}
               disabled={isExecuting}
               onClick={() => {
                 setTimeframe(item);
-                setSelectionMode("auto");
-                setSymbol(null);
+                // 手动切换周期时保留当前币种，避免回退到另一条已锁定决策。
+                setSelectionMode("manual");
               }}
               key={item}
             >
@@ -1167,17 +1194,17 @@ function DecisionScreen({
         <div className={`decision-execution-control ${isExecuting ? "executing" : ""}`}>
           <div>
             <strong>{isExecuting ? `${activeSymbol} 决策执行中` : `执行 ${activeSymbol} 决策`}</strong>
-            <span>{isExecuting ? "已固定当前币种、周期与决策快照，行情扫描不会将其替换" : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
+            <span>{isExecuting ? "仅当前币种、周期与决策快照已锁定，其他候选仍可正常查看" : simulationExecutionBlocked ? "模拟钱包已有交易执行中，可查看本决策，结束当前交易后再执行" : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
           </div>
           <button
             type="button"
             aria-pressed={isExecuting}
-            disabled={!analysis || (!isExecuting && direction === "WAIT")}
+            disabled={!analysis || simulationExecutionBlocked || (!isExecuting && direction === "WAIT")}
             onClick={() => void (async () => {
-              if (isExecuting) {
+              if (activeDecision) {
                 setExecutionMutationState("saving");
                 try {
-                  await onCancelExecution(lockedDecision);
+                  await onCancelExecution(activeDecision);
                   setSelectionMode("auto");
                   setSymbol(candidates[0]?.symbol ?? null);
                   setExecutionMutationState("idle");
@@ -1190,7 +1217,7 @@ function DecisionScreen({
             })()}
           >
             <LockClosedIcon />
-            {isExecuting ? "结束执行并恢复智能优选" : `开始执行 ${activeSymbol}`}
+            {isExecuting ? "结束执行并恢复智能优选" : simulationExecutionBlocked ? "已有模拟交易执行中" : `开始执行 ${activeSymbol}`}
           </button>
           {isExecuting && !simulationEnabled && (
             <button
@@ -1210,7 +1237,7 @@ function DecisionScreen({
         open={executionConfirmationOpen}
         onOpenChange={setExecutionConfirmationOpen}
         title="确认开始执行"
-        description={`${activeSymbol}-PERP · ${directionLabels[direction]} · ${timeframe}`}
+        description={`${activeSymbol}-PERP · ${directionLabels[direction]} · ${selectedTimeframe}`}
       >
         <div className="execution-confirm-summary">
           <div><span>本次投入资金</span><strong>{formatCapital(currentAllocation)}</strong></div>
@@ -1256,7 +1283,7 @@ function DecisionScreen({
         <div className="decision-reasons">
           {reasons.map((reason, index) => <p key={reason}><span>{index + 1}</span>{reason}</p>)}
         </div>
-        <button type="button" className="primary-button decision-evidence-button" onClick={() => openDetails(analysis, activeSymbol, timeframe)}>
+        <button type="button" className="primary-button decision-evidence-button" onClick={() => openDetails(analysis, activeSymbol, selectedTimeframe)}>
           <ActivityLogIcon />查看完整依据<ChevronRightIcon />
         </button>
       </section>
@@ -1864,6 +1891,14 @@ function TradingPrototype() {
   }>({ analysis: null, symbol: "BTC", timeframe: "1h" });
 
   useEffect(() => {
+    let active = true;
+    loadApiAccessToken().then((token) => {
+      if (active) setApiAccessTokenState(token);
+    });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
     if (simulationWallet.enabled) {
       setLockedDecision(simulationWallet.activeTrade
         ? simulatedTradeToLockedDecision(simulationWallet.activeTrade)
@@ -2114,6 +2149,9 @@ function TradingPrototype() {
           ) : activeTab === "decision" ? (
             <DecisionScreen
               lockedDecision={lockedDecision?.analysis.platform === marketPlatform ? lockedDecision : null}
+              activeDecisions={simulationWallet.enabled
+                ? simulationWallet.activeTrade ? [simulatedTradeToLockedDecision(simulationWallet.activeTrade)] : []
+                : activeExecutions.filter((item) => item.analysis.platform === marketPlatform)}
               onMarketSelectionsChange={setDecisionMarketSelections}
               platform={marketPlatform}
               simulationEnabled={simulationWallet.enabled}

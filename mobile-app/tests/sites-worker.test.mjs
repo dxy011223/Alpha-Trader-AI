@@ -6,6 +6,38 @@ import worker from "../worker/app.js";
 const OWNER_TOKEN = "test-owner-token-abcdefghijklmnopqrstuvwxyz";
 const authHeaders = { authorization: `Bearer ${OWNER_TOKEN}` };
 
+test("allows Capacitor API requests without authenticating the CORS preflight", async () => {
+  const response = await worker.fetch(new Request("https://example.test/api/v1/ai/analyze", {
+    method: "OPTIONS",
+    headers: {
+      origin: "https://localhost",
+      "access-control-request-method": "POST",
+      "access-control-request-headers": "authorization,content-type",
+    },
+  }), {});
+
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("access-control-allow-origin"), "https://localhost");
+  assert.match(response.headers.get("access-control-allow-methods"), /POST/);
+  assert.match(response.headers.get("access-control-allow-headers"), /Authorization/);
+  assert.match(response.headers.get("vary"), /Origin/i);
+});
+
+test("adds CORS headers to API responses only for app origins", async () => {
+  const env = { OWNER_API_TOKEN: OWNER_TOKEN };
+  const allowed = await worker.fetch(new Request("https://example.test/api/v1/settings/capital", {
+    headers: { ...authHeaders, origin: "http://localhost" },
+  }), env);
+  const denied = await worker.fetch(new Request("https://example.test/api/v1/settings/capital", {
+    headers: { ...authHeaders, origin: "https://attacker.example" },
+  }), env);
+
+  assert.equal(allowed.status, 503);
+  assert.equal(allowed.headers.get("access-control-allow-origin"), "http://localhost");
+  assert.equal(denied.status, 503);
+  assert.equal(denied.headers.get("access-control-allow-origin"), null);
+});
+
 function createSimulationDatabase() {
   const wallets = new Map();
   const capital = new Map();
@@ -253,7 +285,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.2\.0"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.0"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

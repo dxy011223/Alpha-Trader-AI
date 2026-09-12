@@ -1,3 +1,5 @@
+import { Capacitor, registerPlugin } from "@capacitor/core";
+
 import type { SimulationWalletState } from "./simulationTrading";
 
 export type AssetSymbol = string;
@@ -251,14 +253,54 @@ const API_BASE = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
 const REQUEST_TIMEOUT_MS = 12_000;
 export const API_ACCESS_TOKEN_KEY = "alpha-owner-api-token";
 
-export function getApiAccessToken() {
-  return globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY) ?? "";
+interface OwnerTokenPlugin {
+  getToken(): Promise<{ token: string }>;
+  setToken(options: { token: string }): Promise<void>;
+  clearToken(): Promise<void>;
 }
 
-export function setApiAccessToken(token: string) {
+const OwnerToken = registerPlugin<OwnerTokenPlugin>("OwnerToken");
+let cachedApiAccessToken: string | null = null;
+let apiAccessTokenLoad: Promise<string> | null = null;
+
+export function getApiAccessToken() {
+  if (cachedApiAccessToken !== null) return cachedApiAccessToken;
+  if (Capacitor.isNativePlatform()) return "";
+  cachedApiAccessToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY) ?? "";
+  return cachedApiAccessToken;
+}
+
+export function loadApiAccessToken(): Promise<string> {
+  if (cachedApiAccessToken !== null) return Promise.resolve(cachedApiAccessToken);
+  if (!Capacitor.isNativePlatform()) return Promise.resolve(getApiAccessToken());
+  if (!apiAccessTokenLoad) {
+    apiAccessTokenLoad = OwnerToken.getToken()
+      .then(({ token }) => {
+        cachedApiAccessToken = token.trim();
+        return cachedApiAccessToken;
+      })
+      .catch(() => {
+        cachedApiAccessToken = "";
+        return "";
+      });
+  }
+  return apiAccessTokenLoad;
+}
+
+export async function setApiAccessToken(token: string) {
   const normalized = token.trim();
-  if (normalized) globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, normalized);
-  else globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  if (Capacitor.isNativePlatform()) {
+    if (normalized) await OwnerToken.setToken({ token: normalized });
+    else await OwnerToken.clearToken();
+    // 清除旧版本可能留下的会话副本，Android 只使用原生安全存储。
+    globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  } else if (normalized) {
+    globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, normalized);
+  } else {
+    globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  }
+  cachedApiAccessToken = normalized;
+  apiAccessTokenLoad = Promise.resolve(normalized);
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -272,7 +314,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   let response: Response;
   try {
-    const token = getApiAccessToken();
+    const token = await loadApiAccessToken();
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
       signal: controller.signal,
