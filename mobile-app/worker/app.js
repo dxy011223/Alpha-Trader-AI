@@ -27,6 +27,21 @@ function withAppCors(request, response) {
   });
 }
 
+function withHtmlNoStore(request, response) {
+  const acceptsHtml = request.headers.get("accept")?.includes("text/html");
+  const isAppEntry = ["/", "/app", "/index.html"].includes(new URL(request.url).pathname);
+  const isHtml = response.headers.get("content-type")?.includes("text/html");
+  if (!acceptsHtml && !isAppEntry && !isHtml) return response;
+
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", "no-store");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 function json(data, status = 200) {
   return Response.json(data, { status, headers: { "cache-control": "no-store" } });
 }
@@ -222,6 +237,7 @@ export default {
     if (request.method === "OPTIONS" && url.pathname.startsWith("/api/") && APP_ORIGINS.has(request.headers.get("origin") || "")) {
       return withAppCors(request, new Response(null, { status: 204 }));
     }
-    return withAppCors(request, await handleRequest(request, env, ctx));
+    const response = await handleRequest(request, env, ctx);
+    return withAppCors(request, withHtmlNoStore(request, response));
   },
 };

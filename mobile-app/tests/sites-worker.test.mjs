@@ -168,6 +168,7 @@ test("falls back to index.html for an unknown app route", async () => {
   );
 
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
   assert.deepEqual(calls, ["/flow/step-two?source=share", "/index.html"]);
 });
 
@@ -189,6 +190,7 @@ test("serves the app shell to service-worker preload requests", async () => {
   );
 
   assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
   assert.deepEqual(calls, ["/app", "/index.html"]);
 });
 
