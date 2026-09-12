@@ -59,7 +59,7 @@ describe("Alpha Trader API 适配器", () => {
   });
 
   it("按匿名设备 ID 读写模拟交易数据库", async () => {
-    const state = { enabled: true, balance: 1_025, activeTrade: null, history: [] };
+    const state = { enabled: true, balance: 1_025, activeTrades: [], history: [] };
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
       new Response(JSON.stringify(state), { status: 200 }),
     ));

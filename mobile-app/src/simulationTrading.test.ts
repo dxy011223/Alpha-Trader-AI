@@ -47,16 +47,22 @@ describe("模拟交易", () => {
     expect(createDefaultSimulationWallet()).toMatchObject({
       enabled: false,
       balance: DEFAULT_SIMULATION_BALANCE,
-      activeTrade: null,
+      activeTrades: [],
       history: [],
     });
   });
 
   it("按平台恢复独立钱包并兼容旧版单钱包", () => {
-    const legacy = JSON.stringify({ enabled: true, balance: 875, activeTrade: null, history: [] });
+    const legacyTrade = openSimulatedTrade({
+      ...analysis("LONG"),
+      platform: "binance",
+    }, "1h", 875, 1);
+    const legacy = JSON.stringify({ enabled: true, balance: 875, activeTrade: legacyTrade, history: [] });
     const wallets = restoreSimulationWalletBook(null, legacy, "binance");
 
     expect(wallets.binance).toMatchObject({ enabled: true, balance: 875 });
+    expect(wallets.binance.activeTrades).toHaveLength(1);
+    expect(wallets.binance.activeTrades[0].analysis.platform).toBe("binance");
     expect(wallets.hyperliquid).toMatchObject({ enabled: false, balance: DEFAULT_SIMULATION_BALANCE });
     expect(wallets.okx).toMatchObject({ enabled: false, balance: DEFAULT_SIMULATION_BALANCE });
   });

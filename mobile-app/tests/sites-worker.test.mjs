@@ -82,18 +82,25 @@ test("persists simulation wallet state through the D1 binding", async () => {
     platform: "binance",
     enabled: false,
     balance: 1_000,
+    activeTrades: [],
     activeTrade: null,
     history: [],
   });
 
+  const activeTrades = [{ id: 1 }, { id: 2 }, { id: 3 }];
   const saved = await worker.fetch(new Request(url, {
     method: "PUT",
     headers: { "content-type": "application/json", ...authHeaders },
-    body: JSON.stringify({ enabled: true, balance: 1_125.5, activeTrade: null, history: [] }),
+    body: JSON.stringify({ enabled: true, balance: 1_125.5, activeTrades, history: [] }),
   }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
   const payload = await saved.json();
   assert.equal(payload.enabled, true);
   assert.equal(payload.balance, 1_125.5);
+  assert.deepEqual(payload.activeTrades, activeTrades);
+  assert.deepEqual(payload.activeTrade, activeTrades[0], "旧版客户端仍可读取首笔执行状态");
+
+  const reloaded = await worker.fetch(new Request(url, { headers: authHeaders }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.deepEqual((await reloaded.json()).activeTrades, activeTrades);
 
   const hyperliquid = await worker.fetch(new Request(
     "https://example.test/api/v1/simulation/wallet/device_test_12345678?platform=hyperliquid",
@@ -104,6 +111,14 @@ test("persists simulation wallet state through the D1 binding", async () => {
   assert.equal(hyperliquidPayload.enabled, false);
   assert.equal(hyperliquidPayload.balance, 1_000);
   assert.equal(DB.writes, 1, "GET 请求不得创建数据库记录");
+
+  const rejected = await worker.fetch(new Request(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ enabled: true, balance: 1_000, activeTrades: [{}, {}, {}, {}], history: [] }),
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(rejected.status, 422);
+  assert.equal(DB.writes, 1, "超过三笔的模拟交易不得写入数据库");
 });
 
 test("protects owner state and persists capital in D1", async () => {
@@ -296,7 +311,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.0"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.1"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

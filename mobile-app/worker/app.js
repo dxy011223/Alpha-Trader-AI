@@ -1,6 +1,7 @@
 import baseWorker from "./index.js";
 
 const APP_ORIGINS = new Set(["https://localhost", "http://localhost"]);
+const MAX_ACTIVE_DECISIONS = 3;
 
 function appendVary(headers, value) {
   const values = (headers.get("vary") || "").split(",").map((item) => item.trim().toLowerCase());
@@ -110,12 +111,19 @@ async function handleCapital(request, env, ownerId) {
 }
 
 function walletResponse(row, clientId, platform) {
+  const storedActiveTrades = parseJson(row?.active_trade, []);
+  const activeTrades = (Array.isArray(storedActiveTrades)
+    ? storedActiveTrades
+    : storedActiveTrades && typeof storedActiveTrades === "object" ? [storedActiveTrades] : []
+  ).slice(0, MAX_ACTIVE_DECISIONS);
   return {
     client_id: clientId,
     platform,
     enabled: Boolean(row?.enabled),
     balance: Number(row?.balance ?? 1_000),
-    activeTrade: parseJson(row?.active_trade, null),
+    activeTrades,
+    // 保留旧字段，避免尚未升级的 APK 读取数据库后丢失首笔执行状态。
+    activeTrade: activeTrades[0] ?? null,
     history: parseJson(row?.history, []),
     updated_at: row?.updated_at ?? new Date().toISOString(),
   };
@@ -134,10 +142,14 @@ async function handleSimulationWallet(request, env, ownerId, clientId, platform)
       const payload = await request.json();
       const balance = Number(payload.balance);
       const history = Array.isArray(payload.history) ? payload.history.slice(0, 500) : null;
-      const activeTrade = payload.activeTrade === null || typeof payload.activeTrade === "object"
-        ? payload.activeTrade
-        : undefined;
-      if (typeof payload.enabled !== "boolean" || !Number.isFinite(balance) || balance < 0 || balance > 1_000_000_000 || history === null || activeTrade === undefined) {
+      const activeTrades = Array.isArray(payload.activeTrades)
+        ? payload.activeTrades
+        : payload.activeTrade === null ? []
+          : payload.activeTrade && typeof payload.activeTrade === "object" ? [payload.activeTrade] : undefined;
+      const activeTradesValid = Array.isArray(activeTrades)
+        && activeTrades.length <= MAX_ACTIVE_DECISIONS
+        && activeTrades.every((trade) => trade && typeof trade === "object" && !Array.isArray(trade));
+      if (typeof payload.enabled !== "boolean" || !Number.isFinite(balance) || balance < 0 || balance > 1_000_000_000 || history === null || !activeTradesValid) {
         return json({ detail: "模拟钱包数据格式不正确" }, 422);
       }
       const now = new Date().toISOString();
@@ -156,14 +168,14 @@ async function handleSimulationWallet(request, env, ownerId, clientId, platform)
         platform,
         payload.enabled ? 1 : 0,
         balance,
-        activeTrade ? JSON.stringify(activeTrade) : null,
+        activeTrades.length > 0 ? JSON.stringify(activeTrades) : null,
         JSON.stringify(history),
         now,
       ).run();
       return json(walletResponse({
         enabled: payload.enabled,
         balance,
-        active_trade: activeTrade ? JSON.stringify(activeTrade) : null,
+        active_trade: activeTrades.length > 0 ? JSON.stringify(activeTrades) : null,
         history: JSON.stringify(history),
         updated_at: now,
       }, clientId, platform));

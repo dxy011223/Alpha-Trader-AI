@@ -17,8 +17,8 @@ function analysis(symbol: string, platform = "hyperliquid") {
       risk_budget_rate: 0.0075,
       risk_budget_amount: 75,
       stop_distance_rate: 0.05,
-      margin_amount: 500,
-      position_value: 1500,
+      margin_amount: 300,
+      position_value: 900,
       max_loss_amount: 75,
       margin_cap_rate: 0.3,
       capped: false,
@@ -39,7 +39,7 @@ test.beforeEach(async ({ page }) => {
       },
     };
   });
-  type SimulationState = { enabled: boolean; balance: number; activeTrade: object | null; history: object[] };
+  type SimulationState = { enabled: boolean; balance: number; activeTrades: object[]; activeTrade?: object | null; history: object[] };
   const simulationStates = new Map<string, SimulationState>();
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -49,7 +49,7 @@ test.beforeEach(async ({ page }) => {
       const platform = url.searchParams.get("platform") ?? "hyperliquid";
       if (request.method() === "PUT") simulationStates.set(platform, request.postDataJSON() as SimulationState);
       const simulationState = simulationStates.get(platform)
-        ?? { enabled: false, balance: 1_000, activeTrade: null, history: [] };
+        ?? { enabled: false, balance: 1_000, activeTrades: [], activeTrade: null, history: [] };
       await route.fulfill({ json: {
         ...simulationState,
         client_id: url.pathname.split("/").at(-1),
@@ -257,7 +257,7 @@ test("模拟交易不读取真实钱包历史并在决策执行后自动开仓",
   expect(requestedUrls.some((raw) => /\/settings\/wallet$|\/wallet\/0x|\/trades\/completed|\/reviews|\/executions\/active/.test(new URL(raw).pathname))).toBe(false);
 });
 
-test("执行决策只锁定对应币种，其他候选仍可操作", async ({ page }) => {
+test("最多可同时执行三个决策，且只锁定对应币种", async ({ page }) => {
   await page.getByRole("button", { name: "行情平台设置" }).click();
   await page.getByRole("switch", { name: "已关闭" }).click();
   await page.keyboard.press("Escape");
@@ -276,6 +276,23 @@ test("执行决策只锁定对应币种，其他候选仍可操作", async ({ pa
   await page.getByRole("button", { name: "1h", exact: true }).click();
   await expect(page.getByRole("button", { name: "1h", exact: true })).toHaveAttribute("aria-pressed", "true");
 
+  await page.getByRole("button", { name: /开始执行 SOL/ }).click();
+  await page.getByRole("button", { name: "确认开始执行" }).click();
+  const hypeDecision = page.getByRole("tab").filter({ hasText: "HYPE" });
+  await hypeDecision.click();
+  await page.getByRole("button", { name: /开始执行 HYPE/ }).click();
+  await page.getByRole("button", { name: "确认开始执行" }).click();
+
+  const dogeDecision = page.getByRole("tab").filter({ hasText: "DOGE" });
+  await dogeDecision.click();
+  await expect(page.getByRole("button", { name: "已达 3 个执行上限" })).toBeDisabled();
+  await expect(page.getByText("已达到最多 3 个同时执行的上限，请先结束一个决策")).toBeVisible();
+
+  await page.getByLabel("主导航").getByRole("button", { name: "持仓", exact: true }).click();
+  await expect(page.getByText("3 个执行中", { exact: true })).toBeVisible();
+  await expect(page.getByRole("tablist", { name: "执行中持仓" }).getByRole("tab")).toHaveCount(3);
+
+  await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
   await ethDecision.click();
   await expect(page.getByText("ETH-PERP", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "4h", exact: true })).toBeDisabled();

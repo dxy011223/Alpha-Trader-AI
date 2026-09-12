@@ -1,6 +1,7 @@
 import type { AnalysisResponse, CompletedTradeRecord, MarketInterval, MarketPlatform } from "./alphaApi";
 
 export const DEFAULT_SIMULATION_BALANCE = 1_000;
+export const MAX_ACTIVE_DECISIONS = 3;
 export const SIMULATION_CLIENT_ID_KEY = "alpha-simulation-client-id";
 export const SIMULATION_WALLETS_KEY = "alpha-simulation-wallets";
 export const simulationPlatforms: MarketPlatform[] = ["hyperliquid", "binance", "okx"];
@@ -27,9 +28,13 @@ export interface SimulatedCompletedTrade extends CompletedTradeRecord {
 export interface SimulationWalletState {
   enabled: boolean;
   balance: number;
-  activeTrade: SimulatedTrade | null;
+  activeTrades: SimulatedTrade[];
   history: SimulatedCompletedTrade[];
 }
+
+type LegacySimulationWalletState = Partial<SimulationWalletState> & {
+  activeTrade?: SimulatedTrade | null;
+};
 
 export type SimulationWalletBook = Record<MarketPlatform, SimulationWalletState>;
 
@@ -45,7 +50,7 @@ export function createDefaultSimulationWallet(enabled = false): SimulationWallet
   return {
     enabled,
     balance: DEFAULT_SIMULATION_BALANCE,
-    activeTrade: null,
+    activeTrades: [],
     history: [],
   };
 }
@@ -53,24 +58,29 @@ export function createDefaultSimulationWallet(enabled = false): SimulationWallet
 export function hasSimulationData(state: SimulationWalletState) {
   return state.enabled
     || state.balance !== DEFAULT_SIMULATION_BALANCE
-    || state.activeTrade !== null
+    || state.activeTrades.length > 0
     || state.history.length > 0;
 }
 
 export function restoreSimulationWallet(raw: string | null, platform: MarketPlatform = "hyperliquid"): SimulationWalletState {
   if (!raw) return createDefaultSimulationWallet();
   try {
-    const stored = JSON.parse(raw) as Partial<SimulationWalletState> | null;
+    const stored = JSON.parse(raw) as LegacySimulationWalletState | null;
     if (!stored || typeof stored !== "object") return createDefaultSimulationWallet();
-    const activeTrade = stored.activeTrade
-      ? {
-          ...stored.activeTrade,
+    const storedActiveTrades = Array.isArray(stored.activeTrades)
+      ? stored.activeTrades
+      : stored.activeTrade ? [stored.activeTrade] : [];
+    // 旧版本仅保存 activeTrade；恢复时自动迁移并限制为当前并发上限。
+    const activeTrades = storedActiveTrades
+      .filter((trade): trade is SimulatedTrade => Boolean(trade && typeof trade === "object"))
+      .slice(0, MAX_ACTIVE_DECISIONS)
+      .map((trade) => ({
+          ...trade,
           analysis: {
-            ...stored.activeTrade.analysis,
+            ...trade.analysis,
             platform,
           },
-        }
-      : null;
+        }));
     const history = Array.isArray(stored.history)
       ? stored.history.slice(0, 500).map((trade) => ({
           ...trade,
@@ -86,7 +96,7 @@ export function restoreSimulationWallet(raw: string | null, platform: MarketPlat
       balance: Number.isFinite(stored.balance) && Number(stored.balance) >= 0
         ? Number(stored.balance)
         : DEFAULT_SIMULATION_BALANCE,
-      activeTrade,
+      activeTrades,
       history,
     };
   } catch {
@@ -124,8 +134,10 @@ export function restoreSimulationWalletBook(
   if (!legacyRaw) return wallets;
   let inferredPlatform = legacyPlatform;
   try {
-    const legacy = JSON.parse(legacyRaw) as Partial<SimulationWalletState>;
-    const storedPlatform = legacy.activeTrade?.analysis.platform ?? legacy.history?.[0]?.platform;
+    const legacy = JSON.parse(legacyRaw) as LegacySimulationWalletState;
+    const storedPlatform = legacy.activeTrades?.[0]?.analysis.platform
+      ?? legacy.activeTrade?.analysis.platform
+      ?? legacy.history?.[0]?.platform;
     if (simulationPlatforms.includes(storedPlatform as MarketPlatform)) {
       inferredPlatform = storedPlatform as MarketPlatform;
     }

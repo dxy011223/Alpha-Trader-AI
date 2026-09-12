@@ -65,6 +65,7 @@ import { BottomSheet, KeyboardInput, MobileScroll, useKeyboard } from "./mobile"
 import DownloadLanding from "./DownloadLanding";
 import {
   DEFAULT_SIMULATION_BALANCE,
+  MAX_ACTIVE_DECISIONS,
   SIMULATION_WALLETS_KEY,
   closeSimulatedTradeIfTriggered,
   createDefaultSimulationWallet,
@@ -673,7 +674,7 @@ function MarketScreen({
             type="button"
             role="switch"
             aria-checked={simulationWallet.enabled}
-            disabled={simulationWallet.activeTrade !== null}
+            disabled={simulationWallet.activeTrades.length > 0}
             onClick={() => onSimulationEnabledChange(!simulationWallet.enabled)}
           >
             <i />
@@ -682,12 +683,12 @@ function MarketScreen({
           <div className="simulation-wallet-summary">
             <span>模拟钱包余额</span>
             <strong>{formatUsdc(simulationWallet.balance)}</strong>
-            <small>{simulationWallet.activeTrade ? "当前平台有模拟交易执行中，可切换平台，暂不可关闭或重置" : `默认 ${DEFAULT_SIMULATION_BALANCE} USDC · 不影响真实资产`}</small>
+            <small>{simulationWallet.activeTrades.length > 0 ? `当前平台有模拟交易执行中（${simulationWallet.activeTrades.length} 笔），可切换平台，暂不可关闭或重置` : `默认 ${DEFAULT_SIMULATION_BALANCE} USDC · 不影响真实资产`}</small>
           </div>
           <button
             className="simulation-reset-button"
             type="button"
-            disabled={simulationWallet.activeTrade !== null}
+            disabled={simulationWallet.activeTrades.length > 0}
             onClick={onResetSimulationWallet}
           >
             重置为 1000 USDC
@@ -896,7 +897,10 @@ function DecisionScreen({
   const activeDecision = activeDecisions.find((item) => item.analysis.symbol === activeSymbol) ?? null;
   const isExecuting = activeDecision !== null;
   const selectedTimeframe = activeDecision?.timeframe ?? timeframe;
-  const simulationExecutionBlocked = simulationEnabled && !isExecuting && activeDecisions.length > 0;
+  const executionLimitReached = !isExecuting && activeDecisions.length >= MAX_ACTIVE_DECISIONS;
+  const activeSimulationAllocation = activeDecisions.reduce((sum, item) => sum + item.allocatedAmount, 0);
+  const simulationAvailableBalance = Math.max(0, simulationBalance - activeSimulationAllocation);
+  const simulationBalanceExhausted = simulationEnabled && !isExecuting && simulationAvailableBalance <= 0;
   const activeDecisionKey = activeDecisions.map((item) => item.decisionId).join("|");
   const formatCapital = simulationEnabled ? formatUsdc : formatMoney;
 
@@ -992,7 +996,7 @@ function DecisionScreen({
   const positionSizing = analysis?.position_sizing;
   const plannedAllocation = positionSizing?.margin_amount ?? 0;
   const currentAllocation = activeDecision?.allocatedAmount
-    ?? (simulationEnabled ? Math.min(plannedAllocation, simulationBalance) : plannedAllocation);
+    ?? (simulationEnabled ? Math.min(plannedAllocation, simulationAvailableBalance) : plannedAllocation);
   const nominalExposure = simulationEnabled || activeDecision
     ? currentAllocation * leverage
     : positionSizing?.position_value ?? currentAllocation * leverage;
@@ -1043,7 +1047,7 @@ function DecisionScreen({
   };
 
   const confirmExecution = async () => {
-    if (!analysis || direction === "WAIT") return;
+    if (!analysis || direction === "WAIT" || executionLimitReached || simulationBalanceExhausted) return;
     setExecutionMutationState("saving");
     try {
       await onStartExecution(analysis, timeframe, totalAmount);
@@ -1210,12 +1214,18 @@ function DecisionScreen({
         <div className={`decision-execution-control ${isExecuting ? "executing" : ""}`}>
           <div>
             <strong>{isExecuting ? `${activeSymbol} 决策执行中` : `执行 ${activeSymbol} 决策`}</strong>
-            <span>{isExecuting ? "仅当前币种、周期与决策快照已锁定，其他候选仍可正常查看" : simulationExecutionBlocked ? "模拟钱包已有交易执行中，可查看本决策，结束当前交易后再执行" : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
+            <span>{isExecuting
+              ? `仅当前币种、周期与决策快照已锁定；当前 ${activeDecisions.length}/${MAX_ACTIVE_DECISIONS} 个执行中`
+              : executionLimitReached
+                ? `已达到最多 ${MAX_ACTIVE_DECISIONS} 个同时执行的上限，请先结束一个决策`
+                : simulationBalanceExhausted
+                  ? "模拟钱包可用保证金不足，请先结束一个决策"
+                  : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损独立结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
           </div>
           <button
             type="button"
             aria-pressed={isExecuting}
-            disabled={!analysis || simulationExecutionBlocked || (!isExecuting && direction === "WAIT")}
+            disabled={!analysis || executionLimitReached || simulationBalanceExhausted || (!isExecuting && direction === "WAIT")}
             onClick={() => void (async () => {
               if (activeDecision) {
                 setExecutionMutationState("saving");
@@ -1233,7 +1243,7 @@ function DecisionScreen({
             })()}
           >
             <LockClosedIcon />
-            {isExecuting ? "结束执行并恢复智能优选" : simulationExecutionBlocked ? "已有模拟交易执行中" : `开始执行 ${activeSymbol}`}
+            {isExecuting ? "结束当前决策" : executionLimitReached ? `已达 ${MAX_ACTIVE_DECISIONS} 个执行上限` : simulationBalanceExhausted ? "模拟保证金不足" : `开始执行 ${activeSymbol}`}
           </button>
           {isExecuting && !simulationEnabled && (
             <button
@@ -1268,11 +1278,11 @@ function DecisionScreen({
         </div>
         <div className="execution-confirm-actions">
           <button type="button" onClick={() => setExecutionConfirmationOpen(false)}>取消</button>
-          <button type="button" disabled={executionMutationState === "saving"} onClick={() => void confirmExecution()}>
+          <button type="button" disabled={executionMutationState === "saving" || executionLimitReached || simulationBalanceExhausted} onClick={() => void confirmExecution()}>
             {executionMutationState === "saving" ? "保存中…" : "确认开始执行"}
           </button>
         </div>
-        {executionMutationState === "error" && <small className="execution-save-error">保存失败，请检查后端连接或是否已有执行中的决策。</small>}
+        {executionMutationState === "error" && <small className="execution-save-error">保存失败，请检查后端连接、资金余额或并行执行数量。</small>}
       </BottomSheet>
 
       <section className="decision-detail-card" aria-labelledby="score-breakdown-title">
@@ -1574,7 +1584,10 @@ function SecondaryScreen({
   const activePosition = lockedDecision?.analysis;
   const positionSizing = activePosition?.position_sizing;
   const startedAt = lockedDecision ? formatDecisionTime(lockedDecision.startedAt) : "";
-  const simulatedTrade = simulationWallet.activeTrade;
+  const simulatedTrade = lockedDecision
+    ? simulationWallet.activeTrades.find((trade) => trade.id === lockedDecision.decisionId) ?? null
+    : null;
+  const simulatedUnrealizedPnl = simulationWallet.activeTrades.reduce((sum, trade) => sum + trade.unrealizedPnl, 0);
   const simulatedTotalPnl = simulationWallet.history.reduce((sum, trade) => sum + trade.net_pnl, 0);
   const selectedMonitor = lockedDecision
     ? positionMonitors.find((item) => item.position_id === lockedDecision.positionId)
@@ -1603,7 +1616,7 @@ function SecondaryScreen({
             </div>
             <div className="wallet-balance-grid">
               <div><span>钱包余额</span><strong>{formatUsdc(simulationWallet.balance)}</strong></div>
-              <div><span>浮动盈亏</span><strong className={(simulatedTrade?.unrealizedPnl ?? 0) < 0 ? "loss" : "profit"}>{formatUsdc(simulatedTrade?.unrealizedPnl ?? 0)}</strong></div>
+              <div><span>浮动盈亏</span><strong className={simulatedUnrealizedPnl < 0 ? "loss" : "profit"}>{formatUsdc(simulatedUnrealizedPnl)}</strong></div>
               <div><span>累计已结算</span><strong className={simulatedTotalPnl < 0 ? "loss" : "profit"}>{formatUsdc(simulatedTotalPnl)}</strong></div>
             </div>
             <small className="wallet-connected-address">已完成 {simulationWallet.history.length} 笔模拟交易 · 当前平台数据独立保存</small>
@@ -1890,7 +1903,9 @@ function TradingPrototype() {
   const simulationWalletsRef = useRef(simulationWallets);
   const lastSyncedSimulationRef = useRef<Partial<Record<MarketPlatform, string>>>({});
   const activeSimulationKey = simulationPlatforms.map((platform) => (
-    simulationWallets[platform].enabled ? simulationWallets[platform].activeTrade?.id ?? "" : ""
+    simulationWallets[platform].enabled
+      ? simulationWallets[platform].activeTrades.map((trade) => trade.id).join(",")
+      : ""
   )).join("|");
   const [marketMode, setMarketMode] = useState<MarketMode>("free");
   const [freeMarketSymbol, setFreeMarketSymbol] = useState<AssetSymbol>("BTC");
@@ -1916,9 +1931,10 @@ function TradingPrototype() {
 
   useEffect(() => {
     if (simulationWallet.enabled) {
-      setLockedDecision(simulationWallet.activeTrade
-        ? simulatedTradeToLockedDecision(simulationWallet.activeTrade)
-        : null);
+      const decisions = simulationWallet.activeTrades.map(simulatedTradeToLockedDecision);
+      setLockedDecision((current) => (
+        decisions.find((item) => item.decisionId === current?.decisionId) ?? decisions[0] ?? null
+      ));
       return;
     }
     const controller = new AbortController();
@@ -1932,7 +1948,7 @@ function TradingPrototype() {
       })
       .catch(() => undefined);
     return () => controller.abort();
-  }, [apiAccessToken, marketPlatform, simulationWallet.activeTrade?.id, simulationWallet.enabled]);
+  }, [apiAccessToken, activeSimulationKey, marketPlatform, simulationWallet.enabled]);
 
   useEffect(() => {
     if (simulationWallet.enabled) {
@@ -2035,7 +2051,7 @@ function TradingPrototype() {
   useEffect(() => {
     const activeTrades = simulationPlatforms.flatMap((platform) => {
       const wallet = simulationWallets[platform];
-      return wallet.enabled && wallet.activeTrade ? [{ platform, trade: wallet.activeTrade }] : [];
+      return wallet.enabled ? wallet.activeTrades.map((trade) => ({ platform, trade })) : [];
     });
     if (activeTrades.length === 0) return;
     const controller = new AbortController();
@@ -2056,16 +2072,19 @@ function TradingPrototype() {
             if (result.status !== "fulfilled") continue;
             const { platform, trade, snapshot } = result.value;
             const wallet = next[platform];
-            if (wallet.activeTrade?.id !== trade.id) continue;
+            const currentTrade = wallet.activeTrades.find((item) => item.id === trade.id);
+            if (!currentTrade) continue;
             const completed = closeSimulatedTradeIfTriggered(trade, snapshot.price);
             const updatedWallet = completed ? {
               ...wallet,
               balance: Math.max(0, wallet.balance + completed.net_pnl),
-              activeTrade: null,
+              activeTrades: wallet.activeTrades.filter((item) => item.id !== trade.id),
               history: [completed, ...wallet.history].slice(0, 500),
             } : {
               ...wallet,
-              activeTrade: updateSimulatedTrade(wallet.activeTrade, snapshot.price),
+              activeTrades: wallet.activeTrades.map((item) => (
+                item.id === trade.id ? updateSimulatedTrade(currentTrade, snapshot.price) : item
+              )),
             };
             if (next === current) next = { ...current };
             next[platform] = updatedWallet;
@@ -2098,11 +2117,22 @@ function TradingPrototype() {
       setLockedDecision(decision);
       return decision;
     }
-    const trade = openSimulatedTrade(analysis, timeframe, simulationWallet.balance);
+    if (simulationWallet.activeTrades.length >= MAX_ACTIVE_DECISIONS) {
+      throw new Error(`最多同时执行 ${MAX_ACTIVE_DECISIONS} 个决策`);
+    }
+    if (simulationWallet.activeTrades.some((trade) => trade.analysis.symbol === analysis.symbol)) {
+      throw new Error("当前币种已有执行中的决策");
+    }
+    const allocatedAmount = simulationWallet.activeTrades.reduce((sum, trade) => sum + trade.allocatedAmount, 0);
+    const availableBalance = Math.max(0, simulationWallet.balance - allocatedAmount);
+    const trade = openSimulatedTrade(analysis, timeframe, availableBalance, Date.now() + simulationWallet.activeTrades.length);
     const decision = simulatedTradeToLockedDecision(trade);
     setSimulationWallets((current) => ({
       ...current,
-      [marketPlatform]: { ...current[marketPlatform], activeTrade: trade },
+      [marketPlatform]: {
+        ...current[marketPlatform],
+        activeTrades: [trade, ...current[marketPlatform].activeTrades],
+      },
     }));
     setLockedDecision(decision);
     return decision;
@@ -2110,10 +2140,14 @@ function TradingPrototype() {
 
   const cancelTrackedExecution = async (decision: LockedDecision) => {
     if (simulationWallet.enabled) {
-      setSimulationWallets((current) => current[marketPlatform].activeTrade?.id === decision.decisionId
-        ? { ...current, [marketPlatform]: { ...current[marketPlatform], activeTrade: null } }
-        : current);
-      setLockedDecision(null);
+      setSimulationWallets((current) => {
+        const activeTrades = current[marketPlatform].activeTrades.filter((trade) => trade.id !== decision.decisionId);
+        setLockedDecision(activeTrades[0] ? simulatedTradeToLockedDecision(activeTrades[0]) : null);
+        return {
+          ...current,
+          [marketPlatform]: { ...current[marketPlatform], activeTrades },
+        };
+      });
       return;
     }
     await cancelExecution(decision.decisionId);
@@ -2143,7 +2177,7 @@ function TradingPrototype() {
               apiAccessToken={apiAccessToken}
               onApiAccessTokenChange={setApiAccessTokenState}
               onSimulationEnabledChange={(enabled) => {
-                if (simulationWallet.activeTrade) return;
+                if (simulationWallet.activeTrades.length > 0) return;
                 setLockedDecision(null);
                 setSimulationWallets((current) => ({
                   ...current,
@@ -2151,7 +2185,7 @@ function TradingPrototype() {
                 }));
               }}
               onResetSimulationWallet={() => {
-                if (simulationWallet.activeTrade) return;
+                if (simulationWallet.activeTrades.length > 0) return;
                 setSimulationWallets((current) => ({
                   ...current,
                   [marketPlatform]: createDefaultSimulationWallet(simulationWallet.enabled),
@@ -2166,7 +2200,7 @@ function TradingPrototype() {
             <DecisionScreen
               lockedDecision={lockedDecision?.analysis.platform === marketPlatform ? lockedDecision : null}
               activeDecisions={simulationWallet.enabled
-                ? simulationWallet.activeTrade ? [simulatedTradeToLockedDecision(simulationWallet.activeTrade)] : []
+                ? simulationWallet.activeTrades.map(simulatedTradeToLockedDecision)
                 : activeExecutions.filter((item) => item.analysis.platform === marketPlatform)}
               onMarketSelectionsChange={setDecisionMarketSelections}
               platform={marketPlatform}
@@ -2185,9 +2219,11 @@ function TradingPrototype() {
             tab={activeTab}
             lockedDecision={lockedDecision?.analysis.platform === marketPlatform
               ? lockedDecision
-              : activeExecutions[0] ?? null}
+              : simulationWallet.enabled && simulationWallet.activeTrades[0]
+                ? simulatedTradeToLockedDecision(simulationWallet.activeTrades[0])
+                : activeExecutions.find((item) => item.analysis.platform === marketPlatform) ?? null}
             activeDecisions={simulationWallet.enabled
-              ? simulationWallet.activeTrade ? [simulatedTradeToLockedDecision(simulationWallet.activeTrade)] : []
+              ? simulationWallet.activeTrades.map(simulatedTradeToLockedDecision)
               : activeExecutions}
             completedTrades={simulationWallet.enabled ? simulationWallet.history : completedTrades}
             reviews={reviews}
