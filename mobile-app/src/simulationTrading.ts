@@ -93,7 +93,7 @@ export function restoreSimulationWallet(raw: string | null, platform: MarketPlat
       : [];
     return {
       enabled: stored.enabled === true,
-      balance: Number.isFinite(stored.balance) && Number(stored.balance) >= 0
+      balance: Number.isFinite(stored.balance) && Math.abs(Number(stored.balance)) <= 1_000_000_000
         ? Number(stored.balance)
         : DEFAULT_SIMULATION_BALANCE,
       activeTrades,
@@ -156,16 +156,17 @@ export function calculateSimulatedPnl(trade: Pick<SimulatedTrade, "analysis" | "
 export function openSimulatedTrade(
   analysis: AnalysisResponse,
   timeframe: MarketInterval,
-  balance: number,
+  referenceBalance: number,
   now = Date.now(),
 ): SimulatedTrade {
   if (analysis.direction === "WAIT") throw new Error("等待信号不能开启模拟交易");
   const validEntries = analysis.entry_range.filter((price) => Number.isFinite(price) && price > 0);
   if (validEntries.length === 0) throw new Error("决策缺少有效入场价格");
   const entryPrice = validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
-  const requestedMargin = analysis.position_sizing?.margin_amount || balance * 0.1;
-  const allocatedAmount = Math.min(Math.max(requestedMargin, 0), Math.max(balance, 0));
-  if (allocatedAmount <= 0) throw new Error("模拟钱包余额不足");
+  // 模拟账户仅统计盈亏，不用余额限制决策样本的计划保证金。
+  const requestedMargin = analysis.position_sizing?.margin_amount || Math.max(referenceBalance, DEFAULT_SIMULATION_BALANCE) * 0.1;
+  const allocatedAmount = Math.max(requestedMargin, 0);
+  if (allocatedAmount <= 0) throw new Error("决策缺少有效模拟保证金");
   const size = allocatedAmount * Math.max(analysis.leverage, 1) / entryPrice;
 
   return {

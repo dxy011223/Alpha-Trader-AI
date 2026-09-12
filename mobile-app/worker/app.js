@@ -149,7 +149,7 @@ async function handleSimulationWallet(request, env, ownerId, clientId, platform)
       const activeTradesValid = Array.isArray(activeTrades)
         && activeTrades.length <= MAX_ACTIVE_DECISIONS
         && activeTrades.every((trade) => trade && typeof trade === "object" && !Array.isArray(trade));
-      if (typeof payload.enabled !== "boolean" || !Number.isFinite(balance) || balance < 0 || balance > 1_000_000_000 || history === null || !activeTradesValid) {
+      if (typeof payload.enabled !== "boolean" || !Number.isFinite(balance) || Math.abs(balance) > 1_000_000_000 || history === null || !activeTradesValid) {
         return json({ detail: "模拟钱包数据格式不正确" }, 422);
       }
       const now = new Date().toISOString();
@@ -234,11 +234,13 @@ async function handleRequest(request, env, ctx) {
       if (url.pathname === "/api/v1/settings/capital") {
         return handleCapital(request, env, auth.ownerId);
       }
-      const capital = await readCapital(env, auth.ownerId);
-      if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
-      const headers = new Headers(request.headers);
-      headers.set("x-alpha-owner-capital", String(capital.total_amount));
-      return baseWorker.fetch(new Request(request, { headers }), env, ctx);
+      if (aiRoute) {
+        const capital = await readCapital(env, auth.ownerId);
+        if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
+        const headers = new Headers(request.headers);
+        headers.set("x-alpha-owner-capital", String(capital.total_amount));
+        return baseWorker.fetch(new Request(request, { headers }), env, ctx);
+      }
     }
     return baseWorker.fetch(request, env, ctx);
 }

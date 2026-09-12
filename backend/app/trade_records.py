@@ -18,6 +18,15 @@ from app.schemas import (
 )
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """SQLite 会丢失时区信息；API 始终按 UTC 返回持久化时间。"""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _decision_platform(decision: TrackedDecision) -> str:
     return str((decision.analysis_snapshot or {}).get("platform") or "hyperliquid")
 
@@ -30,8 +39,8 @@ def _decision_response(record: TrackedDecision) -> DecisionRecordResponse:
         timeframe=record.timeframe,
         total_amount=float(record.total_amount),
         allocated_amount=float(record.allocated_amount),
-        started_at=record.started_at,
-        completed_at=record.completed_at,
+        started_at=_as_utc(record.started_at),
+        completed_at=_as_utc(record.completed_at),
     )
 
 
@@ -50,8 +59,8 @@ def _position_response(record: TrackedPosition) -> PositionRecordResponse:
         stop_loss=float(record.stop_loss),
         take_profit=[float(value) for value in record.take_profit],
         status=record.status,
-        created_at=record.created_at,
-        closed_at=record.closed_at,
+        created_at=_as_utc(record.created_at),
+        closed_at=_as_utc(record.closed_at),
     )
 
 
@@ -212,10 +221,10 @@ def _trade_response(
         pnl_percent=trade.pnl_percent,
         entry_source=trade.entry_source,
         exit_source=trade.exit_source,
-        closed_at=trade.closed_at,
+        closed_at=_as_utc(trade.closed_at),
         analysis=decision.analysis_snapshot,
         timeframe=decision.timeframe,
-        started_at=decision.started_at,
+        started_at=_as_utc(decision.started_at),
         allocated_amount=float(decision.allocated_amount),
         platform=_decision_platform(decision),
     )
@@ -232,7 +241,7 @@ def _review_response(review: ReviewRecord) -> ReviewRecordResponse:
         findings=review.findings,
         adjustments=review.adjustments,
         metrics=review.metrics,
-        created_at=review.created_at,
+        created_at=_as_utc(review.created_at),
     )
 
 
@@ -300,15 +309,7 @@ def _build_trade_review(
         f"本次共产生手续费 {float(trade.fee):,.4f} USDC，占毛盈亏绝对值 {fee_share:.2f}%。",
         f"相对计划最大亏损，本次结果为 {risk_multiple:+.2f}R。",
     ]
-    adjustments = []
-    if trade.entry_source == "plan":
-        adjustments.append("未检索到决策开始后的开仓成交，下次应在实际开仓前启动跟踪。")
-    if fee_share >= 10:
-        adjustments.append("手续费占比较高，后续应减少碎片化成交并评估限价单。")
-    if result == "loss" and risk_multiple < -1.05:
-        adjustments.append("实际亏损超过计划风险预算，需要核查止损执行偏差。")
-    if not adjustments:
-        adjustments.append("执行结果与计划风险边界一致，继续保留当前仓位计算规则。")
+    adjustments = ["AI 分析暂不可用，本次仅保留已核验交易事实。"]
     return ReviewRecord(
         trade_id=trade.id,
         review_type="trade",
@@ -327,7 +328,7 @@ def _build_trade_review(
             "pnl_percent": trade.pnl_percent,
             "risk_multiple": round(risk_multiple, 4),
             "platform": _decision_platform(decision),
-            "analysis_engine": "rules",
+            "analysis_engine": "facts",
             "analysis_model": None,
         },
     )
@@ -548,15 +549,7 @@ def generate_daily_review(
             f"当日完成 {total} 笔真实交易，胜率 {win_rate:.1f}%。",
             f"净盈亏 {float(net_pnl):+,.2f} USDC，手续费合计 {float(fees):,.4f} USDC。",
         ]
-        adjustments = []
-        if not trades:
-            adjustments.append("当日没有完成交易，不调整策略参数。")
-        elif win_rate < 50:
-            adjustments.append("当日胜率低于 50%，下一交易日降低总风险敞口并复核入场条件。")
-        elif fees > abs(net_pnl) * Decimal("0.1"):
-            adjustments.append("手续费占比较高，下一交易日减少不必要的分批成交。")
-        else:
-            adjustments.append("当日执行与风险边界稳定，保留当前仓位规则并继续观察。")
+        adjustments = ["AI 分析暂不可用，本次仅保留已核验交易事实。"]
 
         review = existing or ReviewRecord(
             trade_id=None,
@@ -567,6 +560,9 @@ def generate_daily_review(
         review.summary = f"{target_date.isoformat()} {platform} 每日真实交易复盘"
         review.findings = findings
         review.adjustments = adjustments
+        previous_optimization = (
+            (existing.metrics or {}).get("strategy_optimization") if existing else None
+        )
         review.metrics = {
                 "total": total,
                 "wins": wins,
@@ -574,10 +570,13 @@ def generate_daily_review(
                 "win_rate": round(win_rate, 4),
                 "fees": float(fees),
                 "net_pnl": float(net_pnl),
-                "analysis_engine": "rules",
+                "analysis_engine": "facts",
                 "analysis_model": None,
                 "platform": platform,
             }
+        if previous_optimization:
+            # 重跑同一日复盘时保留已经落库的策略优化结果，确保幂等。
+            review.metrics["strategy_optimization"] = previous_optimization
         if existing is None:
             session.add(review)
         session.flush()

@@ -6,6 +6,7 @@ import {
   closeSimulatedTradeIfTriggered,
   createDefaultSimulationWallet,
   restoreSimulationWalletBook,
+  restoreSimulationWallet,
   openSimulatedTrade,
   updateSimulatedTrade,
 } from "./simulationTrading";
@@ -67,10 +68,21 @@ describe("模拟交易", () => {
     expect(wallets.okx).toMatchObject({ enabled: false, balance: DEFAULT_SIMULATION_BALANCE });
   });
 
-  it("开仓保证金不超过钱包余额", () => {
+  it("模拟开仓不受钱包余额限制", () => {
     const trade = openSimulatedTrade(analysis("LONG"), "1h", 100, 1);
-    expect(trade.allocatedAmount).toBe(100);
-    expect(trade.size).toBe(2);
+    expect(trade.allocatedAmount).toBe(200);
+    expect(trade.size).toBe(4);
+  });
+
+  it("累计亏损后的负净值可以恢复用于复盘", () => {
+    const wallet = restoreSimulationWallet(JSON.stringify({
+      enabled: true,
+      balance: -125.5,
+      activeTrades: [],
+      history: [],
+    }));
+
+    expect(wallet.balance).toBe(-125.5);
   });
 
   it("多单触发止盈并计算盈利", () => {

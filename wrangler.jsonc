@@ -7,6 +7,9 @@
   "secrets": {
     "required": ["OWNER_API_TOKEN"]
   },
+  "ai": {
+    "binding": "AI"
+  },
   "assets": {
     "directory": "./mobile-app/dist/client",
     "binding": "ASSETS",

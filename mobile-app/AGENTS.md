@@ -8,6 +8,7 @@
 - The selected visual target is `reference-option-1.png` (拇指驾驶舱).
 - Only 市场总览 may show K-line charts. Its 自由 mode renders one searched asset at a time; its 决策 mode renders four K-line charts matching the four opportunities currently shown on the 决策 page. Other tabs must not repeat these charts.
 - The product is read-only and must never imply or expose automatic order execution.
+- Simulation mode is the only automatic execution path: it records virtual entries and exits only, remains isolated by platform, allows at most three concurrent decisions, and treats its 1000 USDC starting balance as review net value rather than a funding limit. It must never call an exchange order endpoint or mix simulated records into real-account history.
 
 In ChatGPT Work Mode, run `sites-preview start "$PWD"`, open `http://terminal.local:4173/` in the cloud browser, and verify the rendered app and its primary interactions. Keep that preview open and tell the user to inspect it in the cloud browser; do not present the local URL as a user-facing chat link. In Codex Desktop, run the local server yourself, open the preview in the in-app browser, and provide the clickable local URL. Do not deploy to Sites unless the user explicitly asks to share, publish, or deploy. Do not give the user server-start instructions when you can run it.
 

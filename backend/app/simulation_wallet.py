@@ -19,12 +19,19 @@ def _response(
     client_id: str,
     platform: MarketPlatform,
 ) -> SimulationWalletResponse:
+    stored_trades = record.active_trade if record is not None else None
+    active_trades = (
+        stored_trades if isinstance(stored_trades, list)
+        else [stored_trades] if isinstance(stored_trades, dict)
+        else []
+    )[:3]
     return SimulationWalletResponse(
         client_id=client_id,
         platform=platform,
         enabled=record.enabled if record is not None else False,
         balance=float(record.balance) if record is not None else float(DEFAULT_SIMULATION_BALANCE),
-        activeTrade=record.active_trade if record is not None else None,
+        activeTrades=active_trades,
+        activeTrade=active_trades[0] if active_trades else None,
         history=(record.history or []) if record is not None else [],
         updated_at=(record.updated_at if record is not None else None) or datetime.now(UTC),
     )
@@ -52,7 +59,10 @@ def write_simulation_wallet(
             session.add(record)
         record.enabled = payload.enabled
         record.balance = Decimal(str(payload.balance))
-        record.active_trade = payload.activeTrade.model_dump(mode="json") if payload.activeTrade else None
+        active_trades = payload.activeTrades
+        if active_trades is None:
+            active_trades = [payload.activeTrade] if payload.activeTrade else []
+        record.active_trade = [trade.model_dump(mode="json") for trade in active_trades] or None
         record.history = [trade.model_dump(mode="json") for trade in payload.history]
         record.updated_at = datetime.now(UTC)
         session.flush()

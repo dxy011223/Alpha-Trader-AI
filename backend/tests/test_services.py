@@ -1,7 +1,7 @@
 import asyncio
 
 from app import services
-from app.schemas import AnalysisRequest, Candle, MarketSnapshot
+from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem
 
 
 def test_user_fills_by_time_paginates_and_deduplicates(monkeypatch):
@@ -193,3 +193,27 @@ def test_score_below_seventy_is_observation_only():
     assert decision.score < 70
     assert decision.direction == "WAIT"
     assert decision.position_sizing.margin_amount == 0
+
+
+def test_relevant_news_changes_rule_score_in_expected_direction():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    bullish = NewsItem(
+        id=1, title="利多事件", source="测试源", published_at="2026-09-13 08:00",
+        impact=5, assets=["TEST"], direction="bullish", analysis="测试",
+    )
+    bearish = bullish.model_copy(update={"id": 2, "title": "利空事件", "direction": "bearish"})
+
+    supported = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market, 10_000, news_items=[bullish]
+    )
+    opposed = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market, 10_000, news_items=[bearish]
+    )
+
+    assert supported.score_breakdown.news == 10
+    assert opposed.score_breakdown.news == 4
+    assert supported.score > opposed.score
+    assert any("参考 1 条相关事件" in reason for reason in supported.reasons)

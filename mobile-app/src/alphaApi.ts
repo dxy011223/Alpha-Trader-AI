@@ -91,7 +91,10 @@ export interface AnalysisResponse {
   source: "live" | "demo";
   analysis_engine: "openai" | "rules";
   analysis_model: string | null;
+  decision_schema_version?: "ai_full_v1" | null;
   platform: MarketPlatform;
+  strategy_version?: string;
+  strategy_parameters?: Record<string, number>;
 }
 
 export interface OpportunityScanResponse {
@@ -148,7 +151,9 @@ export interface PositionMonitor {
   decision_id: number;
   symbol: string;
   platform: MarketPlatform;
-  action: "HOLD" | "REDUCE" | "EXIT" | "ADJUST_SL";
+  action: "HOLD" | "REDUCE" | "EXIT" | "ADJUST_SL" | "ADJUST_TP";
+  opening_score: number;
+  current_score: number;
   current_price: number;
   unrealized_pnl: number;
   reason: string;
@@ -234,7 +239,7 @@ export interface ReviewRecord {
   summary: string;
   findings: string[];
   adjustments: string[];
-  metrics: Record<string, number | string | boolean | null>;
+  metrics: Record<string, unknown>;
   created_at: string;
 }
 

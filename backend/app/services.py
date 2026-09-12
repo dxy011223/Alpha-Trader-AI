@@ -8,6 +8,7 @@ import httpx
 
 from app.news_sources import fetch_live_news
 from app.schemas import AnalysisRequest, AnalysisResponse, Candle, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
+from app.strategy_scoring import apply_strategy_weights, normalize_strategy_parameters
 
 logger = logging.getLogger(__name__)
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -346,6 +347,53 @@ def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators
     )
 
 
+def calculate_news_scores(
+    symbol: str,
+    direction: Literal["LONG", "SHORT", "WAIT"],
+    news_items: list[NewsItem] | None,
+) -> tuple[int, int, str]:
+    """按相关资产、事件等级及方向一致性计算企划中的宏观和新闻得分。"""
+    if not news_items or direction == "WAIT":
+        return 10, 7, "当前没有可用于方向确认的相关事件，宏观与新闻维度使用中性基线"
+
+    normalized_symbol = symbol.upper()
+    relevant_news = [
+        item for item in news_items
+        if normalized_symbol in {asset.upper() for asset in item.assets}
+        or "MARKET" in {asset.upper() for asset in item.assets}
+    ][:8]
+    macro_news = [
+        item for item in news_items
+        if {asset.upper() for asset in item.assets} & {"USD", "SPX", "NASDAQ", "MARKET"}
+    ][:8]
+
+    def aligned_score(items: list[NewsItem], baseline: int, maximum: int) -> int:
+        if not items:
+            return baseline
+        alignment = 0
+        for item in items:
+            if item.direction == "neutral":
+                continue
+            supports_direction = (
+                item.direction == "bullish" and direction == "LONG"
+            ) or (
+                item.direction == "bearish" and direction == "SHORT"
+            )
+            alignment += item.impact if supports_direction else -item.impact
+        adjustment = round(alignment / max(1, len(items)) * 0.6)
+        return max(0, min(maximum, baseline + adjustment))
+
+    macro_score = aligned_score(macro_news, 10, 15)
+    news_score = aligned_score(relevant_news, 7, 10)
+    bullish = sum(item.direction == "bullish" for item in relevant_news)
+    bearish = sum(item.direction == "bearish" for item in relevant_news)
+    summary = (
+        f"新闻维度参考 {len(relevant_news)} 条相关事件（利多 {bullish}、利空 {bearish}），"
+        f"宏观维度参考 {len(macro_news)} 条事件"
+    )
+    return macro_score, news_score, summary
+
+
 def build_execution_levels(
     market: MarketSnapshot, direction: str, risk: str
 ) -> tuple[list[float], float, list[float]]:
@@ -433,6 +481,7 @@ def analyze_market(
     indicators: TechnicalIndicators | None = None,
     strategy_version: str = "v1",
     strategy_parameters: dict | None = None,
+    news_items: list[NewsItem] | None = None,
 ) -> AnalysisResponse:
     market = market or MARKETS[payload.symbol.upper()]
     symbol = market.symbol
@@ -451,22 +500,25 @@ def analyze_market(
             trend_score = min(trend_score, 20)
         if indicators.rsi14 is not None:
             structure_score = max(8, min(25, round(25 - abs(indicators.rsi14 - 50) * 0.25)))
+    direction = indicator_direction
+    if direction == "WAIT":
+        direction = "LONG" if market.change_24h >= 1 else "SHORT" if market.change_24h <= -1 else "WAIT"
     capital_score = max(0, min(20, round(15 - abs(market.funding_rate) * 100)))
-    macro_score = 10
-    news_score = 7
-    score_breakdown = {
+    macro_score, news_score, news_reason = calculate_news_scores(
+        symbol, direction, news_items
+    )
+    raw_score_breakdown = {
         "trend": trend_score,
         "structure": structure_score,
         "capital": capital_score,
         "macro": macro_score,
         "news": news_score,
     }
+    normalized_parameters = normalize_strategy_parameters(strategy_parameters)
+    score_breakdown = apply_strategy_weights(raw_score_breakdown, normalized_parameters)
     score = sum(score_breakdown.values())
-    direction = indicator_direction
-    if direction == "WAIT":
-        direction = "LONG" if market.change_24h >= 1 else "SHORT" if market.change_24h <= -1 else "WAIT"
     # 企划将 50–69 分定义为观察区，只有 70 分以上才生成可执行方向。
-    min_trade_score = max(70, min(80, int((strategy_parameters or {}).get("min_trade_score", 70))))
+    min_trade_score = int(normalized_parameters["min_trade_score"])
     if score < min_trade_score:
         direction = "WAIT"
     risk = "high" if market.volatility > 6 else "medium" if market.volatility > 3 else "low"
@@ -504,11 +556,21 @@ def analyze_market(
                 f"RSI14 为 {indicators.rsi14}，ATR 占比 {indicators.atr_percent}%"
                 if indicators else "K 线指标暂不可用，本次仅使用市场快照评分"
             ),
-            f"策略版本 {strategy_version}，当前可交易阈值 {min_trade_score} 分",
+            news_reason,
+            (
+                f"策略版本 {strategy_version}，当前可交易阈值 {min_trade_score} 分；"
+                f"五维权重为趋势 {normalized_parameters['trend_weight']}、"
+                f"技术结构 {normalized_parameters['structure_weight']}、"
+                f"资金 {normalized_parameters['capital_weight']}、"
+                f"宏观 {normalized_parameters['macro_weight']}、"
+                f"新闻 {normalized_parameters['news_weight']}"
+            ),
         ],
         disclaimer="仅供研究与辅助决策，不构成投资建议；系统不会自动下单。",
         source=market.source,
         platform=market.platform,
+        strategy_version=strategy_version,
+        strategy_parameters=normalized_parameters,
     )
 
 

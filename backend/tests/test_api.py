@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from fastapi.testclient import TestClient
@@ -60,11 +61,30 @@ def test_protected_routes_reject_missing_owner_token():
     assert response.json()["detail"] == "访问令牌无效或缺失"
 
 
+def test_strategy_versions_are_available_read_only(monkeypatch):
+    monkeypatch.setattr("app.api.list_strategy_versions", lambda _limit: [])
+
+    response = client.get("/api/v1/strategies/versions")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
 def test_ai_analysis_has_risk_controls(monkeypatch):
     monkeypatch.setattr(
         "app.api.read_capital_settings",
         lambda: type("Capital", (), {"total_amount": 10_000})(),
     )
+    monkeypatch.setattr("app.api.read_current_strategy", lambda: ("v1", {}))
+    async def fake_ai(analyses, _markets, _timeframe, _total_amount):
+        return [analyze_market(
+            AnalysisRequest(symbol=item.symbol, timeframe=_timeframe, platform=item.platform),
+            _markets[item.symbol],
+            _total_amount,
+        ).model_copy(update={"analysis_engine": "openai", "analysis_model": "test-model"})
+            for item in analyses]
+
+    monkeypatch.setattr("app.api.enrich_analyses_with_openai", fake_ai)
     response = client.post("/api/v1/ai/analyze", json={"symbol": "BTC", "timeframe": "4h"})
     payload = response.json()
     assert response.status_code == 200
@@ -74,10 +94,45 @@ def test_ai_analysis_has_risk_controls(monkeypatch):
     assert payload["score"] == sum(payload["score_breakdown"].values())
     assert payload["score_breakdown"].keys() == {"trend", "structure", "capital", "macro", "news"}
     assert payload["source"] in {"live", "demo"}
-    assert payload["analysis_engine"] in {"openai", "rules"}
+    assert payload["analysis_engine"] == "openai"
+    assert payload["strategy_version"].startswith("v")
+    assert sum(
+        payload["strategy_parameters"][f"{factor}_weight"]
+        for factor in ("trend", "structure", "capital", "macro", "news")
+    ) == 100
     assert payload["position_sizing"]["margin_amount"] >= 0
     assert payload["position_sizing"]["position_value"] >= payload["position_sizing"]["margin_amount"]
     assert "不会自动下单" in payload["disclaimer"]
+
+
+def test_ai_analysis_returns_503_instead_of_rule_fallback(monkeypatch):
+    async def fake_market(_symbol: str, _platform: str):
+        return MarketSnapshot(
+            symbol="BTC",
+            price=100,
+            change_24h=1,
+            volume=1_000_000,
+            volatility=2,
+            funding_rate=0,
+            open_interest=1_000_000,
+            source="live",
+        )
+
+    async def unavailable(*_args):
+        from app.ai_analysis import AIDecisionUnavailable
+
+        raise AIDecisionUnavailable("AI 决策暂时不可用，请稍后重试")
+
+    monkeypatch.setattr("app.api.get_live_market", fake_market)
+    monkeypatch.setattr("app.api.get_candles", lambda *_args: asyncio.sleep(0, result=[]))
+    monkeypatch.setattr("app.api.read_capital_settings", lambda: type("Capital", (), {"total_amount": 10_000})())
+    monkeypatch.setattr("app.api.read_current_strategy", lambda: ("v1", {}))
+    monkeypatch.setattr("app.api.enrich_analyses_with_openai", unavailable)
+
+    response = client.post("/api/v1/ai/analyze", json={"symbol": "BTC", "timeframe": "4h"})
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "AI 决策暂时不可用，请稍后重试"
 
 
 def test_position_sizing_uses_risk_and_stop_distance():
@@ -170,6 +225,16 @@ def test_ai_opportunities_are_ranked(monkeypatch):
         "app.market_scanner.read_capital_settings",
         lambda: type("Capital", (), {"total_amount": 10_000})(),
     )
+    monkeypatch.setattr("app.market_scanner.read_current_strategy", lambda: ("v1", {}))
+    async def fake_ai(analyses, _markets, _timeframe, _total_amount):
+        return [analyze_market(
+            AnalysisRequest(symbol=item.symbol, timeframe=_timeframe, platform=item.platform),
+            _markets[item.symbol],
+            _total_amount,
+        ).model_copy(update={"analysis_engine": "openai", "analysis_model": "test-model"})
+            for item in analyses]
+
+    monkeypatch.setattr("app.market_scanner.enrich_analyses_with_openai", fake_ai)
     response = client.get("/api/v1/ai/opportunities?timeframe=4h")
     payload = response.json()
 

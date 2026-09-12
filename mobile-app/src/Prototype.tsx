@@ -110,6 +110,16 @@ type LockedDecision = {
   totalAmount: number;
   allocatedAmount: number;
 };
+type StrategyOptimizationSummary = {
+  status?: string;
+  version_before?: string;
+  version_after?: string;
+  sample_total?: number;
+  sample_limit?: number;
+  win_rate?: number;
+  net_pnl?: number;
+  changes?: string[];
+};
 
 async function connectWithWalletConnect(projectId: string): Promise<string> {
   const [{ createAppKit }, { arbitrum }] = await Promise.all([
@@ -429,6 +439,16 @@ function isSimulatedTrade(trade: CompletedTradeRecord): trade is SimulatedComple
   return "is_simulated" in trade && trade.is_simulated === true;
 }
 
+function readStrategyOptimization(review: ReviewRecord): StrategyOptimizationSummary | null {
+  const value = review.metrics.strategy_optimization;
+  return value && typeof value === "object" ? value as StrategyOptimizationSummary : null;
+}
+
+function readMetricNumber(review: ReviewRecord, key: string) {
+  const value = review.metrics[key];
+  return typeof value === "number" ? value : 0;
+}
+
 function getMarketRegime(snapshot: MarketSnapshot | null, fallback: string) {
   if (!snapshot) return fallback;
   if (snapshot.volatility >= 6) return "高波动";
@@ -606,10 +626,10 @@ function MarketScreen({
   }, [mode, platform, symbol, timeframe]);
 
   const direction = analysis?.direction ?? "WAIT";
-  const confidence = analysis?.confidence ?? 68;
-  const entryRange = analysis?.entry_range.map(formatPrice).join("–") ?? "111,800–113,200";
-  const stopLoss = analysis ? formatPrice(analysis.stop_loss) : "109,000";
-  const takeProfit = analysis?.take_profit.map(formatPrice).join(" / ") ?? "118,000 / 122,000";
+  const confidence = analysis?.confidence ?? 0;
+  const entryRange = analysis?.entry_range.map(formatPrice).join("–") ?? "--";
+  const stopLoss = analysis ? formatPrice(analysis.stop_loss) : "--";
+  const takeProfit = analysis?.take_profit.map(formatPrice).join(" / ") ?? "--";
 
   const selectFreeSymbol = (nextSymbol: string) => {
     // 币种只允许字母和数字，保持与后端接口的校验规则一致。
@@ -631,7 +651,7 @@ function MarketScreen({
         open={settingsOpen}
         onOpenChange={setSettingsOpen}
         title="设置"
-        description="管理行情来源与模拟交易；模拟数据同步到数据库，不读取真实钱包交易历史"
+        description="管理行情来源与自动模拟交易；模拟数据同步到数据库，不读取真实钱包交易历史"
       >
         <div className="settings-section-title"><strong>后端访问</strong><span>{apiAccessToken ? "已授权" : "未授权"}</span></div>
         <div className="api-token-settings-card">
@@ -667,7 +687,7 @@ function MarketScreen({
         <div className={`simulation-settings-card ${simulationWallet.enabled ? "active" : ""}`}>
           <div>
             <strong>自动模拟交易</strong>
-            <span>决策开始后按计划入场，触发首个止盈或止损后自动结算</span>
+            <span>发现可执行机会后自动入场，最多并行三笔，按止盈止损结算</span>
           </div>
           <button
             className="simulation-toggle"
@@ -683,7 +703,7 @@ function MarketScreen({
           <div className="simulation-wallet-summary">
             <span>模拟钱包余额</span>
             <strong>{formatUsdc(simulationWallet.balance)}</strong>
-            <small>{simulationWallet.activeTrades.length > 0 ? `当前平台有模拟交易执行中（${simulationWallet.activeTrades.length} 笔），可切换平台，暂不可关闭或重置` : `默认 ${DEFAULT_SIMULATION_BALANCE} USDC · 不影响真实资产`}</small>
+            <small>{simulationWallet.activeTrades.length > 0 ? `当前平台有模拟交易执行中（${simulationWallet.activeTrades.length} 笔），可切换平台，暂不可关闭或重置` : `默认 ${DEFAULT_SIMULATION_BALANCE} USDC · 仅统计盈亏，不限制开仓资金`}</small>
           </div>
           <button
             className="simulation-reset-button"
@@ -819,19 +839,19 @@ function MarketScreen({
       </section>
       <section className="decision-card" aria-labelledby="decision-title">
         <div className="section-heading">
-          <h2 id="decision-title">AI 决策 <small>{analysis ? "已更新" : "演示"}</small></h2>
+          <h2 id="decision-title">AI 决策 <small>{analysis ? "已更新" : "未生成"}</small></h2>
           <div className="confidence"><span>置信度</span><strong>{confidence}%</strong><i><b style={{ width: `${confidence}%` }} /></i></div>
         </div>
         <div className="decision-summary">
           <div className={`wait-state ${direction.toLowerCase()}`}><strong>{directionLabels[direction]}</strong><span>{direction}</span></div>
-          <p>{analysis?.reasons[0] ?? "价格接近前高阻力区，短期或震荡整理，等待更好的入场机会。"}</p>
+          <p>{analysis?.reasons[0] ?? "AI 决策暂不可用；系统不会使用本地规则生成替代结论。"}</p>
         </div>
         <div className="decision-metrics">
           <div><span>入场区间</span><strong>{entryRange}</strong></div>
           <div><span>止损</span><strong className="loss">{stopLoss}</strong></div>
           <div><span>止盈目标</span><strong>{takeProfit}</strong></div>
-          <div><span>建议杠杆</span><strong>{analysis?.leverage ?? 3}×</strong></div>
-          <div><span>风险等级</span><strong className="risk">{analysis ? riskLabels[analysis.risk] : "中等"}</strong></div>
+          <div><span>建议杠杆</span><strong>{analysis ? `${analysis.leverage}×` : "--"}</strong></div>
+          <div><span>风险等级</span><strong className="risk">{analysis ? riskLabels[analysis.risk] : "未生成"}</strong></div>
         </div>
         <div className="decision-actions">
           <button type="button" className="primary-button" onClick={() => openDetails(analysis, symbol, timeframe)}><ActivityLogIcon />查看完整依据<ChevronRightIcon /></button>
@@ -898,9 +918,6 @@ function DecisionScreen({
   const isExecuting = activeDecision !== null;
   const selectedTimeframe = activeDecision?.timeframe ?? timeframe;
   const executionLimitReached = !isExecuting && activeDecisions.length >= MAX_ACTIVE_DECISIONS;
-  const activeSimulationAllocation = activeDecisions.reduce((sum, item) => sum + item.allocatedAmount, 0);
-  const simulationAvailableBalance = Math.max(0, simulationBalance - activeSimulationAllocation);
-  const simulationBalanceExhausted = simulationEnabled && !isExecuting && simulationAvailableBalance <= 0;
   const activeDecisionKey = activeDecisions.map((item) => item.decisionId).join("|");
   const formatCapital = simulationEnabled ? formatUsdc : formatMoney;
 
@@ -982,44 +999,43 @@ function DecisionScreen({
     })));
   }, [candidates, onMarketSelectionsChange, timeframe]);
 
-  const fallbackBreakdown = { trend: 18, structure: 16, capital: 14, macro: 9, news: 7 };
+  const fallbackBreakdown = { trend: 0, structure: 0, capital: 0, macro: 0, news: 0 };
   const breakdown = analysis?.score_breakdown ?? fallbackBreakdown;
   const score = analysis?.score ?? Object.values(fallbackBreakdown).reduce((sum, value) => sum + value, 0);
-  const confidence = analysis?.confidence ?? 64;
+  const confidence = analysis?.confidence ?? 0;
   const direction = analysis?.direction ?? "WAIT";
   const opportunity = getOpportunity(score);
-  const fallbackPrice = Number(assets[activeSymbol]?.price.replace(/,/g, "") ?? 0);
-  const entryRange = analysis?.entry_range ?? [fallbackPrice * 0.992, fallbackPrice * 0.997];
-  const stopLoss = analysis?.stop_loss ?? fallbackPrice * 0.974;
-  const takeProfit = analysis?.take_profit ?? [fallbackPrice * 1.035, fallbackPrice * 1.072];
-  const leverage = analysis?.leverage ?? 3;
+  const entryRange = analysis?.entry_range ?? [0, 0];
+  const stopLoss = analysis?.stop_loss ?? 0;
+  const takeProfit = analysis?.take_profit ?? [0, 0];
+  const leverage = analysis?.leverage ?? 0;
   const positionSizing = analysis?.position_sizing;
   const plannedAllocation = positionSizing?.margin_amount ?? 0;
   const currentAllocation = activeDecision?.allocatedAmount
-    ?? (simulationEnabled ? Math.min(plannedAllocation, simulationAvailableBalance) : plannedAllocation);
+    ?? (simulationEnabled ? plannedAllocation || DEFAULT_SIMULATION_BALANCE * 0.1 : plannedAllocation);
   const nominalExposure = simulationEnabled || activeDecision
     ? currentAllocation * leverage
     : positionSizing?.position_value ?? currentAllocation * leverage;
   const maxLossAmount = positionSizing?.max_loss_amount ?? 0;
   const stopDistancePercent = (positionSizing?.stop_distance_rate ?? 0) * 100;
   const riskBudgetPercent = (positionSizing?.risk_budget_rate ?? 0) * 100;
-  const risk = analysis ? riskLabels[analysis.risk] : "中等";
+  const risk = analysis ? riskLabels[analysis.risk] : "未生成";
   const entryMid = (entryRange[0] + entryRange[1]) / 2;
   const riskDistance = Math.abs(entryMid - stopLoss);
   const rewardDistance = Math.abs(takeProfit[0] - entryMid);
   const rewardRisk = riskDistance > 0 ? (rewardDistance / riskDistance).toFixed(1) : "--";
+  const entryRangeLabel = analysis ? entryRange.map(formatPrice).join(" – ") : "--";
+  const stopLossLabel = analysis ? formatPrice(stopLoss) : "--";
+  const takeProfitLabels = analysis ? takeProfit.map(formatPrice) : ["--", "--"];
+  const strategyParameters = analysis?.strategy_parameters;
   const scoreItems: Array<[keyof typeof breakdown, string, number]> = [
-    ["trend", "趋势", 30],
-    ["structure", "技术结构", 25],
-    ["capital", "资金", 20],
-    ["macro", "宏观", 15],
-    ["news", "新闻", 10],
+    ["trend", "趋势", strategyParameters?.trend_weight ?? 30],
+    ["structure", "技术结构", strategyParameters?.structure_weight ?? 25],
+    ["capital", "资金", strategyParameters?.capital_weight ?? 20],
+    ["macro", "宏观", strategyParameters?.macro_weight ?? 15],
+    ["news", "新闻", strategyParameters?.news_weight ?? 10],
   ];
-  const reasons = analysis?.reasons ?? [
-    "趋势方向尚未获得足够确认，继续观察关键结构。",
-    "资金费率处于温和区间，暂未出现明显拥挤。",
-    "重大新闻与宏观事件发生时需要重新评估。",
-  ];
+  const reasons = analysis?.reasons ?? ["AI 决策尚未生成；系统不会使用本地规则替代。"];
   const sourceLabel = isExecuting
     ? "执行快照"
     : remoteState === "loading"
@@ -1028,7 +1044,7 @@ function DecisionScreen({
         ? "分析暂不可用"
         : analysis?.analysis_engine === "openai"
           ? `${analysis.source === "live" ? "实时行情" : "演示行情"} · OpenAI ${analysis.analysis_model ?? "AI"}`
-          : analysis?.source === "live" ? "实时行情 · 规则分析" : "演示分析 · 规则分析";
+          : "非 AI 决策已拒绝";
   const sourceTone = remoteState === "offline" ? "offline" : analysis?.source === "live" ? "live" : "demo";
   const parsedAmount = Number(amountDraft.replace(/,/g, ""));
   const amountIsValid = Number.isFinite(parsedAmount) && parsedAmount > 0 && parsedAmount <= 1_000_000_000;
@@ -1047,7 +1063,7 @@ function DecisionScreen({
   };
 
   const confirmExecution = async () => {
-    if (!analysis || direction === "WAIT" || executionLimitReached || simulationBalanceExhausted) return;
+    if (!analysis || direction === "WAIT" || executionLimitReached) return;
     setExecutionMutationState("saving");
     try {
       await onStartExecution(analysis, timeframe, totalAmount);
@@ -1110,18 +1126,18 @@ function DecisionScreen({
               <span>{scanError ?? "机会扫描暂时不可用"}</span>
               <button type="button" onClick={() => setScanRetry((current) => current + 1)}>重新扫描</button>
             </div>
-          ) : <div className="opportunity-loading">正在扫描并计算机会评分…</div>}
+          ) : <div className="opportunity-loading">正在等待 AI 扫描并计算完整决策…</div>}
         </div>
       </section>
 
       <section className="capital-settings-card" aria-labelledby="capital-settings-title">
         <div className="capital-settings-heading">
-          <div><strong id="capital-settings-title">三向资金预算</strong><span>最多同时配置 3 个有效币种方向</span></div>
-          <em>至少保留 10%</em>
+          <div><strong id="capital-settings-title">三向资金预算</strong><span>{simulationEnabled ? "自动记录最多 3 个有效币种方向" : "最多同时配置 3 个有效币种方向"}</span></div>
+          <em>{simulationEnabled ? "模拟资金不限额" : "至少保留 10%"}</em>
         </div>
         <div className="capital-editor">
           <label htmlFor="total-capital">
-            <span>总金额</span>
+            <span>{simulationEnabled ? "账户净值" : "总金额"}</span>
             <div><KeyboardInput
               id="total-capital"
               aria-label="总金额（USDT）"
@@ -1139,13 +1155,24 @@ function DecisionScreen({
           </button>
         </div>
         <small className={capitalState === "error" ? "error" : ""}>
-          {simulationEnabled ? "当前使用本地模拟钱包余额，不读取或修改真实钱包" : capitalState === "loading" ? "正在读取资金设置" : capitalState === "saved" ? "总金额已保存，正在重新计算仓位" : capitalState === "error" ? "保存失败，请检查后端连接" : "按风险预算与止损距离反推投入资金"}
+          {simulationEnabled ? "模拟净值仅用于累计盈亏与复盘，不限制单笔或总开仓资金" : capitalState === "loading" ? "正在读取资金设置" : capitalState === "saved" ? "总金额已保存，正在重新计算仓位" : capitalState === "error" ? "保存失败，请检查后端连接" : "按风险预算与止损距离反推投入资金"}
         </small>
         <div className="capital-budget-summary" aria-label="资金预算规则">
-          <div><span>高风险预算<small>总资金 0.5%</small></span><strong>{formatCapital(totalAmount * 0.005)}</strong></div>
-          <div><span>中风险预算<small>总资金 0.75%</small></span><strong>{formatCapital(totalAmount * 0.0075)}</strong></div>
-          <div><span>低风险预算<small>总资金 1%</small></span><strong>{formatCapital(totalAmount * 0.01)}</strong></div>
-          <div><span>保证金上限<small>单笔最多 30%</small></span><strong>{formatCapital(totalAmount * 0.3)}</strong></div>
+          {simulationEnabled ? (
+            <>
+              <div><span>执行方式<small>发现机会自动开仓</small></span><strong>自动</strong></div>
+              <div><span>机会门槛<small>评分与方向有效</small></span><strong>≥ 70</strong></div>
+              <div><span>并行上限<small>独立止盈止损</small></span><strong>{MAX_ACTIVE_DECISIONS} 笔</strong></div>
+              <div><span>资金限制<small>仅记录计划金额</small></span><strong>无限制</strong></div>
+            </>
+          ) : (
+            <>
+              <div><span>高风险预算<small>总资金 0.5%</small></span><strong>{formatCapital(totalAmount * 0.005)}</strong></div>
+              <div><span>中风险预算<small>总资金 0.75%</small></span><strong>{formatCapital(totalAmount * 0.0075)}</strong></div>
+              <div><span>低风险预算<small>总资金 1%</small></span><strong>{formatCapital(totalAmount * 0.01)}</strong></div>
+              <div><span>保证金上限<small>单笔最多 30%</small></span><strong>{formatCapital(totalAmount * 0.3)}</strong></div>
+            </>
+          )}
         </div>
       </section>
 
@@ -1192,11 +1219,11 @@ function DecisionScreen({
       <section className="decision-detail-card" aria-labelledby="execution-plan-title">
         <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划</h2></div><em>手动确认后执行</em></div>
         <div className="execution-grid">
-          <div className="wide"><span>建议入场区间</span><strong>{entryRange.map(formatPrice).join(" – ")}</strong></div>
-          <div><span>结构止损</span><strong className="loss">{formatPrice(stopLoss)}</strong></div>
+          <div className="wide"><span>建议入场区间</span><strong>{entryRangeLabel}</strong></div>
+          <div><span>结构止损</span><strong className="loss">{stopLossLabel}</strong></div>
           <div><span>建议杠杆</span><strong>{leverage}×</strong></div>
-          <div><span>止盈目标 1</span><strong>{formatPrice(takeProfit[0])}</strong></div>
-          <div><span>止盈目标 2</span><strong>{formatPrice(takeProfit[1])}</strong></div>
+          <div><span>止盈目标 1</span><strong>{takeProfitLabels[0]}</strong></div>
+          <div><span>止盈目标 2</span><strong>{takeProfitLabels[1]}</strong></div>
           <div><span>目标盈亏比</span><strong>1 : {rewardRisk}</strong></div>
           <div><span>风险等级</span><strong className="risk">{risk}</strong></div>
           <div className="capital-result">
@@ -1218,14 +1245,12 @@ function DecisionScreen({
               ? `仅当前币种、周期与决策快照已锁定；当前 ${activeDecisions.length}/${MAX_ACTIVE_DECISIONS} 个执行中`
               : executionLimitReached
                 ? `已达到最多 ${MAX_ACTIVE_DECISIONS} 个同时执行的上限，请先结束一个决策`
-                : simulationBalanceExhausted
-                  ? "模拟钱包可用保证金不足，请先结束一个决策"
-                  : simulationEnabled ? "开始后自动模拟开仓，并按止盈止损独立结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
+                : simulationEnabled ? "可执行机会会自动模拟开仓，不限制总资金，并按止盈止损独立结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
           </div>
           <button
             type="button"
             aria-pressed={isExecuting}
-            disabled={!analysis || executionLimitReached || simulationBalanceExhausted || (!isExecuting && direction === "WAIT")}
+            disabled={!analysis || executionLimitReached || (!isExecuting && direction === "WAIT")}
             onClick={() => void (async () => {
               if (activeDecision) {
                 setExecutionMutationState("saving");
@@ -1243,7 +1268,7 @@ function DecisionScreen({
             })()}
           >
             <LockClosedIcon />
-            {isExecuting ? "结束当前决策" : executionLimitReached ? `已达 ${MAX_ACTIVE_DECISIONS} 个执行上限` : simulationBalanceExhausted ? "模拟保证金不足" : `开始执行 ${activeSymbol}`}
+            {isExecuting ? "结束当前决策" : executionLimitReached ? `已达 ${MAX_ACTIVE_DECISIONS} 个执行上限` : `开始执行 ${activeSymbol}`}
           </button>
           {isExecuting && !simulationEnabled && (
             <button
@@ -1273,12 +1298,12 @@ function DecisionScreen({
         </div>
         <div className="execution-confirm-risk">
           <strong>请确认风险边界</strong>
-          <span>计划入场 {entryRange.map(formatPrice).join(" – ")} · 结构止损 {formatPrice(stopLoss)}</span>
+          <span>计划入场 {entryRangeLabel} · 结构止损 {stopLossLabel}</span>
           <small>{simulationEnabled ? "确认后按计划中间价模拟开仓，触发首个止盈或止损时自动结算盈亏。" : "确认后将固定当前决策并同步到持仓页，仅用于执行跟踪，不会向交易所下单。"}</small>
         </div>
         <div className="execution-confirm-actions">
           <button type="button" onClick={() => setExecutionConfirmationOpen(false)}>取消</button>
-          <button type="button" disabled={executionMutationState === "saving" || executionLimitReached || simulationBalanceExhausted} onClick={() => void confirmExecution()}>
+          <button type="button" disabled={executionMutationState === "saving" || executionLimitReached} onClick={() => void confirmExecution()}>
             {executionMutationState === "saving" ? "保存中…" : "确认开始执行"}
           </button>
         </div>
@@ -1286,7 +1311,7 @@ function DecisionScreen({
       </BottomSheet>
 
       <section className="decision-detail-card" aria-labelledby="score-breakdown-title">
-        <div className="decision-section-title"><div><span>02</span><h2 id="score-breakdown-title">五维评分</h2></div><em>宏观 / 新闻为当前基线</em></div>
+        <div className="decision-section-title"><div><span>02</span><h2 id="score-breakdown-title">五维评分</h2></div><em>策略 {analysis?.strategy_version ?? "v1"}</em></div>
         <div className="score-breakdown">
           {scoreItems.map(([key, label, max]) => (
             <div className="score-row" key={key}>
@@ -1317,7 +1342,7 @@ function DecisionScreen({
       <section className="decision-detail-card invalidation-card" aria-labelledby="invalidation-title">
         <div className="decision-section-title"><div><span>04</span><h2 id="invalidation-title">失效与重评条件</h2></div><em>先定义退出</em></div>
         <div className="invalidation-list">
-          <p>价格触及结构止损 {formatPrice(stopLoss)}，当前计划立即失效</p>
+          <p>价格触及结构止损 {stopLossLabel}，当前计划立即失效</p>
           <p>综合评分低于 70 分，进入观察区并禁止新增交易</p>
           <p>政策、央行或黑天鹅事件出现时，重新生成决策</p>
         </div>
@@ -1592,6 +1617,9 @@ function SecondaryScreen({
   const selectedMonitor = lockedDecision
     ? positionMonitors.find((item) => item.position_id === lockedDecision.positionId)
     : undefined;
+  const dailyReviews = simulationWallet.enabled
+    ? []
+    : reviews.filter((review) => review.review_type === "daily");
 
   return (
     <>
@@ -1606,7 +1634,7 @@ function SecondaryScreen({
       <section className="focus-panel">
         <div className="focus-status">
           <span>{tab === "news" ? newsDate : new Date().toLocaleDateString("zh-CN")} · {tab === "positions" ? "决策同步" : tab === "review" ? "完成交易复盘" : remoteLabel}</span>
-          <strong>{tab === "positions" ? activeDecisions.length > 0 ? `${activeDecisions.length} 个执行中` : "暂无执行" : tab === "review" ? `${completedTrades.length} 笔已完成` : `${newsTotal} 条`}</strong>
+          <strong>{tab === "positions" ? activeDecisions.length > 0 ? `${activeDecisions.length} 个执行中` : "暂无执行" : tab === "review" ? `${completedTrades.length} 笔交易 · ${dailyReviews.length} 份日报` : `${newsTotal} 条`}</strong>
         </div>
         {tab === "positions" && (simulationWallet.enabled ? (
           <div className="wallet-live-panel simulation-wallet-panel">
@@ -1779,7 +1807,7 @@ function SecondaryScreen({
               <div className={`position-monitor-strip ${selectedMonitor.action.toLowerCase()}`}>
                 <div><span>动态管理建议</span><strong>{selectedMonitor.action}</strong></div>
                 <p>{selectedMonitor.reason}</p>
-                <small>标记价 {formatPrice(selectedMonitor.current_price)} · 浮动盈亏 {formatMoney(selectedMonitor.unrealized_pnl)}</small>
+                <small>评分 {selectedMonitor.opening_score}→{selectedMonitor.current_score} · 标记价 {formatPrice(selectedMonitor.current_price)} · 浮动盈亏 {formatMoney(selectedMonitor.unrealized_pnl)}</small>
               </div>
             )}
             <div className="position-actions">
@@ -1791,13 +1819,41 @@ function SecondaryScreen({
             {completionState === "error" && <div className="position-completion-error">未找到真实平仓成交，或交易所中仍有该币种持仓。</div>}
           </article>
         )}
-        {tab === "review" && completedTrades.length === 0 && (
+        {tab === "review" && completedTrades.length === 0 && dailyReviews.length === 0 && (
           <div className="position-empty review-empty">
             <ActivityLogIcon />
             <strong>暂无可复盘交易</strong>
             <span>只有在持仓页标记完成的交易，才会进入复盘记录。</span>
           </div>
         )}
+        {tab === "review" && dailyReviews.map((review) => {
+          const optimization = readStrategyOptimization(review);
+          const versionLabel = optimization
+            ? optimization.version_before === optimization.version_after
+              ? optimization.version_after ?? "保持当前版本"
+              : `${optimization.version_before ?? "当前版本"} → ${optimization.version_after ?? "新版本"}`
+            : "等待策略样本";
+          return (
+            <article className="review-trade-card" aria-label={`${review.review_date} 每日策略复盘`} key={`daily-${review.id}`}>
+              <div className="position-card-heading">
+                <div><span>每日策略复盘</span><strong>{review.review_date}</strong></div>
+                <em>{optimization?.status === "updated" ? "已优化" : "继续观察"}</em>
+              </div>
+              <div className="review-score-grid">
+                <div><span>样本交易</span><strong>{optimization?.sample_total ?? readMetricNumber(review, "total")}</strong></div>
+                <div><span>当日胜单</span><strong>{readMetricNumber(review, "wins")}</strong></div>
+                <div><span>策略胜率</span><strong>{(optimization?.win_rate ?? readMetricNumber(review, "win_rate")).toFixed(1)}%</strong></div>
+                <div><span>样本净盈亏</span><strong className={(optimization?.net_pnl ?? readMetricNumber(review, "net_pnl")) < 0 ? "loss" : "profit"}>{formatUsdc(optimization?.net_pnl ?? readMetricNumber(review, "net_pnl"))}</strong></div>
+              </div>
+              <div className="review-data-note">
+                <small className="review-engine-badge">策略版本 {versionLabel}</small>
+                <strong>{review.summary}</strong>
+                {review.findings.map((item) => <span key={item}>{item}</span>)}
+                {review.adjustments.map((item) => <span key={item}>建议：{item}</span>)}
+              </div>
+            </article>
+          );
+        })}
         {tab === "review" && completedTrades.map((trade) => {
           const decision = trade.analysis;
           const review = reviews.find((item) => item.trade_id === trade.id);
@@ -1822,7 +1878,7 @@ function SecondaryScreen({
               </div>
               <div className="review-data-note">
                 <small className="review-engine-badge">
-                  {simulated ? "模拟结算" : review?.metrics.analysis_engine === "openai" ? "AI 复盘" : "规则复盘"}
+                  {simulated ? "模拟结算" : review?.metrics.analysis_engine === "openai" ? "AI 复盘" : "事实记录"}
                 </small>
                 <strong>{simulated ? `已按${trade.exit_reason === "take_profit" ? "首个止盈" : "止损"}计划价自动结束交易` : review?.summary ?? "已按真实成交生成复盘"}</strong>
                 <span>{review?.findings.join(" ") ?? `毛盈亏 ${simulated ? formatUsdc(trade.gross_pnl) : formatMoney(trade.gross_pnl)}，净收益率 ${trade.pnl_percent.toFixed(2)}%。`}</span>
@@ -1902,6 +1958,7 @@ function TradingPrototype() {
   const simulationSyncState = simulationSyncStates[marketPlatform];
   const simulationWalletsRef = useRef(simulationWallets);
   const lastSyncedSimulationRef = useRef<Partial<Record<MarketPlatform, string>>>({});
+  const autoExecutedSignalsRef = useRef(new Set<string>());
   const activeSimulationKey = simulationPlatforms.map((platform) => (
     simulationWallets[platform].enabled
       ? simulationWallets[platform].activeTrades.map((trade) => trade.id).join(",")
@@ -1972,6 +2029,14 @@ function TradingPrototype() {
     window.localStorage.setItem(SIMULATION_WALLETS_KEY, JSON.stringify(simulationWallets));
     simulationWalletsRef.current = simulationWallets;
   }, [simulationWallets]);
+
+  useEffect(() => {
+    for (const platform of simulationPlatforms) {
+      for (const trade of simulationWallets[platform].activeTrades) {
+        autoExecutedSignalsRef.current.add(`${platform}:${trade.timeframe}:${trade.analysis.symbol}:${trade.analysis.direction}`);
+      }
+    }
+  }, [activeSimulationKey, simulationWallets]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -2077,7 +2142,7 @@ function TradingPrototype() {
             const completed = closeSimulatedTradeIfTriggered(trade, snapshot.price);
             const updatedWallet = completed ? {
               ...wallet,
-              balance: Math.max(0, wallet.balance + completed.net_pnl),
+              balance: wallet.balance + completed.net_pnl,
               activeTrades: wallet.activeTrades.filter((item) => item.id !== trade.id),
               history: [completed, ...wallet.history].slice(0, 500),
             } : {
@@ -2123,9 +2188,7 @@ function TradingPrototype() {
     if (simulationWallet.activeTrades.some((trade) => trade.analysis.symbol === analysis.symbol)) {
       throw new Error("当前币种已有执行中的决策");
     }
-    const allocatedAmount = simulationWallet.activeTrades.reduce((sum, trade) => sum + trade.allocatedAmount, 0);
-    const availableBalance = Math.max(0, simulationWallet.balance - allocatedAmount);
-    const trade = openSimulatedTrade(analysis, timeframe, availableBalance, Date.now() + simulationWallet.activeTrades.length);
+    const trade = openSimulatedTrade(analysis, timeframe, simulationWallet.balance, Date.now() + simulationWallet.activeTrades.length);
     const decision = simulatedTradeToLockedDecision(trade);
     setSimulationWallets((current) => ({
       ...current,
@@ -2137,6 +2200,64 @@ function TradingPrototype() {
     setLockedDecision(decision);
     return decision;
   };
+
+  useEffect(() => {
+    if (!simulationWallet.enabled) return;
+    const controller = new AbortController();
+    let scanning = false;
+
+    const executeAvailableOpportunities = async () => {
+      if (scanning) return;
+      scanning = true;
+      try {
+        const scan = await loadOpportunities("4h", controller.signal, marketPlatform);
+        if (controller.signal.aborted) return;
+        const walletSnapshot = simulationWalletsRef.current[marketPlatform];
+        const activeSymbols = new Set(walletSnapshot.activeTrades.map((trade) => trade.analysis.symbol));
+        const availableSlots = Math.max(0, MAX_ACTIVE_DECISIONS - walletSnapshot.activeTrades.length);
+        const additions: SimulatedTrade[] = [];
+
+        for (const candidate of scan.opportunities) {
+          if (additions.length >= availableSlots) break;
+          const signalKey = `${marketPlatform}:4h:${candidate.symbol}:${candidate.direction}`;
+          if (candidate.direction === "WAIT" || candidate.score < 70 || activeSymbols.has(candidate.symbol) || autoExecutedSignalsRef.current.has(signalKey)) continue;
+          try {
+            const trade = openSimulatedTrade(candidate, "4h", walletSnapshot.balance, Date.now() + additions.length);
+            additions.push(trade);
+            activeSymbols.add(candidate.symbol);
+            autoExecutedSignalsRef.current.add(signalKey);
+          } catch {
+            // 单个决策格式异常时跳过，继续尝试下一个可执行机会。
+          }
+        }
+
+        if (additions.length === 0) return;
+        setSimulationWallets((current) => {
+          const wallet = current[marketPlatform];
+          if (!wallet.enabled) return current;
+          const currentSymbols = new Set(wallet.activeTrades.map((trade) => trade.analysis.symbol));
+          const slots = Math.max(0, MAX_ACTIVE_DECISIONS - wallet.activeTrades.length);
+          const accepted = additions.filter((trade) => !currentSymbols.has(trade.analysis.symbol)).slice(0, slots);
+          if (accepted.length === 0) return current;
+          return {
+            ...current,
+            [marketPlatform]: { ...wallet, activeTrades: [...accepted, ...wallet.activeTrades] },
+          };
+        });
+      } catch {
+        // 扫描暂不可用时保留当前模拟决策，下一轮自动重试。
+      } finally {
+        scanning = false;
+      }
+    };
+
+    void executeAvailableOpportunities();
+    const intervalId = window.setInterval(() => void executeAvailableOpportunities(), 30_000);
+    return () => {
+      window.clearInterval(intervalId);
+      controller.abort();
+    };
+  }, [apiAccessToken, marketPlatform, simulationWallet.enabled]);
 
   const cancelTrackedExecution = async (decision: LockedDecision) => {
     if (simulationWallet.enabled) {
@@ -2178,6 +2299,11 @@ function TradingPrototype() {
               onApiAccessTokenChange={setApiAccessTokenState}
               onSimulationEnabledChange={(enabled) => {
                 if (simulationWallet.activeTrades.length > 0) return;
+                if (!enabled) {
+                  for (const signal of autoExecutedSignalsRef.current) {
+                    if (signal.startsWith(`${marketPlatform}:`)) autoExecutedSignalsRef.current.delete(signal);
+                  }
+                }
                 setLockedDecision(null);
                 setSimulationWallets((current) => ({
                   ...current,
@@ -2186,6 +2312,9 @@ function TradingPrototype() {
               }}
               onResetSimulationWallet={() => {
                 if (simulationWallet.activeTrades.length > 0) return;
+                for (const signal of autoExecutedSignalsRef.current) {
+                  if (signal.startsWith(`${marketPlatform}:`)) autoExecutedSignalsRef.current.delete(signal);
+                }
                 setSimulationWallets((current) => ({
                   ...current,
                   [marketPlatform]: createDefaultSimulationWallet(simulationWallet.enabled),

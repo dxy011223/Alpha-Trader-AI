@@ -9,7 +9,7 @@ from app.market_scanner import run_scheduled_market_scan
 from app.news_sources import current_news_date, fetch_live_news
 from app.position_monitor import monitor_active_positions
 from app.trade_records import generate_daily_review, update_review_content
-from app.strategy_versions import record_daily_performance
+from app.strategy_versions import build_strategy_optimization_context, record_daily_performance
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +38,21 @@ def scheduled_daily_review() -> dict:
     results = {}
     for platform in ("hyperliquid", "binance", "okx"):
         result = generate_daily_review(target_date, platform)
+        strategy_context = build_strategy_optimization_context(result)
         result = asyncio.run(enrich_review_with_openai(
-            result, {"period": target_date.isoformat(), "platform": platform}
+            result,
+            {
+                "period": target_date.isoformat(),
+                "platform": platform,
+                "strategy_optimization": strategy_context,
+            },
         ))
-        results[platform] = update_review_content(result)
-        record_daily_performance(results[platform])
-    logger.info("每日复盘生成完成：日期 %s，平台 %s 个", target_date.isoformat(), len(results))
+        results[platform] = record_daily_performance(update_review_content(result))
+    logger.info(
+        "每日复盘与策略优化完成：日期 %s，平台 %s 个",
+        target_date.isoformat(),
+        len(results),
+    )
     return {platform: result.model_dump(mode="json") for platform, result in results.items()}
 
 

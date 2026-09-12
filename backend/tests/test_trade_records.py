@@ -1,5 +1,6 @@
 import pytest
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -83,6 +84,7 @@ def test_real_fills_create_completed_trade_and_review(monkeypatch, tmp_path):
 
     completed = trade_records.finalize_position(created.position.id, fills)
 
+    assert completed.trade.closed_at.tzinfo is UTC
     assert completed.trade.entry_price == 100
     assert completed.trade.exit_price == 110
     assert completed.trade.fee == 0.2
@@ -91,13 +93,15 @@ def test_real_fills_create_completed_trade_and_review(monkeypatch, tmp_path):
     assert completed.trade.entry_source == "hyperliquid"
     assert completed.review.result == "win"
     assert completed.review.metrics["net_pnl"] == 9.8
-    assert completed.review.metrics["analysis_engine"] == "rules"
+    assert completed.review.metrics["analysis_engine"] == "facts"
+    assert completed.review.adjustments == ["AI 分析暂不可用，本次仅保留已核验交易事实。"]
     assert trade_records.read_active_execution() is None
     assert len(trade_records.list_completed_trades()) == 1
     assert len(trade_records.list_review_records()) == 1
 
-    daily = trade_records.generate_daily_review(completed.trade.closed_at.date())
-    duplicate = trade_records.generate_daily_review(completed.trade.closed_at.date())
+    review_date = completed.trade.closed_at.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    daily = trade_records.generate_daily_review(review_date)
+    duplicate = trade_records.generate_daily_review(review_date)
     assert daily.id == duplicate.id
     assert daily.metrics["total"] == 1
     assert daily.metrics["net_pnl"] == 9.8

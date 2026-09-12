@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.wrangler/
+/test-results/
 .venv/
 node_modules/
 dist/

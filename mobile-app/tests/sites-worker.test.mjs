@@ -91,11 +91,11 @@ test("persists simulation wallet state through the D1 binding", async () => {
   const saved = await worker.fetch(new Request(url, {
     method: "PUT",
     headers: { "content-type": "application/json", ...authHeaders },
-    body: JSON.stringify({ enabled: true, balance: 1_125.5, activeTrades, history: [] }),
+    body: JSON.stringify({ enabled: true, balance: -125.5, activeTrades, history: [] }),
   }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
   const payload = await saved.json();
   assert.equal(payload.enabled, true);
-  assert.equal(payload.balance, 1_125.5);
+  assert.equal(payload.balance, -125.5);
   assert.deepEqual(payload.activeTrades, activeTrades);
   assert.deepEqual(payload.activeTrade, activeTrades[0], "旧版客户端仍可读取首笔执行状态");
 
@@ -229,9 +229,49 @@ test("does not turn missing API or write requests into the app shell", async () 
   }
 });
 
-test("serves market and AI APIs without the local Python backend", async () => {
+function createAiBinding() {
+  return {
+    async run(_model, options) {
+      const context = JSON.parse(options.messages[1].content);
+      return {
+        response: {
+          decisions: context.markets.map((market) => ({
+            symbol: market.symbol,
+            direction: "WAIT",
+            confidence: 64,
+            score: 64,
+            trend: 18,
+            structure: 16,
+            capital: 14,
+            macro: 9,
+            news: 7,
+            entry_range: [market.price, market.price],
+            stop_loss: market.price,
+            take_profit: [market.price, market.price],
+            leverage: 1,
+            risk: "low",
+            position_sizing: {
+              risk_budget_rate: 0,
+              risk_budget_amount: 0,
+              stop_distance_rate: 0,
+              margin_amount: 0,
+              position_value: 0,
+              max_loss_amount: 0,
+              margin_cap_rate: 0.3,
+              capped: false,
+            },
+            reasons: ["市场结构暂不支持入场", "等待新的量价确认"],
+          })),
+        },
+      };
+    },
+  };
+}
+
+test("serves public market data and uses Cloudflare AI for decisions", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
+    if (!init?.body) return Response.json({ Data: [] });
     const payload = JSON.parse(init.body);
     if (payload.type === "metaAndAssetCtxs") {
       return Response.json([
@@ -259,10 +299,19 @@ test("serves market and AI APIs without the local Python backend", async () => {
     const opportunities = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
       { headers: authHeaders },
+    ), { AI: createAiBinding(), DB, OWNER_API_TOKEN: OWNER_TOKEN });
+    assert.equal(opportunities.status, 200);
+    const payload = await opportunities.json();
+    assert.equal(payload.opportunities.length, 4);
+    assert.ok(payload.opportunities.every((item) => item.analysis_engine === "openai"));
+    assert.ok(payload.opportunities.every((item) => item.decision_schema_version === "ai_full_v1"));
+
+    const unavailable = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: authHeaders },
     ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
-    const scan = await opportunities.json();
-    assert.equal(scan.opportunities.length, 4);
-    assert.equal(scan.opportunities[0].instrument.endsWith("-PERP"), true);
+    assert.equal(unavailable.status, 503);
+    assert.match((await unavailable.json()).detail, /AI 决策暂时不可用/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -283,6 +332,7 @@ test("keeps the Cloudflare deployment contract at the repository root", async ()
   assert.equal(config.main, "./mobile-app/worker/app.js");
   assert.equal(config.assets.directory, "./mobile-app/dist/client");
   assert.equal(config.d1_databases[0].migrations_dir, "./mobile-app/migrations");
+  assert.equal(config.ai.binding, "AI");
   assert.deepEqual(config.secrets.required, ["OWNER_API_TOKEN"]);
 });
 
@@ -311,7 +361,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.1"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.2"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

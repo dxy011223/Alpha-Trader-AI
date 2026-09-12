@@ -52,11 +52,12 @@ class AnalysisRequest(BaseModel):
 
 
 class ScoreBreakdown(BaseModel):
-    trend: int = Field(ge=0, le=30)
-    structure: int = Field(ge=0, le=25)
-    capital: int = Field(ge=0, le=20)
-    macro: int = Field(ge=0, le=15)
-    news: int = Field(ge=0, le=10)
+    # 策略优化后单项权重会变化；五项合计仍由服务层约束为不超过 100。
+    trend: int = Field(ge=0, le=40)
+    structure: int = Field(ge=0, le=40)
+    capital: int = Field(ge=0, le=40)
+    macro: int = Field(ge=0, le=40)
+    news: int = Field(ge=0, le=40)
 
 
 class PositionSizing(BaseModel):
@@ -103,6 +104,9 @@ class AnalysisResponse(BaseModel):
     platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
     analysis_engine: Literal["openai", "rules"] = "rules"
     analysis_model: str | None = None
+    decision_schema_version: Literal["ai_full_v1"] | None = None
+    strategy_version: str = "v1"
+    strategy_parameters: dict = Field(default_factory=dict)
 
 
 class OpportunityScanResponse(BaseModel):
@@ -201,7 +205,9 @@ class PositionMonitorResponse(BaseModel):
     decision_id: int
     symbol: str
     platform: Literal["hyperliquid", "binance", "okx"]
-    action: Literal["HOLD", "REDUCE", "EXIT", "ADJUST_SL"]
+    action: Literal["HOLD", "REDUCE", "EXIT", "ADJUST_SL", "ADJUST_TP"]
+    opening_score: int = Field(ge=0, le=100)
+    current_score: int = Field(ge=0, le=100)
     current_price: float
     unrealized_pnl: float
     reason: str
@@ -245,6 +251,13 @@ class ReviewRecordResponse(BaseModel):
     created_at: datetime
 
 
+class StrategyVersionResponse(BaseModel):
+    version: str
+    parameters: dict
+    performance: dict
+    created_at: datetime
+
+
 class CompletionResponse(BaseModel):
     trade: CompletedTradeResponse
     review: ReviewRecordResponse
@@ -269,12 +282,15 @@ class SimulatedCompletedTradePayload(CompletedTradeResponse):
 
 class SimulationWalletUpdate(BaseModel):
     enabled: bool = False
-    balance: float = Field(default=1_000, ge=0, le=1_000_000_000)
+    # 模拟净值仅用于累计盈亏，允许因历史亏损变为负数。
+    balance: float = Field(default=1_000, ge=-1_000_000_000, le=1_000_000_000)
+    activeTrades: list[SimulatedActiveTradePayload] | None = Field(default=None, max_length=3)
     activeTrade: SimulatedActiveTradePayload | None = None
     history: list[SimulatedCompletedTradePayload] = Field(default_factory=list, max_length=500)
 
 
 class SimulationWalletResponse(SimulationWalletUpdate):
+    activeTrades: list[SimulatedActiveTradePayload] = Field(default_factory=list, max_length=3)
     client_id: str
     platform: Literal["hyperliquid", "binance", "okx"]
     updated_at: datetime

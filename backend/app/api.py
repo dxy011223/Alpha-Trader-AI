@@ -4,7 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
-from app.ai_analysis import enrich_analyses_with_openai, enrich_review_with_openai
+from app.ai_analysis import AIDecisionUnavailable, build_ai_decision_context, enrich_analyses_with_openai, enrich_review_with_openai
 from app.capital_settings import read_capital_settings, write_capital_settings
 from app.exchange_accounts import get_exchange_account, get_exchange_fills
 from app.news_archive import get_news_archive
@@ -13,10 +13,15 @@ from app.market_scanner import MarketScanBusy, get_cached_or_compute_market_scan
 from app.security import require_owner, require_secure_transport
 from app.platform_credentials import PrivatePlatform, read_platform_credential_status, read_platform_credentials, write_platform_credentials
 from app.position_monitor import monitor_active_positions
-from app.schemas import AnalysisRequest, AnalysisResponse, Candle, CapitalSettingsResponse, CapitalSettingsUpdate, CompletedTradeResponse, CompletionResponse, ExecutionCreate, ExecutionStateResponse, MarketSnapshot, NewsArchiveResponse, NewsItem, OpportunityScanResponse, PlatformCredentialResponse, PlatformCredentialUpdate, PositionMonitorResponse, ReviewRecordResponse, SimulationWalletResponse, SimulationWalletUpdate, WalletSettingsResponse, WalletSettingsUpdate, WalletSnapshot
+from app.schemas import AnalysisRequest, AnalysisResponse, Candle, CapitalSettingsResponse, CapitalSettingsUpdate, CompletedTradeResponse, CompletionResponse, ExecutionCreate, ExecutionStateResponse, MarketSnapshot, NewsArchiveResponse, NewsItem, OpportunityScanResponse, PlatformCredentialResponse, PlatformCredentialUpdate, PositionMonitorResponse, ReviewRecordResponse, SimulationWalletResponse, SimulationWalletUpdate, StrategyVersionResponse, WalletSettingsResponse, WalletSettingsUpdate, WalletSnapshot
 from app.simulation_wallet import read_simulation_wallet, write_simulation_wallet
-from app.strategy_versions import read_current_strategy
-from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time
+from app.strategy_versions import (
+    build_strategy_optimization_context,
+    list_strategy_versions,
+    read_current_strategy,
+    record_daily_performance,
+)
+from app.services import MarketPlatform, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time
 from app.trade_records import attach_wallet_to_active_position, cancel_execution, create_execution, finalize_position, generate_daily_review, list_completed_trades, list_review_records, read_active_execution, read_active_executions, read_open_position, update_review_content
 from app.wallet_settings import read_wallet_settings, write_wallet_settings
 
@@ -156,7 +161,10 @@ def active_executions(
 async def position_monitors(
     platform: MarketPlatform | None = Query(default=None),
 ) -> list[PositionMonitorResponse]:
-    return await monitor_active_positions(platform)
+    try:
+        return await monitor_active_positions(platform)
+    except AIDecisionUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.post("/executions", response_model=ExecutionStateResponse, status_code=201, summary="开始跟踪决策", dependencies=[Depends(require_owner)])
@@ -174,20 +182,25 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
         indicators = calculate_technical_indicators(candles)
         if indicators.atr_percent is not None:
             market = market.model_copy(update={"volatility": indicators.atr_percent})
-        verified_analysis = analyze_market(
+        verified_analysis = build_ai_decision_context(
             AnalysisRequest(
                 symbol=payload.analysis.symbol,
                 timeframe=payload.timeframe,
                 platform=platform,
             ),
             market,
-            capital.total_amount,
             indicators,
             strategy_version,
             strategy_parameters,
         )
+        verified_analysis = (await enrich_analyses_with_openai(
+            [verified_analysis],
+            {market.symbol: market},
+            payload.timeframe,
+            capital.total_amount,
+        ))[0]
         if verified_analysis.direction == "WAIT":
-            raise ValueError("实时复核后该机会处于观察区，不能开始执行")
+            raise ValueError("AI 实时复核后该机会处于观察区，不能开始执行")
         verified_payload = payload.model_copy(update={
             "analysis": verified_analysis,
             "total_amount": capital.total_amount,
@@ -201,6 +214,8 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
                 f"{platform}:{status.api_key_hint or '已配置'}" if status.configured else None
             )
         return create_execution(verified_payload, account_reference)
+    except AIDecisionUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -285,26 +300,45 @@ def reviews(
     return list_review_records(limit, platform)
 
 
+@router.get(
+    "/strategies/versions",
+    response_model=list[StrategyVersionResponse],
+    summary="读取策略版本历史",
+    dependencies=[Depends(require_owner)],
+)
+def strategy_versions(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[StrategyVersionResponse]:
+    return list_strategy_versions(limit)
+
+
 @router.post("/ai/analyze", response_model=AnalysisResponse, summary="生成 AI 交易计划", dependencies=[Depends(require_owner)])
 async def ai_analyze(payload: AnalysisRequest) -> AnalysisResponse:
-    market, candles = await asyncio.gather(
-        get_live_market(payload.symbol, payload.platform),
-        get_candles(payload.symbol, payload.timeframe, 220, payload.platform),
-    )
-    if market is None:
-        raise HTTPException(status_code=404, detail="暂不支持该交易品种")
-    total_amount = read_capital_settings().total_amount
-    strategy_version, strategy_parameters = read_current_strategy()
-    indicators = calculate_technical_indicators(candles)
-    if indicators.atr_percent is not None:
-        market = market.model_copy(update={"volatility": indicators.atr_percent})
-    base = analyze_market(
-        payload, market, total_amount, indicators, strategy_version, strategy_parameters
-    )
-    analyses = await enrich_analyses_with_openai(
-        [base], {market.symbol: market}, payload.timeframe, total_amount
-    )
-    return analyses[0]
+    try:
+        market, candles = await asyncio.gather(
+            get_live_market(payload.symbol, payload.platform),
+            get_candles(payload.symbol, payload.timeframe, 220, payload.platform),
+        )
+        if market is None:
+            raise HTTPException(status_code=404, detail="暂不支持该交易品种")
+        total_amount = read_capital_settings().total_amount
+        strategy_version, strategy_parameters = read_current_strategy()
+        indicators = calculate_technical_indicators(candles)
+        if indicators.atr_percent is not None:
+            market = market.model_copy(update={"volatility": indicators.atr_percent})
+        base = build_ai_decision_context(
+            payload,
+            market,
+            indicators,
+            strategy_version,
+            strategy_parameters,
+        )
+        analyses = await enrich_analyses_with_openai(
+            [base], {market.symbol: market}, payload.timeframe, total_amount
+        )
+        return analyses[0]
+    except AIDecisionUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/ai/opportunities", response_model=OpportunityScanResponse, summary="扫描全市场交易机会", dependencies=[Depends(require_owner)])
@@ -315,7 +349,7 @@ async def ai_opportunities(
 ) -> OpportunityScanResponse:
     try:
         return await get_cached_or_compute_market_scan(timeframe, limit, platform)
-    except MarketScanBusy as exc:
+    except (AIDecisionUnavailable, MarketScanBusy) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
@@ -351,5 +385,10 @@ async def daily_review(
     platform: MarketPlatform = Query(default="hyperliquid"),
 ) -> ReviewRecordResponse:
     review = generate_daily_review(target_date or current_news_date(), platform)
-    ai_review = await enrich_review_with_openai(review, {"period": review.review_date.isoformat()})
-    return update_review_content(ai_review)
+    strategy_context = build_strategy_optimization_context(review)
+    ai_review = await enrich_review_with_openai(review, {
+        "period": review.review_date.isoformat(),
+        "platform": platform,
+        "strategy_optimization": strategy_context,
+    })
+    return record_daily_performance(update_review_content(ai_review))

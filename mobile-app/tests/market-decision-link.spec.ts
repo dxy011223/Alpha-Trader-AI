@@ -17,8 +17,8 @@ function analysis(symbol: string, platform = "hyperliquid") {
       risk_budget_rate: 0.0075,
       risk_budget_amount: 75,
       stop_distance_rate: 0.05,
-      margin_amount: 300,
-      position_value: 900,
+      margin_amount: 500,
+      position_value: 1500,
       max_loss_amount: 75,
       margin_cap_rate: 0.3,
       capped: false,
@@ -27,6 +27,15 @@ function analysis(symbol: string, platform = "hyperliquid") {
     disclaimer: "仅供研究",
     source: "live",
     platform,
+    strategy_version: "v2",
+    strategy_parameters: {
+      min_trade_score: 72,
+      trend_weight: 27,
+      structure_weight: 25,
+      capital_weight: 23,
+      macro_weight: 15,
+      news_weight: 10,
+    },
   };
 }
 
@@ -67,8 +76,40 @@ test.beforeEach(async ({ page }) => {
       await route.fulfill({ json: null });
       return;
     }
-    if (url.pathname.endsWith("/trades/completed") || url.pathname.endsWith("/reviews")) {
+    if (url.pathname.endsWith("/trades/completed")) {
       await route.fulfill({ json: [] });
+      return;
+    }
+    if (url.pathname.endsWith("/reviews")) {
+      const platform = url.searchParams.get("platform") ?? "hyperliquid";
+      await route.fulfill({ json: [{
+        id: 91,
+        trade_id: null,
+        review_type: "daily",
+        review_date: "2026-09-12",
+        result: "loss",
+        summary: `${platform} 每日真实交易复盘`,
+        findings: ["近期突破策略表现下降。"],
+        adjustments: ["策略优化：已生成 v2，仅影响后续分析，不会自动下单。"],
+        metrics: {
+          platform,
+          total: 5,
+          wins: 2,
+          win_rate: 40,
+          net_pnl: -25,
+          strategy_optimization: {
+            status: "updated",
+            version_before: "v1",
+            version_after: "v2",
+            sample_total: 20,
+            sample_limit: 100,
+            win_rate: 40,
+            net_pnl: -25,
+            changes: ["可交易阈值 70→72"],
+          },
+        },
+        created_at: "2026-09-13T00:10:00Z",
+      }] });
       return;
     }
     if (url.pathname.endsWith("/settings/platform/binance")) {
@@ -129,7 +170,7 @@ test.beforeEach(async ({ page }) => {
     const symbol = url.pathname.split("/").at(-1) ?? "BTC";
     await route.fulfill({ json: {
       symbol,
-      price: symbol === "DOGE" ? 0.24 : 100,
+      price: 100,
       change_24h: 2,
       volume: 1_000_000,
       volatility: 3,
@@ -206,6 +247,17 @@ test("平台切换会更新所有页面数据并持久化", async ({ page }) => 
   await expect(page.getByText(/Binance 永续 · 实时数据/)).toBeVisible();
 });
 
+test("复盘页展示每日策略优化版本和样本指标", async ({ page }) => {
+  await page.getByLabel("主导航").getByRole("button", { name: "复盘", exact: true }).click();
+
+  const dailyReview = page.getByLabel("2026-09-12 每日策略复盘");
+  await expect(dailyReview).toBeVisible();
+  await expect(dailyReview).toContainText("策略版本 v1 → v2");
+  await expect(dailyReview).toContainText("20");
+  await expect(dailyReview).toContainText("40.0%");
+  await expect(dailyReview).toContainText("不会自动下单");
+});
+
 test("市场 K 线支持自由搜索并跟随决策页币种", async ({ page }) => {
   await expect(page.getByRole("button", { name: "自由" })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(".decision-market-chart-card")).toHaveCount(0);
@@ -247,8 +299,7 @@ test("模拟交易不读取真实钱包历史并在决策执行后自动开仓",
   page.on("request", (request) => requestedUrls.push(request.url()));
   await page.reload();
   await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
-  await page.getByRole("button", { name: /开始执行 ETH/ }).click();
-  await page.getByRole("button", { name: "确认开始执行" }).click();
+  await expect(page.getByRole("tab").filter({ hasText: "ETH" })).toContainText("执行中 · 快照已锁定");
   await page.getByLabel("主导航").getByRole("button", { name: "持仓", exact: true }).click();
 
   await expect(page.getByText("自动模拟中")).toBeVisible();
@@ -258,33 +309,29 @@ test("模拟交易不读取真实钱包历史并在决策执行后自动开仓",
 });
 
 test("最多可同时执行三个决策，且只锁定对应币种", async ({ page }) => {
+  const savedStates: Array<{ activeTrades?: Array<{ allocatedAmount: number }> }> = [];
+  page.on("request", (request) => {
+    if (request.method() === "PUT" && request.url().includes("/simulation/wallet/")) {
+      savedStates.push(request.postDataJSON() as { activeTrades?: Array<{ allocatedAmount: number }> });
+    }
+  });
   await page.getByRole("button", { name: "行情平台设置" }).click();
   await page.getByRole("switch", { name: "已关闭" }).click();
   await page.keyboard.press("Escape");
 
   await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
-  await page.getByRole("button", { name: /开始执行 ETH/ }).click();
-  await page.getByRole("button", { name: "确认开始执行" }).click();
-
   const ethDecision = page.getByRole("tab").filter({ hasText: "ETH" });
   const solDecision = page.getByRole("tab").filter({ hasText: "SOL" });
+  const dogeDecision = page.getByRole("tab").filter({ hasText: "DOGE" });
   await expect(ethDecision).toContainText("执行中 · 快照已锁定");
-  await expect(solDecision).toBeEnabled();
-  await solDecision.click();
-  await expect(page.getByText("SOL-PERP", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "1h", exact: true })).toBeEnabled();
-  await page.getByRole("button", { name: "1h", exact: true }).click();
-  await expect(page.getByRole("button", { name: "1h", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(solDecision).toContainText("执行中 · 快照已锁定");
+  await expect(dogeDecision).toContainText("执行中 · 快照已锁定");
+  await expect.poll(() => savedStates.some((state) => state.activeTrades?.length === 3)).toBe(true);
+  const threeTradeState = [...savedStates].reverse().find((state) => state.activeTrades?.length === 3);
+  expect(threeTradeState?.activeTrades?.reduce((sum, trade) => sum + trade.allocatedAmount, 0)).toBe(1_500);
 
-  await page.getByRole("button", { name: /开始执行 SOL/ }).click();
-  await page.getByRole("button", { name: "确认开始执行" }).click();
   const hypeDecision = page.getByRole("tab").filter({ hasText: "HYPE" });
   await hypeDecision.click();
-  await page.getByRole("button", { name: /开始执行 HYPE/ }).click();
-  await page.getByRole("button", { name: "确认开始执行" }).click();
-
-  const dogeDecision = page.getByRole("tab").filter({ hasText: "DOGE" });
-  await dogeDecision.click();
   await expect(page.getByRole("button", { name: "已达 3 个执行上限" })).toBeDisabled();
   await expect(page.getByText("已达到最多 3 个同时执行的上限，请先结束一个决策")).toBeVisible();
 
@@ -304,8 +351,7 @@ test("切换平台时模拟余额与持仓互不串用", async ({ page }) => {
   await page.keyboard.press("Escape");
 
   await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
-  await page.getByRole("button", { name: /开始执行 ETH/ }).click();
-  await page.getByRole("button", { name: "确认开始执行" }).click();
+  await expect(page.getByRole("tab").filter({ hasText: "ETH" })).toContainText("执行中 · 快照已锁定");
   await page.getByLabel("主导航").getByRole("button", { name: "市场", exact: true }).click();
 
   await page.getByRole("button", { name: "行情平台设置" }).click();

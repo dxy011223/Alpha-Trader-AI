@@ -63,6 +63,11 @@ def test_simulation_wallet_state_is_persisted(monkeypatch, tmp_path):
         unrealizedPnl=6,
         startedAt=int(now.timestamp() * 1_000),
     )
+    active_trades = [
+        active_trade,
+        active_trade.model_copy(update={"id": -3}),
+        active_trade.model_copy(update={"id": -4}),
+    ]
     completed_trade = SimulatedCompletedTradePayload(
         id=-2,
         decision_id=-2,
@@ -89,8 +94,8 @@ def test_simulation_wallet_state_is_persisted(monkeypatch, tmp_path):
     )
     payload = SimulationWalletUpdate(
         enabled=True,
-        balance=1_085.25,
-        activeTrade=active_trade,
+        balance=-85.25,
+        activeTrades=active_trades,
         history=[completed_trade],
     )
 
@@ -98,12 +103,35 @@ def test_simulation_wallet_state_is_persisted(monkeypatch, tmp_path):
     reloaded = simulation_wallet.read_simulation_wallet(CLIENT_ID, "hyperliquid")
 
     assert reloaded.enabled is True
-    assert reloaded.balance == 1_085.25
+    assert reloaded.balance == -85.25
+    assert len(reloaded.activeTrades) == 3
     assert reloaded.activeTrade is not None
+    assert reloaded.activeTrade.id == -1
     assert reloaded.activeTrade.latestPrice == 102
     assert len(reloaded.history) == 1
     assert reloaded.history[0].exit_reason == "take_profit"
     assert reloaded.history[0].net_pnl == 24
+
+
+def test_simulation_wallet_accepts_legacy_single_active_trade(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'simulation-legacy.db'}")
+    Base.metadata.create_all(engine)
+    testing_session = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    monkeypatch.setattr(simulation_wallet, "SessionLocal", testing_session)
+    active_trade = SimulatedActiveTradePayload(
+        id=-1, analysis=_analysis(), timeframe="4h", entryPrice=100, size=3,
+        allocatedAmount=100, latestPrice=102, unrealizedPnl=6,
+        startedAt=int(datetime.now(UTC).timestamp() * 1_000),
+    )
+
+    simulation_wallet.write_simulation_wallet(
+        CLIENT_ID,
+        "hyperliquid",
+        SimulationWalletUpdate(enabled=True, activeTrade=active_trade),
+    )
+
+    reloaded = simulation_wallet.read_simulation_wallet(CLIENT_ID, "hyperliquid")
+    assert [trade.id for trade in reloaded.activeTrades] == [-1]
 
 
 def test_simulation_wallet_state_is_separated_by_platform(monkeypatch, tmp_path):
