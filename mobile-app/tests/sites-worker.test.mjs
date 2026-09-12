@@ -229,48 +229,13 @@ test("does not turn missing API or write requests into the app shell", async () 
   }
 });
 
-function createAiBinding() {
-  return {
-    async run(_model, options) {
-      const context = JSON.parse(options.messages[1].content);
-      return {
-        response: {
-          decisions: context.markets.map((market) => ({
-            symbol: market.symbol,
-            direction: "WAIT",
-            confidence: 64,
-            score: 64,
-            trend: 18,
-            structure: 16,
-            capital: 14,
-            macro: 9,
-            news: 7,
-            entry_range: [market.price, market.price],
-            stop_loss: market.price,
-            take_profit: [market.price, market.price],
-            leverage: 1,
-            risk: "low",
-            position_sizing: {
-              risk_budget_rate: 0,
-              risk_budget_amount: 0,
-              stop_distance_rate: 0,
-              margin_amount: 0,
-              position_value: 0,
-              max_loss_amount: 0,
-              margin_cap_rate: 0.3,
-              capped: false,
-            },
-            reasons: ["市场结构暂不支持入场", "等待新的量价确认"],
-          })),
-        },
-      };
-    },
-  };
-}
-
-test("serves public market data and uses Cloudflare AI for decisions", async () => {
+test("serves public market data and proxies AI decisions to the Python backend", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
+    if (_url instanceof Request && new URL(_url.url).hostname === "backend.example.test") {
+      assert.equal(_url.headers.get("authorization"), `Bearer ${OWNER_TOKEN}`);
+      return Response.json({ proxied: true });
+    }
     if (!init?.body) return Response.json({ Data: [] });
     const payload = JSON.parse(init.body);
     if (payload.type === "metaAndAssetCtxs") {
@@ -299,19 +264,21 @@ test("serves public market data and uses Cloudflare AI for decisions", async () 
     const opportunities = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
       { headers: authHeaders },
-    ), { AI: createAiBinding(), DB, OWNER_API_TOKEN: OWNER_TOKEN });
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
     assert.equal(opportunities.status, 200);
     const payload = await opportunities.json();
-    assert.equal(payload.opportunities.length, 4);
-    assert.ok(payload.opportunities.every((item) => item.analysis_engine === "openai"));
-    assert.ok(payload.opportunities.every((item) => item.decision_schema_version === "ai_full_v1"));
+    assert.equal(payload.proxied, true);
 
     const unavailable = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
       { headers: authHeaders },
     ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
     assert.equal(unavailable.status, 503);
-    assert.match((await unavailable.json()).detail, /AI 决策暂时不可用/);
+    assert.match((await unavailable.json()).detail, /完整后端服务/);
   } finally {
     globalThis.fetch = originalFetch;
   }

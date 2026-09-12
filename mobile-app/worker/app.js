@@ -208,11 +208,9 @@ async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
     const simulationMatch = url.pathname.match(/^\/api\/v1\/simulation\/wallet\/([A-Za-z0-9_-]{8,64})$/);
     const protectedLocally = simulationMatch || url.pathname === "/api/v1/settings/capital";
-    const aiRoute = url.pathname === "/api/v1/ai/analyze" || url.pathname === "/api/v1/ai/opportunities";
     const fullBackendRoute = url.pathname.startsWith("/api/v1/")
       && !url.pathname.match(/^\/api\/v1\/(market\/|news(?:\/|$))/)
-      && !protectedLocally
-      && !aiRoute;
+      && !protectedLocally;
     const nonHyperliquid = url.searchParams.get("platform")
       && url.searchParams.get("platform") !== "hyperliquid";
 
@@ -221,7 +219,7 @@ async function handleRequest(request, env, ctx) {
       return proxied ?? json({ detail: "当前部署尚未配置完整后端服务" }, 503);
     }
 
-    if (protectedLocally || aiRoute) {
+    if (protectedLocally) {
       const auth = await authenticateOwner(request, env);
       if (auth.error) return auth.error;
       if (simulationMatch) {
@@ -233,13 +231,6 @@ async function handleRequest(request, env, ctx) {
       }
       if (url.pathname === "/api/v1/settings/capital") {
         return handleCapital(request, env, auth.ownerId);
-      }
-      if (aiRoute) {
-        const capital = await readCapital(env, auth.ownerId);
-        if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
-        const headers = new Headers(request.headers);
-        headers.set("x-alpha-owner-capital", String(capital.total_amount));
-        return baseWorker.fetch(new Request(request, { headers }), env, ctx);
       }
     }
     return baseWorker.fetch(request, env, ctx);

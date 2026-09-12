@@ -49,6 +49,12 @@ API 文档：`http://localhost:8000/docs`。未配置 PostgreSQL 时，本地开
 docker compose up --build
 ```
 
+## Render 后端部署
+
+仓库根目录的 `render.yaml` 会创建免费预览规格的 FastAPI Web Service、PostgreSQL 和 Redis-compatible Key Value。首次创建 Blueprint 时必须在 Render 控制台填写 `OWNER_API_TOKEN` 与 `AI_API_KEY`；其余连接地址和加密密钥由平台注入或生成。部署完成后，把 Web Service 的 HTTPS 地址配置为 Cloudflare Worker 的 `BACKEND_API_URL`。
+
+免费 Web Service 在空闲后会休眠，免费 PostgreSQL 会在 30 天后到期，因此仅适合功能验收；正式长期运行应升级对应实例或迁移到长期托管数据库。
+
 ## 主要 API
 
 - `GET /api/v1/market/{symbol}`：指定平台任意可用永续合约市场快照
