@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 from app import services
 from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem
@@ -217,3 +218,98 @@ def test_relevant_news_changes_rule_score_in_expected_direction():
     assert opposed.score_breakdown.news == 4
     assert supported.score > opposed.score
     assert any("参考 1 条相关事件" in reason for reason in supported.reasons)
+
+
+def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_range():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    original_market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), original_market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed_market = original_market.model_copy(update={"price": 99.5, "change_24h": 2.2})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000
+    )
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "4h", generated_at + timedelta(minutes=30)
+    )
+
+    assert decision.entry_range == original.entry_range
+    assert decision.stop_loss == original.stop_loss
+    assert decision.take_profit == original.take_profit
+    assert decision.current_price == 99.5
+    assert decision.decision_status == "executable"
+    assert decision.is_executable is True
+
+
+def test_decision_plan_marks_original_target_as_reached_instead_of_chasing_price():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed_market = market.model_copy(update={"price": original.take_profit[0], "change_24h": 4})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000
+    )
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "4h", generated_at + timedelta(hours=1)
+    )
+
+    assert decision.entry_range == original.entry_range
+    assert decision.decision_status == "target_reached"
+    assert decision.is_executable is False
+    assert "禁止追价" in decision.status_reason
+
+
+def test_decision_plan_invalidates_when_latest_signal_no_longer_meets_threshold():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    weak_market = market.model_copy(update={"price": 99.5, "change_24h": 0, "volatility": 8, "funding_rate": 0.05})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), weak_market, 10_000
+    )
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, weak_market.price, "4h", generated_at + timedelta(minutes=30)
+    )
+
+    assert decision.decision_status == "invalidated"
+    assert decision.is_executable is False
+    assert "不满足" in decision.status_reason
+
+
+def test_expired_decision_plan_allows_a_new_plan():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="1h"), market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed_market = market.model_copy(update={"price": 110})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="1h"), refreshed_market, 10_000
+    )
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "1h", generated_at + timedelta(hours=1, seconds=1)
+    )
+
+    assert decision.entry_range == refreshed.entry_range
+    assert decision.reference_price == 110

@@ -43,6 +43,7 @@ function createSimulationDatabase() {
   const capital = new Map();
   const passwordCredentials = new Map();
   const loginRateLimits = new Map();
+  const decisionPlans = new Map();
   let writes = 0;
   return {
     get writes() { return writes; },
@@ -98,6 +99,8 @@ function createSimulationDatabase() {
           } else if (sql.includes("owner_simulation_wallets")) {
             const key = `${params[0]}:${params[1]}:${params[2]}`;
             wallets.set(key, { enabled: params[3], balance: params[4], active_trade: params[5], history: params[6], updated_at: params[7] });
+          } else if (sql.includes("owner_decision_plan_scans")) {
+            decisionPlans.set(`${params[0]}:${params[1]}`, { scan_json: params[2], updated_at: params[3] });
           }
           return { success: true, meta: { changes: 1 } };
         },
@@ -108,6 +111,7 @@ function createSimulationDatabase() {
           }
           if (sql.includes("FROM auth_login_rate_limits")) return loginRateLimits.get(params[0]) ?? null;
           if (sql.includes("owner_capital_settings")) return capital.get(params[0]) ?? null;
+          if (sql.includes("owner_decision_plan_scans")) return decisionPlans.get(`${params[0]}:${params[1]}`) ?? null;
           return wallets.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
         },
       };
@@ -383,6 +387,8 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
     const payload = await response.json();
     assert.equal(payload.opportunities.length, 4);
     assert.ok(payload.opportunities.every((item) => item.analysis_engine === "rules"));
+    assert.ok(payload.opportunities.every((item) => item.reference_price > 0));
+    assert.ok(payload.opportunities.every((item) => item.is_executable === false));
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;

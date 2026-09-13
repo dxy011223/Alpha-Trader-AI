@@ -2,6 +2,7 @@ import logging
 import math
 import statistics
 import time
+from datetime import UTC, datetime
 from typing import Literal
 
 import httpx
@@ -15,6 +16,16 @@ HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 OKX_API_URL = "https://www.okx.com"
 MarketPlatform = Literal["hyperliquid", "binance", "okx"]
+
+DECISION_VALIDITY_SECONDS = {
+    "1m": 300,
+    "5m": 900,
+    "15m": 1_800,
+    "1h": 3_600,
+    "4h": 14_400,
+    "1d": 86_400,
+}
+MIN_REMAINING_REWARD_RISK = 1.5
 
 
 MARKETS = {
@@ -474,6 +485,87 @@ def calculate_position_sizing(
     )
 
 
+def refresh_decision_plan(
+    original: AnalysisResponse,
+    refreshed: AnalysisResponse,
+    current_price: float,
+    timeframe: str,
+    now: datetime | None = None,
+) -> AnalysisResponse:
+    """固定原计划价格，只根据最新行情重评其生命周期与可执行性。"""
+    now = now or datetime.now(UTC)
+    try:
+        generated_at = datetime.fromisoformat(original.generated_at or "")
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=UTC)
+    except ValueError:
+        return refreshed
+
+    validity_seconds = DECISION_VALIDITY_SECONDS.get(timeframe, 14_400)
+    if original.direction == "WAIT" or (now - generated_at).total_seconds() >= validity_seconds:
+        return refreshed
+
+    terminal_statuses = {"invalidated", "target_reached"}
+    if original.decision_status in terminal_statuses:
+        return original.model_copy(update={"current_price": current_price})
+
+    entry_low, entry_high = sorted(original.entry_range[:2])
+    first_target = original.take_profit[0]
+    min_trade_score = int(refreshed.strategy_parameters.get("min_trade_score", 70))
+    status: Literal["watching", "executable", "invalidated", "target_reached"] = "watching"
+    executable = False
+
+    target_reached = (
+        original.direction == "LONG" and current_price >= first_target
+    ) or (
+        original.direction == "SHORT" and current_price <= first_target
+    )
+    stop_reached = (
+        original.direction == "LONG" and current_price <= original.stop_loss
+    ) or (
+        original.direction == "SHORT" and current_price >= original.stop_loss
+    )
+
+    if target_reached:
+        status = "target_reached"
+        reason = "价格已达到原决策首个止盈目标，本轮预测完成，禁止追价入场"
+    elif stop_reached:
+        status = "invalidated"
+        reason = "价格已触及原决策结构止损，本轮计划失效"
+    elif refreshed.direction != original.direction or refreshed.score < min_trade_score:
+        status = "invalidated"
+        reason = "最新方向或综合评分已不满足原决策的可执行标准"
+    elif entry_low <= current_price <= entry_high:
+        risk_distance = abs(current_price - original.stop_loss)
+        remaining_reward = abs(first_target - current_price)
+        reward_risk = remaining_reward / risk_distance if risk_distance > 0 else 0
+        if reward_risk >= MIN_REMAINING_REWARD_RISK:
+            status = "executable"
+            executable = True
+            reason = f"价格进入原入场区间，最新评分 {refreshed.score} 分，剩余盈亏比 {reward_risk:.2f}"
+        else:
+            reason = f"价格虽进入原入场区间，但剩余盈亏比 {reward_risk:.2f} 低于 {MIN_REMAINING_REWARD_RISK:.1f}"
+    elif original.direction == "LONG" and current_price > entry_high:
+        reason = "价格高于原入场区间，等待回踩，禁止追涨"
+    elif original.direction == "SHORT" and current_price < entry_low:
+        reason = "价格低于原入场区间，等待反弹，禁止追空"
+    else:
+        reason = "价格已穿过原入场区间但尚未触及止损，等待重新进入计划区间"
+
+    return original.model_copy(update={
+        "confidence": refreshed.confidence,
+        "score": refreshed.score,
+        "score_breakdown": refreshed.score_breakdown,
+        "indicators": refreshed.indicators,
+        "source": refreshed.source,
+        "current_price": current_price,
+        "decision_status": status,
+        "is_executable": executable,
+        "status_reason": reason,
+        "reasons": [reason, *refreshed.reasons],
+    })
+
+
 def analyze_market(
     payload: AnalysisRequest,
     market: MarketSnapshot | None = None,
@@ -533,6 +625,12 @@ def analyze_market(
         stop_loss=stop_loss,
         leverage=leverage,
     )
+    generated_at = datetime.now(UTC).isoformat()
+    status_reason = (
+        "当前评分或方向尚未达到可执行标准"
+        if direction == "WAIT"
+        else "已生成固定交易计划，等待价格进入计划入场区间"
+    )
     return AnalysisResponse(
         symbol=symbol,
         instrument=f"{symbol}-PERP",
@@ -571,6 +669,12 @@ def analyze_market(
         platform=market.platform,
         strategy_version=strategy_version,
         strategy_parameters=normalized_parameters,
+        reference_price=market.price,
+        current_price=market.price,
+        generated_at=generated_at,
+        decision_status="watching",
+        is_executable=False,
+        status_reason=status_reason,
     )
 
 

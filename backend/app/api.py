@@ -20,7 +20,7 @@ from app.strategy_versions import (
     list_strategy_versions,
     record_daily_performance,
 )
-from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time
+from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time, refresh_decision_plan
 from app.trade_records import attach_wallet_to_active_position, cancel_execution, create_execution, finalize_position, generate_daily_review, list_completed_trades, list_review_records, read_active_execution, read_active_executions, read_open_position, update_review_content
 from app.wallet_settings import read_wallet_settings, write_wallet_settings
 
@@ -187,8 +187,14 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
             capital.total_amount,
             indicators,
         )
-        if verified_analysis.direction == "WAIT":
-            raise ValueError("实时规则复核后该机会处于观察区，不能开始执行")
+        verified_analysis = refresh_decision_plan(
+            payload.analysis,
+            verified_analysis,
+            market.price,
+            payload.timeframe,
+        )
+        if not verified_analysis.is_executable:
+            raise ValueError(f"当前决策不可执行：{verified_analysis.status_reason}")
         verified_payload = payload.model_copy(update={
             "analysis": verified_analysis,
             "total_amount": capital.total_amount,

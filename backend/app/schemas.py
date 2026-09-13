@@ -107,6 +107,12 @@ class AnalysisResponse(BaseModel):
     decision_schema_version: Literal["ai_full_v1"] | None = None
     strategy_version: str = "v1"
     strategy_parameters: dict = Field(default_factory=dict)
+    reference_price: float | None = None
+    current_price: float | None = None
+    generated_at: str | None = None
+    decision_status: Literal["watching", "executable", "invalidated", "target_reached"] = "watching"
+    is_executable: bool = False
+    status_reason: str = "等待进入计划入场区间"
 
 
 class OpportunityScanResponse(BaseModel):

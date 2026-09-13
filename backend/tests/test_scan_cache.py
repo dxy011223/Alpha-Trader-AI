@@ -53,6 +53,28 @@ def test_scan_cache_round_trip(monkeypatch):
     assert cached.scan_source == "scheduled_cache"
 
 
+def test_decision_plan_cache_uses_a_separate_long_lived_key(monkeypatch):
+    fake = FakeRedis()
+    monkeypatch.setattr(scan_cache, "get_settings", lambda: SimpleNamespace(
+        redis_url="redis://test",
+        market_scan_cache_seconds=360,
+    ))
+    monkeypatch.setattr(scan_cache.Redis, "from_url", lambda *_args, **_kwargs: fake)
+    scan = OpportunityScanResponse(
+        scanned_markets=100,
+        eligible_markets=80,
+        updated_at="2026-09-13T00:00:00Z",
+        opportunities=[],
+    )
+
+    scan_cache.write_decision_plan_cache("4h", scan)
+    cached = scan_cache.read_decision_plan_cache("4h")
+
+    assert cached is not None
+    assert cached.updated_at == scan.updated_at
+    assert "alpha-trader:decision-plans:hyperliquid:4h" in fake.values
+
+
 def test_scan_lock_uses_owner_token_when_releasing(monkeypatch):
     fake = FakeRedis()
     monkeypatch.setattr(scan_cache, "get_settings", lambda: SimpleNamespace(

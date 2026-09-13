@@ -36,6 +36,12 @@ function analysis(symbol: string, platform = "hyperliquid") {
       macro_weight: 15,
       news_weight: 10,
     },
+    reference_price: 101,
+    current_price: 99.5,
+    generated_at: "2026-09-13T00:00:00Z",
+    decision_status: "executable",
+    is_executable: true,
+    status_reason: "价格进入原入场区间，信号仍然有效。",
   };
 }
 
@@ -217,6 +223,15 @@ test("机会扫描失败会显示原因并可手动重试", async ({ page }) => 
 
   await page.getByRole("button", { name: "重新扫描" }).click();
   await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
+});
+
+test("决策页展示固定参考价、当前复核价和可执行状态", async ({ page }) => {
+  await page.locator(".bottom-nav button").nth(1).click();
+
+  await expect(page.getByText("决策参考价")).toBeVisible();
+  await expect(page.getByText("当前复核价")).toBeVisible();
+  await expect(page.getByRole("button", { name: /开始执行/ })).toBeEnabled();
+  await expect(page.getByText("价格进入原入场区间，信号仍然有效。")).toBeVisible();
 });
 
 test("缺少访问令牌时显示账号密码登录且不发送 AI 扫描请求", async ({ page }) => {

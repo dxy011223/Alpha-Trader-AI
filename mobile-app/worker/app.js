@@ -627,6 +627,7 @@ async function handleRequest(request, env, ctx) {
         if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
         const headers = new Headers(request.headers);
         headers.set("x-alpha-owner-capital", String(capital.total_amount));
+        headers.set("x-alpha-owner-id", auth.ownerId);
         return baseWorker.fetch(new Request(request, { headers }), env, ctx);
       }
     }

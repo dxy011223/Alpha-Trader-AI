@@ -8,6 +8,7 @@ const STRATEGY_PARAMETERS = {
   news_weight: 10,
 };
 const INTERVAL_MS = { "1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000 };
+const DECISION_VALIDITY_MS = { ...INTERVAL_MS, "1m": 300_000, "5m": 900_000, "15m": 1_800_000 };
 const FALLBACK_MARKETS = [
   { symbol: "BTC", price: 82437.2, change_24h: 2.84, volume: 28460000000, volatility: 3.12, funding_rate: 0.0102, open_interest: 18720000000, source: "demo" },
   { symbol: "ETH", price: 3548.76, change_24h: 1.92, volume: 14820000000, volatility: 3.86, funding_rate: 0.0084, open_interest: 9640000000, source: "demo" },
@@ -192,6 +193,7 @@ function analyzeMarket(market, totalAmount) {
   const stopDistance = { low: 0.02, medium: 0.026, high: 0.035 }[risk] ?? 0.035;
   const stopLoss = roundPrice(market.price * (direction === "SHORT" ? 1 + stopDistance : 1 - stopDistance));
   const leverage = risk === "medium" ? 3 : 2;
+  const generatedAt = new Date().toISOString();
   return {
     symbol: market.symbol, instrument: `${market.symbol}-PERP`, direction, confidence: score, score,
     score_breakdown: scoreBreakdown, entry_range: entryRange, stop_loss: stopLoss,
@@ -215,7 +217,103 @@ function analyzeMarket(market, totalAmount) {
     decision_schema_version: null,
     strategy_version: "v1",
     strategy_parameters: STRATEGY_PARAMETERS,
+    reference_price: market.price,
+    current_price: market.price,
+    generated_at: generatedAt,
+    decision_status: "watching",
+    is_executable: false,
+    status_reason: direction === "WAIT"
+      ? "当前评分或方向尚未达到可执行标准"
+      : "已生成固定交易计划，等待价格进入计划入场区间",
   };
+}
+
+function refreshDecisionPlan(original, refreshed, currentPrice, timeframe, now = Date.now()) {
+  const generatedAt = Date.parse(original.generated_at || "");
+  const validityMs = DECISION_VALIDITY_MS[timeframe] || DECISION_VALIDITY_MS["4h"];
+  if (original.direction === "WAIT" || !Number.isFinite(generatedAt) || now - generatedAt >= validityMs) {
+    return refreshed;
+  }
+  if (["invalidated", "target_reached"].includes(original.decision_status)) {
+    return { ...original, current_price: currentPrice };
+  }
+
+  const [entryLow, entryHigh] = [...original.entry_range].sort((a, b) => a - b);
+  const firstTarget = original.take_profit[0];
+  const targetReached = original.direction === "LONG" ? currentPrice >= firstTarget : currentPrice <= firstTarget;
+  const stopReached = original.direction === "LONG" ? currentPrice <= original.stop_loss : currentPrice >= original.stop_loss;
+  let decisionStatus = "watching";
+  let isExecutable = false;
+  let statusReason;
+
+  if (targetReached) {
+    decisionStatus = "target_reached";
+    statusReason = "价格已达到原决策首个止盈目标，本轮预测完成，禁止追价入场";
+  } else if (stopReached) {
+    decisionStatus = "invalidated";
+    statusReason = "价格已触及原决策结构止损，本轮计划失效";
+  } else if (refreshed.direction !== original.direction || refreshed.score < STRATEGY_PARAMETERS.min_trade_score) {
+    decisionStatus = "invalidated";
+    statusReason = "最新方向或综合评分已不满足原决策的可执行标准";
+  } else if (currentPrice >= entryLow && currentPrice <= entryHigh) {
+    const riskDistance = Math.abs(currentPrice - original.stop_loss);
+    const rewardRisk = riskDistance > 0 ? Math.abs(firstTarget - currentPrice) / riskDistance : 0;
+    if (rewardRisk >= 1.5) {
+      decisionStatus = "executable";
+      isExecutable = true;
+      statusReason = `价格进入原入场区间，最新评分 ${refreshed.score} 分，剩余盈亏比 ${rewardRisk.toFixed(2)}`;
+    } else {
+      statusReason = `价格虽进入原入场区间，但剩余盈亏比 ${rewardRisk.toFixed(2)} 低于 1.5`;
+    }
+  } else if (original.direction === "LONG" && currentPrice > entryHigh) {
+    statusReason = "价格高于原入场区间，等待回踩，禁止追涨";
+  } else if (original.direction === "SHORT" && currentPrice < entryLow) {
+    statusReason = "价格低于原入场区间，等待反弹，禁止追空";
+  } else {
+    statusReason = "价格已穿过原入场区间但尚未触及止损，等待重新进入计划区间";
+  }
+
+  return {
+    ...original,
+    confidence: refreshed.confidence,
+    score: refreshed.score,
+    score_breakdown: refreshed.score_breakdown,
+    source: refreshed.source,
+    current_price: currentPrice,
+    decision_status: decisionStatus,
+    is_executable: isExecutable,
+    status_reason: statusReason,
+    reasons: [statusReason, ...refreshed.reasons],
+  };
+}
+
+async function readDecisionPlans(env, ownerId, timeframe) {
+  if (!env.DB || !ownerId) return null;
+  try {
+    const row = await env.DB.prepare(`
+      SELECT scan_json FROM owner_decision_plan_scans
+      WHERE owner_id = ? AND platform = 'hyperliquid' AND timeframe = ?
+    `).bind(ownerId, timeframe).first();
+    return row?.scan_json ? JSON.parse(row.scan_json) : null;
+  } catch (error) {
+    console.error("边缘决策计划读取失败", error);
+    return null;
+  }
+}
+
+async function writeDecisionPlans(env, ownerId, timeframe, scan) {
+  if (!env.DB || !ownerId) return;
+  try {
+    await env.DB.prepare(`
+      INSERT INTO owner_decision_plan_scans (owner_id, platform, timeframe, scan_json, updated_at)
+      VALUES (?, 'hyperliquid', ?, ?, ?)
+      ON CONFLICT(owner_id, platform, timeframe) DO UPDATE SET
+        scan_json = excluded.scan_json,
+        updated_at = excluded.updated_at
+    `).bind(ownerId, timeframe, JSON.stringify(scan), Date.now()).run();
+  } catch (error) {
+    console.error("边缘决策计划保存失败", error);
+  }
 }
 
 async function handleApi(request, url, env) {
@@ -248,13 +346,28 @@ async function handleApi(request, url, env) {
     const totalAmount = Number(request.headers.get("x-alpha-owner-capital") || 0);
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
     const limit = Math.min(4, Math.max(1, Number(url.searchParams.get("limit") || 4)));
+    const timeframe = url.searchParams.get("timeframe") || "4h";
     const markets = await getMarkets();
     const eligible = markets.filter((market) => market.volume >= 500_000 && market.open_interest >= 250_000);
-    const opportunities = eligible
+    const refreshed = eligible
       .map((market) => analyzeMarket(market, totalAmount))
       .sort((a, b) => b.score - a.score)
+      .slice(0, Math.max(limit * 2, 12));
+    const ownerId = request.headers.get("x-alpha-owner-id");
+    const previous = await readDecisionPlans(env, ownerId, timeframe);
+    const previousBySymbol = new Map((previous?.opportunities || []).map((item) => [item.symbol, item]));
+    const priceBySymbol = new Map(eligible.map((market) => [market.symbol, market.price]));
+    const opportunities = refreshed
+      .map((item) => previousBySymbol.has(item.symbol)
+        ? refreshDecisionPlan(previousBySymbol.get(item.symbol), item, priceBySymbol.get(item.symbol), timeframe)
+        : item)
+      .sort((a, b) => Number(b.is_executable) - Number(a.is_executable)
+        || Number(b.decision_status === "watching") - Number(a.decision_status === "watching")
+        || b.score - a.score)
       .slice(0, limit);
-    return json({ scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "live_scan", platform: "hyperliquid" });
+    const scan = { scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "live_scan", platform: "hyperliquid" };
+    await writeDecisionPlans(env, ownerId, timeframe, scan);
+    return json(scan);
   }
 
   if (url.pathname === "/api/v1/news" && request.method === "GET") {

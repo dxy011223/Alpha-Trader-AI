@@ -95,6 +95,12 @@ export interface AnalysisResponse {
   platform: MarketPlatform;
   strategy_version?: string;
   strategy_parameters?: Record<string, number>;
+  reference_price?: number | null;
+  current_price?: number | null;
+  generated_at?: string | null;
+  decision_status?: "watching" | "executable" | "invalidated" | "target_reached";
+  is_executable?: boolean;
+  status_reason?: string;
 }
 
 export interface OpportunityScanResponse {

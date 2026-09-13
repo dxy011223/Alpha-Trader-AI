@@ -7,9 +7,9 @@ from app.capital_settings import read_capital_settings
 from app.database import SessionLocal
 from app.models import MarketScanRecord
 from app.config import get_settings
-from app.scan_cache import acquire_scan_lock, read_scan_cache, release_scan_lock, write_timeframe_scan_cache
+from app.scan_cache import acquire_scan_lock, read_decision_plan_cache, read_scan_cache, release_scan_lock, write_decision_plan_cache, write_timeframe_scan_cache
 from app.schemas import AnalysisRequest, OpportunityScanResponse
-from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_markets
+from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_markets, refresh_decision_plan
 
 
 _scan_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -42,7 +42,7 @@ async def compute_market_scan(
         get_candles(market.symbol, timeframe, 220, platform)
         for market in indicator_candidates
     ))
-    decisions = sorted(
+    refreshed_decisions = sorted(
         (
             analyze_market(
                 AnalysisRequest(symbol=market.symbol, timeframe=timeframe, platform=platform),
@@ -57,7 +57,25 @@ async def compute_market_scan(
         key=lambda item: item.score,
         reverse=True,
     )
-    return OpportunityScanResponse(
+    previous_scan = await asyncio.to_thread(read_decision_plan_cache, timeframe, platform)
+    previous_by_symbol = {
+        item.symbol: item for item in previous_scan.opportunities
+    } if previous_scan else {}
+    market_by_symbol = {market.symbol: market for market in indicator_candidates}
+    decisions = [
+        refresh_decision_plan(
+            previous_by_symbol[item.symbol],
+            item,
+            market_by_symbol[item.symbol].price,
+            timeframe,
+        ) if item.symbol in previous_by_symbol else item
+        for item in refreshed_decisions
+    ]
+    decisions.sort(
+        key=lambda item: (item.is_executable, item.decision_status == "watching", item.score),
+        reverse=True,
+    )
+    scan = OpportunityScanResponse(
         scanned_markets=len(markets),
         eligible_markets=len(eligible_markets),
         updated_at=datetime.now(UTC).isoformat(),
@@ -65,6 +83,8 @@ async def compute_market_scan(
         scan_source="live_scan",
         platform=platform,
     )
+    await asyncio.to_thread(write_decision_plan_cache, timeframe, scan)
+    return scan
 
 
 async def get_cached_or_compute_market_scan(

@@ -1027,6 +1027,14 @@ function DecisionScreen({
   const score = analysis?.score ?? Object.values(fallbackBreakdown).reduce((sum, value) => sum + value, 0);
   const confidence = analysis?.confidence ?? 0;
   const direction = analysis?.direction ?? "WAIT";
+  const decisionExecutable = analysis?.is_executable === true;
+  const decisionStatusLabel = analysis?.decision_status === "executable"
+    ? "可执行"
+    : analysis?.decision_status === "target_reached"
+      ? "目标已达"
+      : analysis?.decision_status === "invalidated"
+        ? "已失效"
+        : "等待入场";
   const opportunity = getOpportunity(score);
   const entryRange = analysis?.entry_range ?? [0, 0];
   const stopLoss = analysis?.stop_loss ?? 0;
@@ -1050,6 +1058,8 @@ function DecisionScreen({
   const entryRangeLabel = analysis ? entryRange.map(formatPrice).join(" – ") : "--";
   const stopLossLabel = analysis ? formatPrice(stopLoss) : "--";
   const takeProfitLabels = analysis ? takeProfit.map(formatPrice) : ["--", "--"];
+  const referencePriceLabel = analysis?.reference_price ? formatPrice(analysis.reference_price) : "--";
+  const currentPriceLabel = analysis?.current_price ? formatPrice(analysis.current_price) : "--";
   const strategyParameters = analysis?.strategy_parameters;
   const scoreItems: Array<[keyof typeof breakdown, string, number]> = [
     ["trend", "趋势", strategyParameters?.trend_weight ?? 30],
@@ -1086,7 +1096,7 @@ function DecisionScreen({
   };
 
   const confirmExecution = async () => {
-    if (!analysis || direction === "WAIT" || executionLimitReached) return;
+    if (!analysis || !decisionExecutable || executionLimitReached) return;
     setExecutionMutationState("saving");
     try {
       await onStartExecution(analysis, timeframe, totalAmount);
@@ -1141,7 +1151,7 @@ function DecisionScreen({
                 key={candidate.symbol}
               >
                 <span><small>#{index + 1}</small><strong>{candidate.symbol}</strong></span>
-                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.direction}`} </em>
+                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.is_executable ? "可执行" : candidate.decision_status === "target_reached" ? "目标已达" : candidate.decision_status === "invalidated" ? "已失效" : "等待入场"}`} </em>
               </button>
             );
           }) : remoteState === "offline" ? (
@@ -1240,8 +1250,10 @@ function DecisionScreen({
       </section>
 
       <section className="decision-detail-card" aria-labelledby="execution-plan-title">
-        <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划</h2></div><em>手动确认后执行</em></div>
+        <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划</h2></div><em>{isExecuting ? "快照已锁定" : decisionStatusLabel}</em></div>
         <div className="execution-grid">
+          <div><span>决策参考价</span><strong>{referencePriceLabel}</strong></div>
+          <div><span>当前复核价</span><strong>{currentPriceLabel}</strong></div>
           <div className="wide"><span>建议入场区间</span><strong>{entryRangeLabel}</strong></div>
           <div><span>结构止损</span><strong className="loss">{stopLossLabel}</strong></div>
           <div><span>建议杠杆</span><strong>{leverage}×</strong></div>
@@ -1268,12 +1280,12 @@ function DecisionScreen({
               ? `仅当前币种、周期与决策快照已锁定；当前 ${activeDecisions.length}/${MAX_ACTIVE_DECISIONS} 个执行中`
               : executionLimitReached
                 ? `已达到最多 ${MAX_ACTIVE_DECISIONS} 个同时执行的上限，请先结束一个决策`
-                : simulationEnabled ? "可执行机会会自动模拟开仓，不限制总资金，并按止盈止损独立结算" : "开始后固定本次决策；仅用于执行跟踪，不会自动下单"}</span>
+                : analysis?.status_reason ?? (simulationEnabled ? "可执行机会会自动模拟开仓，不限制总资金，并按止盈止损独立结算" : "等待价格与信号同时满足原计划条件")}</span>
           </div>
           <button
             type="button"
             aria-pressed={isExecuting}
-            disabled={!analysis || executionLimitReached || (!isExecuting && direction === "WAIT")}
+            disabled={!analysis || executionLimitReached || (!isExecuting && !decisionExecutable)}
             onClick={() => void (async () => {
               if (activeDecision) {
                 setExecutionMutationState("saving");
@@ -1291,7 +1303,7 @@ function DecisionScreen({
             })()}
           >
             <LockClosedIcon />
-            {isExecuting ? "结束当前决策" : executionLimitReached ? `已达 ${MAX_ACTIVE_DECISIONS} 个执行上限` : `开始执行 ${activeSymbol}`}
+            {isExecuting ? "结束当前决策" : executionLimitReached ? `已达 ${MAX_ACTIVE_DECISIONS} 个执行上限` : decisionExecutable ? `开始执行 ${activeSymbol}` : decisionStatusLabel}
           </button>
           {isExecuting && !simulationEnabled && (
             <button
@@ -2270,7 +2282,7 @@ function TradingPrototype() {
         for (const candidate of scan.opportunities) {
           if (additions.length >= availableSlots) break;
           const signalKey = `${marketPlatform}:4h:${candidate.symbol}:${candidate.direction}`;
-          if (candidate.direction === "WAIT" || candidate.score < 70 || activeSymbols.has(candidate.symbol) || autoExecutedSignalsRef.current.has(signalKey)) continue;
+          if (candidate.is_executable !== true || activeSymbols.has(candidate.symbol) || autoExecutedSignalsRef.current.has(signalKey)) continue;
           try {
             const trade = openSimulatedTrade(candidate, "4h", walletSnapshot.balance, Date.now() + additions.length);
             additions.push(trade);
