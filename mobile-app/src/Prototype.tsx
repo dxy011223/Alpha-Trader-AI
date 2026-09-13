@@ -27,6 +27,7 @@ import {
   cancelExecution,
   completePosition,
   createExecution,
+  API_ACCESS_INVALIDATED_EVENT,
   getApiAccessToken,
   loadAnalysis,
   loadActiveExecutions,
@@ -39,16 +40,19 @@ import {
   loadOpportunities,
   loadPlatformAccount,
   loadPlatformCredentialStatus,
+  loadPasswordAuthStatus,
   loadPositionMonitors,
   loadReviews,
   loadSimulationWallet,
   loadWallet,
   loadWalletSettings,
+  loginWithPassword,
   saveCapitalSettings,
   savePlatformCredentials,
   saveSimulationWallet,
   saveWalletSettings,
   setApiAccessToken,
+  setupPassword,
   type AnalysisResponse,
   type AssetSymbol,
   type Candle,
@@ -553,7 +557,6 @@ function MarketScreen({
   const [dataState, setDataState] = useState<DataState>("loading");
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [tokenDraft, setTokenDraft] = useState(apiAccessToken);
   const [tokenSaveState, setTokenSaveState] = useState<"idle" | "saving" | "error">("idle");
   const symbol = freeSymbol;
   const selected = assets[symbol] ?? {
@@ -563,9 +566,6 @@ function MarketScreen({
     regime: "等待行情",
   };
 
-  useEffect(() => {
-    setTokenDraft(apiAccessToken);
-  }, [apiAccessToken]);
   const hasFallbackQuote = Boolean(assets[symbol]);
   const fallbackChange = Number(selected.delta.replace("%", ""));
   const price = snapshot?.price ?? Number(selected.price.replace(/,/g, ""));
@@ -653,34 +653,27 @@ function MarketScreen({
         title="设置"
         description="管理行情来源与自动模拟交易；模拟数据同步到数据库，不读取真实钱包交易历史"
       >
-        <div className="settings-section-title"><strong>后端访问</strong><span>{apiAccessToken ? "已授权" : "未授权"}</span></div>
+        <div className="settings-section-title"><strong>登录状态</strong><span>{apiAccessToken ? "已登录" : "未登录"}</span></div>
         <div className="api-token-settings-card">
-          <KeyboardInput
-            aria-label="个人后端访问令牌"
-            type="password"
-            value={tokenDraft}
-            placeholder="输入 OWNER_API_TOKEN"
-            onChange={(event) => setTokenDraft(event.target.value)}
-          />
           <button
             type="button"
             disabled={tokenSaveState === "saving"}
             onClick={() => void (async () => {
-              const nextToken = tokenDraft.trim();
               setTokenSaveState("saving");
               try {
-                await setApiAccessToken(nextToken);
-                onApiAccessTokenChange(nextToken);
+                await setApiAccessToken("");
+                onApiAccessTokenChange("");
+                setSettingsOpen(false);
                 setTokenSaveState("idle");
               } catch {
                 setTokenSaveState("error");
               }
             })()}
           >
-            {tokenSaveState === "saving" ? "保存中…" : tokenDraft.trim() ? "安全保存令牌" : "清除令牌"}
+            {tokenSaveState === "saving" ? "正在退出…" : "退出当前设备"}
           </button>
           <small className={tokenSaveState === "error" ? "error" : ""}>
-            {tokenSaveState === "error" ? "安全存储操作失败，请重试" : "Android 使用系统 Keystore 加密持久化；网页端仅保存当前会话。"}
+            {tokenSaveState === "error" ? "退出失败，请重试" : "Android 使用 Keystore 保存安全会话，后续启动会自动校验并续签。"}
           </small>
         </div>
         <div className="settings-section-title"><strong>模拟交易</strong><span>{simulationSyncState === "synced" ? "数据库已同步" : simulationSyncState === "offline" ? "离线缓存" : simulationSyncState === "saving" ? "正在保存" : "正在读取"}</span></div>
@@ -888,6 +881,8 @@ function DecisionScreen({
   onStartExecution,
   onCancelExecution,
   onContinueScanning,
+  apiAccessToken,
+  apiAccessTokenReady,
 }: {
   openDetails: (analysis: AnalysisResponse | null, symbol: AssetSymbol, timeframe: MarketInterval) => void;
   lockedDecision: LockedDecision | null;
@@ -899,6 +894,8 @@ function DecisionScreen({
   onStartExecution: (analysis: AnalysisResponse, timeframe: MarketInterval, totalAmount: number) => Promise<LockedDecision>;
   onCancelExecution: (decision: LockedDecision) => Promise<void>;
   onContinueScanning: () => void;
+  apiAccessToken: string;
+  apiAccessTokenReady: boolean;
 }) {
   const [symbol, setSymbol] = useState<AssetSymbol | null>(lockedDecision?.analysis.symbol ?? null);
   const [timeframe, setTimeframe] = useState<MarketInterval>(lockedDecision?.timeframe ?? "4h");
@@ -928,6 +925,14 @@ function DecisionScreen({
       setCapitalState("ready");
       return;
     }
+    if (!apiAccessTokenReady) {
+      setCapitalState("loading");
+      return;
+    }
+    if (!apiAccessToken) {
+      setCapitalState("error");
+      return;
+    }
     const controller = new AbortController();
     loadCapitalSettings(controller.signal)
       .then((settings) => {
@@ -939,16 +944,32 @@ function DecisionScreen({
         if (!controller.signal.aborted) setCapitalState("error");
       });
     return () => controller.abort();
-  }, [simulationBalance, simulationEnabled]);
+  }, [apiAccessToken, apiAccessTokenReady, simulationBalance, simulationEnabled]);
 
   useEffect(() => {
+    if (!apiAccessTokenReady) {
+      setRemoteState("loading");
+      setScanError(null);
+      return;
+    }
+    if (!apiAccessToken) {
+      setCandidates([]);
+      setScanStats({ scanned: 0, eligible: 0 });
+      setScanError("登录状态缺失，请重新登录");
+      setRemoteState("offline");
+      return;
+    }
     const controller = new AbortController();
+    let refreshInFlight = false;
     setRemoteState("loading");
     setScanError(null);
 
-    const refresh = () => {
-      loadOpportunities(timeframe, controller.signal, platform)
-        .then((scan) => {
+    const refresh = async () => {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      try {
+        const scan = await loadOpportunities(timeframe, controller.signal, platform);
+        if (!controller.signal.aborted) {
           const results = scan.opportunities;
           setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets });
           if (results.length === 0) {
@@ -967,24 +988,26 @@ function DecisionScreen({
             return selectionMode === "auto" || currentSymbol == null ? results[0].symbol : currentSymbol;
           });
           setRemoteState("ready");
-        })
-        .catch((error: unknown) => {
-          if (!controller.signal.aborted) {
-            setCandidates([]);
-            setScanStats({ scanned: 0, eligible: 0 });
-            setScanError(error instanceof Error ? error.message : "机会扫描暂时不可用");
-            setRemoteState("offline");
-          }
-        });
+        }
+      } catch (error: unknown) {
+        if (!controller.signal.aborted) {
+          setCandidates([]);
+          setScanStats({ scanned: 0, eligible: 0 });
+          setScanError(error instanceof Error ? error.message : "机会扫描暂时不可用");
+          setRemoteState("offline");
+        }
+      } finally {
+        refreshInFlight = false;
+      }
     };
-    refresh();
-    const intervalId = window.setInterval(refresh, 30_000);
+    void refresh();
+    const intervalId = window.setInterval(() => void refresh(), 30_000);
 
     return () => {
       window.clearInterval(intervalId);
       controller.abort();
     };
-  }, [activeDecisionKey, lockedDecision, platform, scanRetry, selectionMode, timeframe, totalAmount]);
+  }, [activeDecisionKey, apiAccessToken, apiAccessTokenReady, lockedDecision, platform, scanRetry, selectionMode, timeframe, totalAmount]);
 
   const analysis = activeDecision?.analysis ?? candidates.find((item) => item.symbol === activeSymbol) ?? null;
   const visibleCandidates = candidates.slice(0, 4);
@@ -1936,6 +1959,12 @@ function TradingPrototype() {
   const [completedTrades, setCompletedTrades] = useState<CompletedTradeRecord[]>([]);
   const [reviews, setReviews] = useState<ReviewRecord[]>([]);
   const [apiAccessToken, setApiAccessTokenState] = useState(getApiAccessToken);
+  const [apiAccessTokenReady, setApiAccessTokenReady] = useState(false);
+  const [passwordAuthMode, setPasswordAuthMode] = useState<"login" | "setup">("login");
+  const [usernameDraft, setUsernameDraft] = useState("");
+  const [passwordDraft, setPasswordDraft] = useState("");
+  const [passwordAuthState, setPasswordAuthState] = useState<"idle" | "saving" | "error">("idle");
+  const [passwordAuthError, setPasswordAuthError] = useState("");
   const [marketPlatform, setMarketPlatform] = useState<MarketPlatform>(() => {
     const stored = window.localStorage.getItem("alpha-market-platform");
     return stored === "binance" || stored === "okx" ? stored : "hyperliquid";
@@ -1979,9 +2008,30 @@ function TradingPrototype() {
   }>({ analysis: null, symbol: "BTC", timeframe: "1h" });
 
   useEffect(() => {
+    const handleInvalidAccess = () => {
+      setApiAccessTokenState("");
+      setApiAccessTokenReady(true);
+    };
+    window.addEventListener(API_ACCESS_INVALIDATED_EVENT, handleInvalidAccess);
+    return () => window.removeEventListener(API_ACCESS_INVALIDATED_EVENT, handleInvalidAccess);
+  }, []);
+
+  useEffect(() => {
+    if (!apiAccessTokenReady || apiAccessToken) return;
+    loadPasswordAuthStatus()
+      .then(({ setup_required }) => {
+        if (setup_required) setPasswordAuthMode("setup");
+      })
+      .catch(() => undefined);
+  }, [apiAccessToken, apiAccessTokenReady]);
+
+  useEffect(() => {
     let active = true;
     loadApiAccessToken().then((token) => {
-      if (active) setApiAccessTokenState(token);
+      if (active) {
+        setApiAccessTokenState(token);
+        setApiAccessTokenReady(true);
+      }
     });
     return () => { active = false; };
   }, []);
@@ -2279,6 +2329,93 @@ function TradingPrototype() {
     });
   };
 
+  if (!apiAccessTokenReady || !apiAccessToken) {
+    const authBusy = passwordAuthState === "saving";
+    const canSubmit = usernameDraft.trim().length >= 3
+      && passwordDraft.length >= 10;
+    return (
+      <div className="alpha-app">
+        <MobileScroll className="alpha-scroll">
+          <main className="email-login-screen">
+            <section className="email-login-card" aria-live="polite">
+              <div className="email-login-brand"><span>Alpha</span> Trader AI</div>
+              <LockClosedIcon />
+              <h1>{apiAccessTokenReady ? "登录 Alpha Trader AI" : "正在检查登录状态"}</h1>
+              <p>
+                {apiAccessTokenReady
+                  ? passwordAuthMode === "login"
+                    ? "输入本地账号密码登录，成功后此设备将保持安全会话。"
+                    : "首次使用时创建账号密码，创建成功后其他人无法再次注册。"
+                  : "正在安全读取本机设备会话…"}
+              </p>
+              {apiAccessTokenReady ? (
+                <form className="email-login-fallback" onSubmit={(event) => void (async () => {
+                  event.preventDefault();
+                  if (!canSubmit || authBusy) return;
+                  setPasswordAuthState("saving");
+                  setPasswordAuthError("");
+                  try {
+                    const token = passwordAuthMode === "setup"
+                      ? await setupPassword(usernameDraft, passwordDraft)
+                      : await loginWithPassword(usernameDraft, passwordDraft);
+                    setPasswordDraft("");
+                    setApiAccessTokenState(token);
+                    setApiAccessTokenReady(true);
+                    setPasswordAuthState("idle");
+                  } catch (error) {
+                    setPasswordAuthError(error instanceof Error ? error.message : "登录失败，请重试");
+                    setPasswordAuthState("error");
+                  }
+                })()}>
+                  <label>
+                    <span>账号</span>
+                    <KeyboardInput
+                      aria-label="登录账号"
+                      autoComplete="username"
+                      value={usernameDraft}
+                      placeholder="3–64 位字母或数字"
+                      onChange={(event) => setUsernameDraft(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    <span>密码</span>
+                    <KeyboardInput
+                      aria-label="登录密码"
+                      type="password"
+                      autoComplete={passwordAuthMode === "setup" ? "new-password" : "current-password"}
+                      value={passwordDraft}
+                      placeholder="至少 10 位"
+                      onChange={(event) => setPasswordDraft(event.target.value)}
+                    />
+                  </label>
+                  <button type="submit" disabled={!canSubmit || authBusy}>
+                    {authBusy ? "正在验证…" : passwordAuthMode === "setup" ? "设置并登录" : "登录"}
+                  </button>
+                  {passwordAuthState === "error" ? <small role="alert">{passwordAuthError}</small> : null}
+                </form>
+              ) : <div className="email-login-loading" />}
+              {apiAccessTokenReady ? (
+                <button
+                  type="button"
+                  className="email-login-mode"
+                  disabled={authBusy}
+                  onClick={() => {
+                    setPasswordAuthMode((current) => current === "login" ? "setup" : "login");
+                    setPasswordAuthState("idle");
+                    setPasswordAuthError("");
+                  }}
+                >
+                  {passwordAuthMode === "login" ? "首次使用？创建账号" : "返回账号密码登录"}
+                </button>
+              ) : null}
+              <em>管理员令牌不会发送到 App；Android 仅保存 Keystore 设备会话，网页使用 HttpOnly Cookie。</em>
+            </section>
+          </main>
+        </MobileScroll>
+      </div>
+    );
+  }
+
   return (
     <div className="alpha-app">
       <MobileScroll className="alpha-scroll">
@@ -2338,6 +2475,8 @@ function TradingPrototype() {
               onStartExecution={startExecution}
               onCancelExecution={cancelTrackedExecution}
               onContinueScanning={() => setLockedDecision(null)}
+              apiAccessToken={apiAccessToken}
+              apiAccessTokenReady={apiAccessTokenReady}
               openDetails={(analysis, symbol, timeframe) => {
                 setSheetContext({ analysis, symbol, timeframe });
                 setDetailsOpen(true);

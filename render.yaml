@@ -21,12 +21,8 @@ services:
           property: connectionString
       - key: OWNER_API_TOKEN
         sync: false
-      - key: AI_API_KEY
-        sync: false
       - key: CREDENTIAL_ENCRYPTION_KEY
         generateValue: true
-      - key: AI_MODEL
-        value: gpt-5-mini
 
   - type: keyvalue
     name: alpha-trader-ai-redis

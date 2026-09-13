@@ -4,7 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 
-from app.ai_analysis import AIDecisionUnavailable, build_ai_decision_context, enrich_analyses_with_openai, enrich_review_with_openai
+from app.ai_analysis import enrich_review_with_openai
 from app.capital_settings import read_capital_settings, write_capital_settings
 from app.exchange_accounts import get_exchange_account, get_exchange_fills
 from app.news_archive import get_news_archive
@@ -18,10 +18,9 @@ from app.simulation_wallet import read_simulation_wallet, write_simulation_walle
 from app.strategy_versions import (
     build_strategy_optimization_context,
     list_strategy_versions,
-    read_current_strategy,
     record_daily_performance,
 )
-from app.services import MarketPlatform, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time
+from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time
 from app.trade_records import attach_wallet_to_active_position, cancel_execution, create_execution, finalize_position, generate_daily_review, list_completed_trades, list_review_records, read_active_execution, read_active_executions, read_open_position, update_review_content
 from app.wallet_settings import read_wallet_settings, write_wallet_settings
 
@@ -161,10 +160,7 @@ def active_executions(
 async def position_monitors(
     platform: MarketPlatform | None = Query(default=None),
 ) -> list[PositionMonitorResponse]:
-    try:
-        return await monitor_active_positions(platform)
-    except AIDecisionUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return await monitor_active_positions(platform)
 
 
 @router.post("/executions", response_model=ExecutionStateResponse, status_code=201, summary="开始跟踪决策", dependencies=[Depends(require_owner)])
@@ -178,29 +174,21 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
         if market is None:
             raise ValueError("当前平台不存在该交易品种")
         capital = read_capital_settings()
-        strategy_version, strategy_parameters = read_current_strategy()
         indicators = calculate_technical_indicators(candles)
         if indicators.atr_percent is not None:
             market = market.model_copy(update={"volatility": indicators.atr_percent})
-        verified_analysis = build_ai_decision_context(
+        verified_analysis = analyze_market(
             AnalysisRequest(
                 symbol=payload.analysis.symbol,
                 timeframe=payload.timeframe,
                 platform=platform,
             ),
             market,
-            indicators,
-            strategy_version,
-            strategy_parameters,
-        )
-        verified_analysis = (await enrich_analyses_with_openai(
-            [verified_analysis],
-            {market.symbol: market},
-            payload.timeframe,
             capital.total_amount,
-        ))[0]
+            indicators,
+        )
         if verified_analysis.direction == "WAIT":
-            raise ValueError("AI 实时复核后该机会处于观察区，不能开始执行")
+            raise ValueError("实时规则复核后该机会处于观察区，不能开始执行")
         verified_payload = payload.model_copy(update={
             "analysis": verified_analysis,
             "total_amount": capital.total_amount,
@@ -214,8 +202,6 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
                 f"{platform}:{status.api_key_hint or '已配置'}" if status.configured else None
             )
         return create_execution(verified_payload, account_reference)
-    except AIDecisionUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
@@ -312,33 +298,24 @@ def strategy_versions(
     return list_strategy_versions(limit)
 
 
-@router.post("/ai/analyze", response_model=AnalysisResponse, summary="生成 AI 交易计划", dependencies=[Depends(require_owner)])
+@router.post("/ai/analyze", response_model=AnalysisResponse, summary="生成规则交易计划", dependencies=[Depends(require_owner)])
 async def ai_analyze(payload: AnalysisRequest) -> AnalysisResponse:
-    try:
-        market, candles = await asyncio.gather(
-            get_live_market(payload.symbol, payload.platform),
-            get_candles(payload.symbol, payload.timeframe, 220, payload.platform),
-        )
-        if market is None:
-            raise HTTPException(status_code=404, detail="暂不支持该交易品种")
-        total_amount = read_capital_settings().total_amount
-        strategy_version, strategy_parameters = read_current_strategy()
-        indicators = calculate_technical_indicators(candles)
-        if indicators.atr_percent is not None:
-            market = market.model_copy(update={"volatility": indicators.atr_percent})
-        base = build_ai_decision_context(
-            payload,
-            market,
-            indicators,
-            strategy_version,
-            strategy_parameters,
-        )
-        analyses = await enrich_analyses_with_openai(
-            [base], {market.symbol: market}, payload.timeframe, total_amount
-        )
-        return analyses[0]
-    except AIDecisionUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    market, candles = await asyncio.gather(
+        get_live_market(payload.symbol, payload.platform),
+        get_candles(payload.symbol, payload.timeframe, 220, payload.platform),
+    )
+    if market is None:
+        raise HTTPException(status_code=404, detail="暂不支持该交易品种")
+    total_amount = read_capital_settings().total_amount
+    indicators = calculate_technical_indicators(candles)
+    if indicators.atr_percent is not None:
+        market = market.model_copy(update={"volatility": indicators.atr_percent})
+    return analyze_market(
+        payload,
+        market,
+        total_amount,
+        indicators,
+    )
 
 
 @router.get("/ai/opportunities", response_model=OpportunityScanResponse, summary="扫描全市场交易机会", dependencies=[Depends(require_owner)])
@@ -349,7 +326,7 @@ async def ai_opportunities(
 ) -> OpportunityScanResponse:
     try:
         return await get_cached_or_compute_market_scan(timeframe, limit, platform)
-    except (AIDecisionUnavailable, MarketScanBusy) as exc:
+    except MarketScanBusy as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 

@@ -19,6 +19,29 @@
 .alpha-scroll { background: var(--bg); }
 .alpha-content { min-height: 100%; padding: 64px 16px calc(var(--mobile-safe-area-height) + 100px); }
 
+.email-login-screen { display: grid; min-height: 100%; place-items: center; padding: max(48px, env(safe-area-inset-top)) 24px max(32px, env(safe-area-inset-bottom)); }
+.email-login-card { display: grid; width: min(100%, 380px); justify-items: center; padding: 28px 22px; border: 1px solid rgba(247, 190, 67, 0.24); border-radius: 18px; background: linear-gradient(145deg, rgba(247, 190, 67, 0.08), var(--surface) 44%); box-shadow: 0 22px 70px rgba(0, 0, 0, 0.28); text-align: center; }
+.email-login-brand { margin-bottom: 30px; color: var(--text); font-size: 19px; font-weight: 800; letter-spacing: -0.4px; }
+.email-login-brand span { color: var(--amber); }
+.email-login-card > svg { width: 34px; height: 34px; padding: 9px; border-radius: 14px; background: rgba(247, 190, 67, 0.12); color: var(--amber); box-sizing: content-box; }
+.email-login-card h1 { margin-top: 18px; font-size: 20px; }
+.email-login-card p { margin: 10px 0 22px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.email-login-card button { width: 100%; min-height: 46px; border: 0; border-radius: 11px; background: var(--amber); color: #17130a; font-size: 13px; font-weight: 850; }
+.email-login-card button:disabled { opacity: 0.58; }
+.email-login-card small { margin-top: 12px; color: var(--coral); font-size: 10px; }
+.email-login-card em { margin-top: 18px; color: #66737d; font-size: 9px; font-style: normal; line-height: 1.5; }
+.email-login-divider { display: flex; width: 100%; align-items: center; gap: 10px; margin: 20px 0 12px; color: #65727b; font-size: 9px; }
+.email-login-divider::before, .email-login-divider::after { height: 1px; flex: 1; background: var(--line); content: ""; }
+.email-login-fallback { display: grid; width: 100%; grid-template-columns: 1fr; gap: 8px; }
+.email-login-fallback label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; text-align: left; }
+.email-login-fallback input { width: 100%; min-height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; outline: 0; background: rgba(255, 255, 255, 0.035); color: var(--text); font-size: 12px; }
+.email-login-fallback input:focus { border-color: rgba(247, 190, 67, 0.52); }
+.email-login-fallback button { min-height: 42px; border: 1px solid rgba(247, 190, 67, 0.34); background: rgba(247, 190, 67, 0.08); color: var(--amber); }
+.email-login-fallback small { margin-top: 0; }
+.email-login-card .email-login-mode { min-height: 34px; margin-top: 12px; background: transparent; color: var(--amber); font-size: 11px; }
+.email-login-loading { width: 28px; height: 28px; border: 2px solid rgba(247, 190, 67, 0.2); border-top-color: var(--amber); border-radius: 50%; animation: email-login-spin 800ms linear infinite; }
+@keyframes email-login-spin { to { transform: rotate(360deg); } }
+
 .brand-header {
   display: grid;
   grid-template-columns: auto 1fr auto;

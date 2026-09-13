@@ -5,8 +5,12 @@ import { cancelExecution, completePosition, createExecution, loadActiveExecution
 const apiBase = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
 
 afterEach(async () => {
-  await setApiAccessToken("");
   vi.useRealTimers();
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ authorized: false }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  })));
+  await setApiAccessToken("");
   vi.unstubAllGlobals();
 });
 
@@ -20,22 +24,34 @@ describe("Alpha Trader API 适配器", () => {
     })).toThrow(/安全页面/);
   });
 
-  it("把会话访问令牌附加到 API 请求", async () => {
+  it("用所有者令牌换取网页安全会话且后续请求不再携带主令牌", async () => {
     const values = new Map<string, string>();
     vi.stubGlobal("sessionStorage", {
       getItem: (key: string) => values.get(key) ?? null,
       setItem: (key: string, value: string) => values.set(key, value),
       removeItem: (key: string) => values.delete(key),
     });
-    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ authorized: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
 
     await setApiAccessToken("test-owner-token");
     await loadCapitalSettings();
 
-    expect(fetchMock).toHaveBeenCalledWith(`${apiBase}/settings/capital`, expect.objectContaining({
+    expect(fetchMock).toHaveBeenNthCalledWith(1, `${apiBase}/auth/device`, expect.objectContaining({
+      credentials: "same-origin",
       headers: expect.objectContaining({ Authorization: "Bearer test-owner-token" }),
+      body: JSON.stringify({ transport: "cookie" }),
     }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, `${apiBase}/settings/capital`, expect.objectContaining({
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    }));
+    expect(values.has("alpha-owner-api-token")).toBe(false);
   });
 
   it("使用同源地址读取市场快照", async () => {
@@ -124,7 +140,7 @@ describe("Alpha Trader API 适配器", () => {
 
     await expect(loadOpportunities("1h")).resolves.toEqual(scan);
     expect(fetchMock).toHaveBeenCalledWith(
-      `${apiBase}/ai/opportunities?timeframe=1h&limit=8&platform=hyperliquid`,
+      `${apiBase}/ai/opportunities?timeframe=1h&limit=4&platform=hyperliquid`,
       expect.any(Object),
     );
   });
@@ -218,6 +234,21 @@ describe("Alpha Trader API 适配器", () => {
 
     const result = expect(loadMarket("BTC")).rejects.toThrow("后端连接超时");
     await vi.advanceTimersByTimeAsync(12_000);
+    await result;
+  });
+
+  it("AI 决策使用独立超时且不会被行情时限提前中断", async () => {
+    vi.useFakeTimers();
+    let requestSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn((_url, init: RequestInit) => new Promise((_resolve, reject) => {
+      requestSignal = init.signal ?? undefined;
+      requestSignal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    })));
+
+    const result = expect(loadOpportunities("4h")).rejects.toThrow("后端连接超时");
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(requestSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(33_000);
     await result;
   });
 });

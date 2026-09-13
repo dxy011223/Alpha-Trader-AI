@@ -5,10 +5,7 @@
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
-    "required": ["OWNER_API_TOKEN"]
-  },
-  "ai": {
-    "binding": "AI"
+    "required": ["OWNER_API_TOKEN", "DEVICE_SESSION_SECRET"]
   },
   "assets": {
     "directory": "./mobile-app/dist/client",

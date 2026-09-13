@@ -4,37 +4,34 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.ai_analysis import AIDecisionUnavailable, generate_position_decisions_with_openai
 from app.database import SessionLocal
 from app.models import PositionMonitorRecord
 from app.schemas import ExecutionStateResponse, MarketSnapshot, PositionMonitorResponse
-from app.services import calculate_technical_indicators, get_candles, get_live_market, get_news
+from app.services import get_live_market
 from app.trade_records import read_active_executions
 
 
-def _calculate_unrealized(
-    state: ExecutionStateResponse,
-    market: MarketSnapshot,
-) -> float:
+def _evaluate(state: ExecutionStateResponse, market: MarketSnapshot) -> tuple[str, float, str]:
     position = state.position
     direction_multiplier = 1 if position.direction == "LONG" else -1
-    return (market.price - position.planned_entry) * position.planned_size * direction_multiplier
-
-
-def _validate_ai_action(
-    state: ExecutionStateResponse,
-    market: MarketSnapshot,
-    action: str,
-) -> None:
-    """硬风险边界只做拒绝校验，不替 AI 生成或覆盖动作。"""
-    position = state.position
+    unrealized = (market.price - position.planned_entry) * position.planned_size * direction_multiplier
+    first_target = position.take_profit[0]
     final_target = position.take_profit[-1]
     if position.direction == "LONG":
-        boundary_reached = market.price <= position.stop_loss or market.price >= final_target
+        if market.price <= position.stop_loss or market.price >= final_target:
+            return "EXIT", unrealized, "价格已触及结构止损或最终止盈边界"
+        if market.price >= first_target:
+            return "REDUCE", unrealized, "价格已触及第一止盈目标，建议分批减仓"
+        if market.price >= position.planned_entry * 1.02:
+            return "ADJUST_SL", unrealized, "浮盈达到约 2%，建议把止损上移至成本附近"
     else:
-        boundary_reached = market.price >= position.stop_loss or market.price <= final_target
-    if boundary_reached and action != "EXIT":
-        raise AIDecisionUnavailable("AI 持仓决策未通过止盈止损边界校验，请重新生成")
+        if market.price >= position.stop_loss or market.price <= final_target:
+            return "EXIT", unrealized, "价格已触及结构止损或最终止盈边界"
+        if market.price <= first_target:
+            return "REDUCE", unrealized, "价格已触及第一止盈目标，建议分批减仓"
+        if market.price <= position.planned_entry * 0.98:
+            return "ADJUST_SL", unrealized, "浮盈达到约 2%，建议把止损下移至成本附近"
+    return "HOLD", unrealized, "价格仍在计划风险边界内，继续观察"
 
 
 def _save_monitor(
@@ -78,54 +75,22 @@ def _save_monitor(
 
 async def monitor_active_positions(platform: str | None = None) -> list[PositionMonitorResponse]:
     states = await asyncio.to_thread(read_active_executions, platform)
-    if not states:
-        return []
-    news_items = await asyncio.to_thread(get_news)
-    market_results = await asyncio.gather(*(
-        asyncio.gather(
-            get_live_market(state.position.symbol, state.decision.analysis.platform),
-            get_candles(
-                state.position.symbol,
-                state.decision.timeframe,
-                220,
-                state.decision.analysis.platform,
-            ),
-        )
+    markets = await asyncio.gather(*(
+        get_live_market(state.position.symbol, state.decision.analysis.platform)
         for state in states
     ))
-    prepared = []
-    for state, (market, candles) in zip(states, market_results, strict=True):
+    results = []
+    for state, market in zip(states, markets, strict=True):
         if market is None:
             continue
-        indicators = calculate_technical_indicators(candles)
-        if indicators.atr_percent is not None:
-            market = market.model_copy(update={"volatility": indicators.atr_percent})
-        prepared.append((state, market, indicators))
-
-    contexts = [{
-        "symbol": state.position.symbol,
-        "platform": state.decision.analysis.platform,
-        "timeframe": state.decision.timeframe,
-        "market": market.model_dump(),
-        "indicators": indicators.model_dump(),
-        "opening_analysis": state.decision.analysis.model_dump(),
-        "position": state.position.model_dump(),
-        "recent_news": [item.model_dump() for item in news_items[:12]],
-    } for state, market, indicators in prepared]
-    decisions = await generate_position_decisions_with_openai(contexts)
-
-    results = []
-    for state, market, _indicators in prepared:
-        decision = decisions[state.position.symbol.upper()]
-        _validate_ai_action(state, market, decision.action)
-        unrealized = _calculate_unrealized(state, market)
+        action, unrealized, reason = _evaluate(state, market)
         results.append(await asyncio.to_thread(
             _save_monitor,
             state,
             market,
-            decision.action,
+            action,
             unrealized,
-            decision.reason,
-            decision.current_score,
+            reason,
+            state.decision.analysis.score,
         ))
     return results

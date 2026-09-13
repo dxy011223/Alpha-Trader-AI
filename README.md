@@ -39,7 +39,7 @@ uvicorn app.main:app --reload
 
 API 文档：`http://localhost:8000/docs`。未配置 PostgreSQL 时，本地开发默认使用 SQLite。
 
-除公共行情和新闻外，API 都要求 `Authorization: Bearer <OWNER_API_TOKEN>`。生产环境的所有者令牌至少 32 位；App 在市场页设置中保存到当前会话，不写入构建文件。生产启动会先执行 Alembic 迁移，开发和测试仍可直接使用 SQLite。
+除公共行情和新闻外，API 都要求所有者授权。生产环境的 `OWNER_API_TOKEN` 至少 32 位，只在首次设备授权时提交给 Cloudflare Worker：网页换取一年期 HttpOnly、Secure、SameSite Cookie；Android 换取 HMAC 签名设备令牌并保存到系统 Keystore。后续请求不再从客户端发送主令牌，Worker 验证设备会话后使用服务端主令牌访问 Python API。旧版 Android 保存的主令牌会在升级后自动换取设备会话；本地直连 FastAPI 的开发环境仍使用会话级 Bearer 令牌。生产启动会先执行 Alembic 迁移，开发和测试仍可直接使用 SQLite。
 
 ## Docker Compose
 
@@ -51,7 +51,7 @@ docker compose up --build
 
 ## Render 后端部署
 
-仓库根目录的 `render.yaml` 会创建免费预览规格的 FastAPI Web Service、PostgreSQL 和 Redis-compatible Key Value。首次创建 Blueprint 时必须在 Render 控制台填写 `OWNER_API_TOKEN` 与 `AI_API_KEY`；其余连接地址和加密密钥由平台注入或生成。部署完成后，把 Web Service 的 HTTPS 地址配置为 Cloudflare Worker 的 `BACKEND_API_URL`。
+仓库根目录的 `render.yaml` 会创建免费预览规格的 FastAPI Web Service、PostgreSQL 和 Redis-compatible Key Value。首次创建 Blueprint 时必须在 Render 控制台填写 `OWNER_API_TOKEN`；仅需启用 AI 复盘和策略优化时才填写 `AI_API_KEY`。Render 与 Cloudflare Worker 的 `OWNER_API_TOKEN` 必须保持同值，轮换时需同步更新两端，否则 Worker 会将后端鉴权失败标记为服务端配置错误。其余连接地址和加密密钥由平台注入或生成。部署完成后，把 Web Service 的 HTTPS 地址配置为 Cloudflare Worker 的 `BACKEND_API_URL`。
 
 免费 Web Service 在空闲后会休眠，免费 PostgreSQL 会在 30 天后到期，因此仅适合功能验收；正式长期运行应升级对应实例或迁移到长期托管数据库。
 
@@ -78,7 +78,7 @@ docker compose up --build
 
 行情通过三家平台的公共接口获取。Hyperliquid 使用公开钱包地址；Binance/OKX 使用用户自行创建的只读 API 凭证，后端仅调用账户、持仓和成交历史 GET 接口，不包含下单或撤单调用。完成交易时必须同时找到决策开始后的真实开仓与平仓成交；退出价按成交量加权，净盈亏按交易所已实现盈亏减去 USDT/USDC 手续费计算。其他手续费币种在尚未换算前会拒绝生成错误复盘。AI 不能修改任何成交事实；AI 未配置、拒绝或调用失败时，复盘仅保留事实并标记 `analysis_engine: facts`，不会使用规则分析或规则调参代替。
 
-后端会二次验证 AI 调参方案：五维权重必须合计 100，单项权重和 `min_trade_score` 必须在安全范围内，单次变化不得超过限制。验证通过后才保存新的 `strategy_versions` 记录；不合格方案会被标记为 `rejected`，不会由规则引擎修正或替代。该流程只影响后续研究评分与执行资格复核，不会自动下单、撤单或修改已核验成交。
+后端会二次验证 AI 调参方案：五维权重必须合计 100，单项权重和 `min_trade_score` 必须在安全范围内，单次变化不得超过限制。验证通过后才保存新的 `strategy_versions` 记录；不合格方案会被标记为 `rejected`。当前已恢复最初规则决策版本，实际决策固定使用 `v1` 参数，历史或新生成的 AI 调参记录不会影响评分与执行资格复核。
 
 Binance/OKX 凭证使用 `CREDENTIAL_ENCRYPTION_KEY` 在数据库中加密保存，API 只返回脱敏 Key。部署前可运行以下命令生成主密钥，并只写入服务器 `.env`：
 
@@ -88,13 +88,13 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 交易所 Key 应关闭交易与提币权限，并配置 IP 白名单；生产环境必须通过 HTTPS 使用。
 
-新闻来自 CoinDesk、CNBC Markets 与 Federal Reserve 的公开 RSS，并按真实发布时间归档；新闻源不可用时不会生成假新闻。配置 `AI_API_KEY` 后，交易决策、持仓管理、复盘分析和策略优化均通过 OpenAI Responses API 结构化输出生成，后端只校验数据边界、数学一致性和禁止自动交易约束；AI 未配置或调用失败时不会回退为规则决策。所有密钥均通过环境变量配置，禁止硬编码。
+新闻来自 CoinDesk、CNBC Markets 与 Federal Reserve 的公开 RSS，并按真实发布时间归档；新闻源不可用时不会生成假新闻。交易方向、五维评分、止盈止损、仓位和持仓管理建议由本地规则引擎计算，不依赖外部 AI 服务。配置 `AI_API_KEY` 后，仅复盘分析和策略优化使用 OpenAI Responses API；AI 未配置或调用失败时保留已核验交易事实。所有密钥均通过环境变量配置，禁止硬编码。
 
 Docker Compose 会同时启动 PostgreSQL、Redis、API、Celery Worker 与 Celery Beat。API 仅暴露在容器网络，由前端反向代理访问。Beat 每 5 分钟扫描三个平台并把结果写入 PostgreSQL/Redis，每分钟刷新活动持仓建议，每天北京时间 00:10 为三个平台生成前一日真实交易复盘；周期可通过 `.env` 中的 `MARKET_SCAN_INTERVAL_SECONDS`、`DAILY_REVIEW_HOUR` 和 `DAILY_REVIEW_MINUTE` 调整。
 
 ## Cloudflare Sites 与 APK
 
-Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定，发布时会执行 `mobile-app/drizzle/` 中的 D1 迁移。`OWNER_API_TOKEN` 必须作为运行时 secret 配置；如需完整的钱包、成交与复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。没有完整后端时，Worker 只提供 Hyperliquid 公共行情、D1 新闻归档、资金设置和模拟钱包，并对其余功能明确返回不可用。
+Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定，Wrangler 发布时会执行 `mobile-app/migrations/` 中的 D1 迁移。`OWNER_API_TOKEN` 必须作为运行时 secret 配置；如需完整的钱包、成交与复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。没有完整后端时，Worker 仍提供 Hyperliquid 公共行情、规则决策、D1 新闻归档、资金设置和模拟钱包，并对钱包成交与复盘等功能明确返回不可用。
 
 可在 `mobile-app` 目录运行 `node scripts/ensure-owner-token.mjs` 生成或保留本机 `.env.local` 中的所有者令牌；脚本不会打印令牌，且该文件不会提交到 Git。
 

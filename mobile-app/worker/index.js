@@ -1,5 +1,4 @@
 const HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info";
-const AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const STRATEGY_PARAMETERS = {
   min_trade_score: 70,
   trend_weight: 30,
@@ -7,59 +6,6 @@ const STRATEGY_PARAMETERS = {
   capital_weight: 20,
   macro_weight: 15,
   news_weight: 10,
-};
-const AI_DECISION_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["decisions"],
-  properties: {
-    decisions: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "symbol", "direction", "confidence", "score", "trend", "structure", "capital", "macro", "news",
-          "entry_range", "stop_loss", "take_profit", "leverage", "risk", "position_sizing", "reasons",
-        ],
-        properties: {
-          symbol: { type: "string" },
-          direction: { type: "string", enum: ["LONG", "SHORT", "WAIT"] },
-          confidence: { type: "integer", minimum: 0, maximum: 100 },
-          score: { type: "integer", minimum: 0, maximum: 100 },
-          trend: { type: "integer", minimum: 0, maximum: 30 },
-          structure: { type: "integer", minimum: 0, maximum: 25 },
-          capital: { type: "integer", minimum: 0, maximum: 20 },
-          macro: { type: "integer", minimum: 0, maximum: 15 },
-          news: { type: "integer", minimum: 0, maximum: 10 },
-          entry_range: { type: "array", minItems: 2, maxItems: 2, items: { type: "number", exclusiveMinimum: 0 } },
-          stop_loss: { type: "number", exclusiveMinimum: 0 },
-          take_profit: { type: "array", minItems: 2, maxItems: 2, items: { type: "number", exclusiveMinimum: 0 } },
-          leverage: { type: "integer", minimum: 1, maximum: 20 },
-          risk: { type: "string", enum: ["low", "medium", "high"] },
-          position_sizing: {
-            type: "object",
-            additionalProperties: false,
-            required: [
-              "risk_budget_rate", "risk_budget_amount", "stop_distance_rate", "margin_amount",
-              "position_value", "max_loss_amount", "margin_cap_rate", "capped",
-            ],
-            properties: {
-              risk_budget_rate: { type: "number", minimum: 0, maximum: 0.02 },
-              risk_budget_amount: { type: "number", minimum: 0 },
-              stop_distance_rate: { type: "number", minimum: 0, maximum: 1 },
-              margin_amount: { type: "number", minimum: 0 },
-              position_value: { type: "number", minimum: 0 },
-              max_loss_amount: { type: "number", minimum: 0 },
-              margin_cap_rate: { type: "number", minimum: 0, maximum: 1 },
-              capped: { type: "boolean" },
-            },
-          },
-          reasons: { type: "array", minItems: 2, maxItems: 4, items: { type: "string" } },
-        },
-      },
-    },
-  },
 };
 const INTERVAL_MS = { "1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000 };
 const FALLBACK_MARKETS = [
@@ -203,149 +149,73 @@ async function getCandles(symbol, interval, limit) {
   }
 }
 
-function nearlyEqual(actual, expected, relativeTolerance = 0.03, absoluteTolerance = 0.01) {
-  return Math.abs(actual - expected) <= Math.max(absoluteTolerance, Math.abs(expected) * relativeTolerance);
+function roundPrice(value) {
+  const absolute = Math.abs(value);
+  const digits = absolute >= 1000 ? 2 : absolute >= 1 ? 4 : absolute >= 0.01 ? 6 : 8;
+  return Number(value.toFixed(digits));
 }
 
-function validateAiDecision(decision, market, totalAmount) {
-  const numericFields = ["confidence", "score", "trend", "structure", "capital", "macro", "news", "stop_loss", "leverage"];
-  if (!decision || typeof decision !== "object" || numericFields.some((field) => !Number.isFinite(decision[field]))) {
-    throw new Error("AI 决策字段不完整");
-  }
-  if (!Number.isInteger(decision.confidence) || decision.confidence < 0 || decision.confidence > 100
-    || !Number.isInteger(decision.score) || decision.score < 0 || decision.score > 100
-    || !Number.isInteger(decision.leverage) || decision.leverage < 1 || decision.leverage > 20
-    || !["low", "medium", "high"].includes(decision.risk)) {
-    throw new Error("AI 决策范围无效");
-  }
-  const scoreBreakdown = {
-    trend: decision.trend,
-    structure: decision.structure,
-    capital: decision.capital,
-    macro: decision.macro,
-    news: decision.news,
-  };
-  const score = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
-  if (score !== decision.score) throw new Error("AI 总评分与五维评分不一致");
-  for (const factor of Object.keys(scoreBreakdown)) {
-    if (scoreBreakdown[factor] < 0 || scoreBreakdown[factor] > STRATEGY_PARAMETERS[`${factor}_weight`]) {
-      throw new Error(`AI 的 ${factor} 评分超过策略权重`);
-    }
-  }
-  if (!['LONG', 'SHORT', 'WAIT'].includes(decision.direction)) throw new Error("AI 方向无效");
-  if (decision.direction !== "WAIT" && score < STRATEGY_PARAMETERS.min_trade_score) {
-    throw new Error("AI 可执行方向未达到评分阈值");
-  }
-  if (!Array.isArray(decision.entry_range) || decision.entry_range.length !== 2
-    || !decision.entry_range.every((value) => Number.isFinite(value) && value > 0)
-    || !Array.isArray(decision.take_profit) || decision.take_profit.length !== 2
-    || !decision.take_profit.every((value) => Number.isFinite(value) && value > 0)) {
-    throw new Error("AI 价格区间无效");
-  }
-  const entryRange = [...decision.entry_range].sort((a, b) => a - b);
-  if (decision.direction === "LONG" && !(decision.stop_loss < entryRange[0]
-    && decision.take_profit[0] > entryRange[1] && decision.take_profit[1] > decision.take_profit[0])) {
-    throw new Error("AI 多头止盈止损边界无效");
-  }
-  if (decision.direction === "SHORT" && !(decision.stop_loss > entryRange[1]
-    && decision.take_profit[0] < entryRange[0] && decision.take_profit[1] < decision.take_profit[0])) {
-    throw new Error("AI 空头止盈止损边界无效");
-  }
-  const sizing = decision.position_sizing;
-  const sizingFields = ["risk_budget_rate", "risk_budget_amount", "stop_distance_rate", "margin_amount", "position_value", "max_loss_amount", "margin_cap_rate"];
-  if (!sizing || sizingFields.some((field) => !Number.isFinite(sizing[field])) || typeof sizing.capped !== "boolean") {
-    throw new Error("AI 仓位计算字段无效");
-  }
-  if (sizing.risk_budget_rate < 0 || sizing.risk_budget_rate > 0.02
-    || sizing.risk_budget_amount < 0 || sizing.stop_distance_rate < 0 || sizing.stop_distance_rate > 1
-    || sizing.margin_amount < 0 || sizing.position_value < 0 || sizing.max_loss_amount < 0
-    || sizing.margin_cap_rate < 0 || sizing.margin_cap_rate > 1) {
-    throw new Error("AI 仓位计算范围无效");
-  }
-  if (decision.direction === "WAIT") {
-    if (sizing.margin_amount !== 0 || sizing.position_value !== 0 || sizing.max_loss_amount !== 0) {
-      throw new Error("AI 观望决策不得分配仓位");
-    }
-  } else {
-    const entryMid = (entryRange[0] + entryRange[1]) / 2;
-    const expectedStopRate = Math.abs(entryMid - decision.stop_loss) / entryMid;
-    const marginCap = totalAmount * sizing.margin_cap_rate;
-    const uncappedMargin = sizing.risk_budget_amount / sizing.stop_distance_rate / decision.leverage;
-    if (sizing.margin_amount <= 0 || sizing.position_value <= 0
-      || !nearlyEqual(sizing.stop_distance_rate, expectedStopRate, 0.02, 0.000001)
-      || !nearlyEqual(sizing.risk_budget_amount, totalAmount * sizing.risk_budget_rate)
-      || !nearlyEqual(sizing.position_value, sizing.margin_amount * decision.leverage)
-      || !nearlyEqual(sizing.max_loss_amount, sizing.position_value * sizing.stop_distance_rate)
-      || !nearlyEqual(sizing.margin_amount, Math.min(uncappedMargin, marginCap))
-      || sizing.capped !== (uncappedMargin > marginCap)) {
-      throw new Error("AI 仓位计算未通过一致性校验");
-    }
-  }
-  if (!Array.isArray(decision.reasons) || decision.reasons.length < 2 || decision.reasons.length > 4
-    || decision.reasons.some((reason) => typeof reason !== "string" || !reason.trim())) {
-    throw new Error("AI 决策理由不完整");
-  }
+function positionSizing({ direction, confidence, risk, entryRange, stopLoss, leverage, totalAmount }) {
+  const marginCapRate = 0.3;
+  const empty = { risk_budget_rate: 0, risk_budget_amount: 0, stop_distance_rate: 0, margin_amount: 0, position_value: 0, max_loss_amount: 0, margin_cap_rate: marginCapRate, capped: false };
+  if (direction === "WAIT" || leverage <= 0) return empty;
+  const entryMid = (entryRange[0] + entryRange[1]) / 2;
+  const stopDistanceRate = entryMid > 0 ? Math.abs(entryMid - stopLoss) / entryMid : 0;
+  if (stopDistanceRate <= 0) return empty;
+  const baseRiskRate = { low: 0.01, medium: 0.0075, high: 0.005 }[risk] ?? 0.005;
+  const riskBudgetRate = baseRiskRate * Math.max(0, Math.min(confidence, 100)) / 100;
+  const riskBudgetAmount = totalAmount * riskBudgetRate;
+  const uncappedPositionValue = riskBudgetAmount / stopDistanceRate;
+  const uncappedMargin = uncappedPositionValue / leverage;
+  const marginAmount = Math.min(uncappedMargin, totalAmount * marginCapRate);
+  const positionValue = marginAmount * leverage;
   return {
-    symbol: market.symbol,
-    instrument: `${market.symbol}-PERP`,
-    direction: decision.direction,
-    confidence: decision.confidence,
-    score,
-    score_breakdown: scoreBreakdown,
-    entry_range: entryRange,
-    stop_loss: decision.stop_loss,
-    take_profit: decision.take_profit,
-    leverage: decision.leverage,
-    risk: decision.risk,
-    position_sizing: sizing,
+    risk_budget_rate: Number(riskBudgetRate.toFixed(6)), risk_budget_amount: Number(riskBudgetAmount.toFixed(2)),
+    stop_distance_rate: Number(stopDistanceRate.toFixed(6)), margin_amount: Number(marginAmount.toFixed(2)),
+    position_value: Number(positionValue.toFixed(2)), max_loss_amount: Number((positionValue * stopDistanceRate).toFixed(2)),
+    margin_cap_rate: marginCapRate, capped: uncappedMargin > totalAmount * marginCapRate,
+  };
+}
+
+function analyzeMarket(market, totalAmount) {
+  const trend = Math.max(0, Math.min(30, Math.round(18 + Math.abs(market.change_24h) * 2)));
+  const structure = Math.max(0, Math.min(25, Math.round(17 + Math.abs(market.change_24h) - market.volatility * 0.8)));
+  const capital = Math.max(0, Math.min(20, Math.round(15 - Math.abs(market.funding_rate) * 100)));
+  const scoreBreakdown = { trend, structure, capital, macro: 10, news: 7 };
+  const score = Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
+  let direction = market.change_24h >= 1 ? "LONG" : market.change_24h <= -1 ? "SHORT" : "WAIT";
+  if (score < STRATEGY_PARAMETERS.min_trade_score) direction = "WAIT";
+  const risk = market.volatility > 6 ? "high" : market.volatility > 3 ? "medium" : "low";
+  const entryRange = direction === "SHORT"
+    ? [roundPrice(market.price * 1.003), roundPrice(market.price * 1.008)]
+    : [roundPrice(market.price * 0.992), roundPrice(market.price * 0.997)];
+  const stopDistance = { low: 0.02, medium: 0.026, high: 0.035 }[risk] ?? 0.035;
+  const stopLoss = roundPrice(market.price * (direction === "SHORT" ? 1 + stopDistance : 1 - stopDistance));
+  const leverage = risk === "medium" ? 3 : 2;
+  return {
+    symbol: market.symbol, instrument: `${market.symbol}-PERP`, direction, confidence: score, score,
+    score_breakdown: scoreBreakdown, entry_range: entryRange, stop_loss: stopLoss,
+    take_profit: direction === "SHORT"
+      ? [roundPrice(market.price * 0.965), roundPrice(market.price * 0.928)]
+      : [roundPrice(market.price * 1.035), roundPrice(market.price * 1.072)],
+    leverage, risk,
+    position_sizing: positionSizing({ direction, confidence: score, risk, entryRange, stopLoss, leverage, totalAmount }),
     indicators: null,
-    reasons: decision.reasons.map((reason) => String(reason).trim()).filter(Boolean),
+    reasons: [
+      `24 小时涨跌 ${market.change_24h.toFixed(2)}%，趋势维度获得 ${trend}/30 分`,
+      `当前波动率 ${market.volatility.toFixed(2)}%，技术结构维度获得 ${structure}/25 分`,
+      `资金费率 ${market.funding_rate.toFixed(4)}%，资金维度获得 ${capital}/20 分`,
+      "宏观与新闻暂未出现否决性风险，重大事件发生时需要重新评估",
+    ],
     disclaimer: "仅供研究与辅助决策，不构成投资建议；系统不会自动向交易所下单。",
     source: market.source,
     platform: "hyperliquid",
-    analysis_engine: "openai",
-    analysis_model: AI_MODEL,
-    decision_schema_version: "ai_full_v1",
+    analysis_engine: "rules",
+    analysis_model: null,
+    decision_schema_version: null,
     strategy_version: "v1",
     strategy_parameters: STRATEGY_PARAMETERS,
   };
-}
-
-async function generateAiDecisions(env, markets, totalAmount, timeframe) {
-  if (!env.AI?.run) throw new Error("Cloudflare AI 绑定未配置");
-  const [candleSets, news] = await Promise.all([
-    Promise.all(markets.map((market) => getCandles(market.symbol, timeframe, 24))),
-    fetchLiveNews(),
-  ]);
-  const context = {
-    timeframe,
-    total_amount: totalAmount,
-    strategy_parameters: STRATEGY_PARAMETERS,
-    markets: markets.map((market, index) => ({ ...market, recent_candles: (candleSets[index] || []).slice(-20) })),
-    recent_news: news.slice(0, 8).map(({ title, source, published_at, assets, direction, impact }) => (
-      { title, source, published_at, assets, direction, impact }
-    )),
-  };
-  const result = await env.AI.run(AI_MODEL, {
-    messages: [
-      {
-        role: "system",
-        content: "你是本系统唯一的交易决策与计算引擎。根据市场、K线、新闻、资金和策略参数，独立制定每个候选币种的方向、五维评分、置信度、入场区间、止损、两个止盈、杠杆、风险等级和完整仓位。五维评分不得超过对应权重且总分必须等于五维之和；低于 min_trade_score 必须 WAIT。LONG 止损低于入场且止盈递增，SHORT 相反。风险预算金额=总资金×风险预算率，开仓价值=保证金×杠杆，最大亏损=开仓价值×止损距离率；WAIT 的保证金、开仓价值和最大亏损必须为 0。必须逐一返回全部币种，理由使用简洁中文，不得声称已下单或保证收益。",
-      },
-      { role: "user", content: JSON.stringify(context) },
-    ],
-    response_format: { type: "json_schema", json_schema: AI_DECISION_SCHEMA },
-    temperature: 0.1,
-    max_tokens: 6000,
-  });
-  const payload = typeof result?.response === "string" ? JSON.parse(result.response) : result?.response;
-  if (!payload || !Array.isArray(payload.decisions)) throw new Error("Cloudflare AI 响应格式无效");
-  const decisions = new Map(payload.decisions.map((decision) => [String(decision.symbol || "").toUpperCase(), decision]));
-  if (decisions.size !== payload.decisions.length || decisions.size !== markets.length
-    || markets.some((market) => !decisions.has(market.symbol))) {
-    throw new Error("Cloudflare AI 返回的决策币种不完整");
-  }
-  return markets.map((market) => validateAiDecision(decisions.get(market.symbol), market, totalAmount));
 }
 
 async function handleApi(request, url, env) {
@@ -371,31 +241,20 @@ async function handleApi(request, url, env) {
     const market = (await getMarkets()).find((item) => item.symbol === symbol);
     const totalAmount = Number(request.headers.get("x-alpha-owner-capital") || 0);
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
-    if (!market) return json({ detail: "暂不支持该交易品种" }, 404);
-    try {
-      const [decision] = await generateAiDecisions(env, [market], totalAmount, payload.timeframe || "1h");
-      return json(decision);
-    } catch (error) {
-      console.error(JSON.stringify({ message: "Cloudflare AI 决策生成失败", error: String(error?.message || error) }));
-      return json({ detail: "AI 决策暂时不可用，请稍后重试" }, 503);
-    }
+    return market ? json(analyzeMarket(market, totalAmount)) : json({ detail: "暂不支持该交易品种" }, 404);
   }
 
   if (url.pathname === "/api/v1/ai/opportunities" && request.method === "GET") {
     const totalAmount = Number(request.headers.get("x-alpha-owner-capital") || 0);
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
+    const limit = Math.min(4, Math.max(1, Number(url.searchParams.get("limit") || 4)));
     const markets = await getMarkets();
     const eligible = markets.filter((market) => market.volume >= 500_000 && market.open_interest >= 250_000);
-    const limit = Math.min(8, Math.max(4, Number(url.searchParams.get("limit") || 8)));
-    const candidates = eligible.sort((a, b) => b.volume - a.volume).slice(0, limit);
-    try {
-      const opportunities = (await generateAiDecisions(env, candidates, totalAmount, url.searchParams.get("timeframe") || "1h"))
-        .sort((a, b) => b.score - a.score);
-      return json({ scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "live_scan", platform: "hyperliquid" });
-    } catch (error) {
-      console.error(JSON.stringify({ message: "Cloudflare AI 机会扫描失败", error: String(error?.message || error) }));
-      return json({ detail: "AI 决策暂时不可用，请稍后重试" }, 503);
-    }
+    const opportunities = eligible
+      .map((market) => analyzeMarket(market, totalAmount))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+    return json({ scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "live_scan", platform: "hyperliquid" });
   }
 
   if (url.pathname === "/api/v1/news" && request.method === "GET") {

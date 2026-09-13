@@ -41,6 +41,9 @@ function analysis(symbol: string, platform = "hyperliquid") {
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
+    if (window.localStorage.getItem("alpha-e2e-skip-owner-token") !== "1") {
+      window.sessionStorage.setItem("alpha-owner-api-token", "test-owner-token");
+    }
     (window as Window & { ethereum?: { request: (payload: { method: string }) => Promise<string[]> } }).ethereum = {
       request: async ({ method }) => {
         if (method !== "eth_requestAccounts") throw new Error("不支持的钱包请求");
@@ -65,6 +68,23 @@ test.beforeEach(async ({ page }) => {
         platform,
         updated_at: "2026-09-11T00:00:00Z",
       } });
+      return;
+    }
+
+    if (url.pathname.endsWith("/auth/device")) {
+      await route.fulfill({ json: { authorized: true, expires_at: "2027-09-13T00:00:00Z" } });
+      return;
+    }
+    if (url.pathname.endsWith("/auth/session")) {
+      await route.fulfill({ status: 401, json: { detail: "访问令牌缺失" } });
+      return;
+    }
+    if (url.pathname.endsWith("/auth/password/status")) {
+      await route.fulfill({ json: { setup_required: true } });
+      return;
+    }
+    if (url.pathname.endsWith("/auth/logout")) {
+      await route.fulfill({ json: { authorized: false } });
       return;
     }
 
@@ -197,6 +217,27 @@ test("机会扫描失败会显示原因并可手动重试", async ({ page }) => 
 
   await page.getByRole("button", { name: "重新扫描" }).click();
   await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
+});
+
+test("缺少访问令牌时显示账号密码登录且不发送 AI 扫描请求", async ({ page }) => {
+  await page.evaluate(() => {
+    window.localStorage.setItem("alpha-e2e-skip-owner-token", "1");
+    window.sessionStorage.removeItem("alpha-owner-api-token");
+  });
+  await page.reload();
+  let aiRequests = 0;
+  page.on("request", (request) => {
+    if (request.url().includes("/api/v1/ai/opportunities")) aiRequests += 1;
+  });
+
+  await expect(page.getByRole("heading", { name: "登录 Alpha Trader AI" })).toBeVisible();
+  await expect(page.getByLabel("登录账号")).toBeVisible();
+  await expect(page.getByLabel("登录密码")).toBeVisible();
+  await expect(page.getByText("首次使用时创建账号密码")).toBeVisible();
+  await expect(page.getByLabel("首次设置所有者访问令牌")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "设置并登录" })).toBeDisabled();
+  await expect(page.locator(".bottom-nav")).toHaveCount(0);
+  expect(aiRequests).toBe(0);
 });
 
 test("持仓页可连接浏览器钱包并同步 Hyperliquid 数据", async ({ page }) => {

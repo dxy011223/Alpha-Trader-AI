@@ -1,14 +1,14 @@
 {
   "name": "mobile-app",
   "private": true,
-  "version": "1.4.2",
+  "version": "1.4.8",
   "type": "module",
   "scripts": {
     "check:runtime": "node scripts/check-mobile-runtime.mjs",
     "update:runtime-lock": "node scripts/update-mobile-runtime-lock.mjs",
     "test:runtime": "playwright test",
     "test:sites": "node --test tests/sites-worker.test.mjs",
-    "test:api": "vitest run src/alphaApi.test.ts src/simulationTrading.test.ts",
+    "test:api": "vitest run src/alphaApi.test.ts src/alphaApi.native.test.ts src/simulationTrading.test.ts",
     "predev": "npm run check:runtime",
     "dev": "vite",
     "prebuild": "npm run check:runtime",

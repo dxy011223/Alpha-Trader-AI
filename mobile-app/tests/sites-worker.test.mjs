@@ -41,9 +41,12 @@ test("adds CORS headers to API responses only for app origins", async () => {
 function createSimulationDatabase() {
   const wallets = new Map();
   const capital = new Map();
+  const passwordCredentials = new Map();
+  const loginRateLimits = new Map();
   let writes = 0;
   return {
     get writes() { return writes; },
+    get passwordCredentials() { return passwordCredentials; },
     prepare(sql) {
       let params = [];
       return {
@@ -53,15 +56,57 @@ function createSimulationDatabase() {
         },
         async run() {
           writes += 1;
-          if (sql.includes("owner_capital_settings")) {
+          if (sql.includes("INSERT INTO owner_password_credentials")) {
+            const [ownerId, username, salt, passwordHash, iterations, createdAt, updatedAt] = params;
+            const duplicate = passwordCredentials.has(username)
+              || [...passwordCredentials.values()].some((item) => item.owner_id === ownerId);
+            if (duplicate) throw new Error("账号已存在");
+            passwordCredentials.set(username, {
+              owner_id: ownerId,
+              username_normalized: username,
+              password_salt: salt,
+              password_hash: passwordHash,
+              password_iterations: iterations,
+              failed_attempts: 0,
+              failed_window_started_at: null,
+              locked_until: null,
+              created_at: createdAt,
+              updated_at: updatedAt,
+            });
+          } else if (sql.includes("UPDATE owner_password_credentials")) {
+            const reset = sql.includes("failed_attempts = 0");
+            const ownerId = params.at(-1);
+            const record = [...passwordCredentials.values()].find((item) => item.owner_id === ownerId);
+            if (record) {
+              record.failed_attempts = reset ? 0 : params[0];
+              record.failed_window_started_at = reset ? null : params[1];
+              record.locked_until = reset ? null : params[2];
+            }
+          } else if (sql.includes("INSERT INTO auth_login_rate_limits")) {
+            const [clientHash] = params;
+            loginRateLimits.set(clientHash, params.length === 2 ? {
+              failed_attempts: 0,
+              failed_window_started_at: null,
+              locked_until: null,
+            } : {
+              failed_attempts: params[1],
+              failed_window_started_at: params[2],
+              locked_until: params[3],
+            });
+          } else if (sql.includes("owner_capital_settings")) {
             capital.set(params[0], { total_amount: params[1], currency: "USDT", updated_at: params[2] });
           } else if (sql.includes("owner_simulation_wallets")) {
             const key = `${params[0]}:${params[1]}:${params[2]}`;
             wallets.set(key, { enabled: params[3], balance: params[4], active_trade: params[5], history: params[6], updated_at: params[7] });
           }
-          return { success: true };
+          return { success: true, meta: { changes: 1 } };
         },
         async first() {
+          if (sql.includes("FROM owner_password_credentials")) {
+            if (sql.includes("LIMIT 1")) return passwordCredentials.values().next().value ?? null;
+            return passwordCredentials.get(params[0]) ?? null;
+          }
+          if (sql.includes("FROM auth_login_rate_limits")) return loginRateLimits.get(params[0]) ?? null;
           if (sql.includes("owner_capital_settings")) return capital.get(params[0]) ?? null;
           return wallets.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
         },
@@ -126,6 +171,13 @@ test("protects owner state and persists capital in D1", async () => {
   const url = "https://example.test/api/v1/settings/capital";
   const denied = await worker.fetch(new Request(url), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
   assert.equal(denied.status, 401);
+  assert.equal((await denied.json()).detail, "访问令牌缺失");
+
+  const invalid = await worker.fetch(new Request(url, {
+    headers: { authorization: "Bearer invalid-owner-token" },
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(invalid.status, 401);
+  assert.equal((await invalid.json()).detail, "登录状态无效，请重新登录");
 
   const saved = await worker.fetch(new Request(url, {
     method: "PUT",
@@ -138,6 +190,147 @@ test("protects owner state and persists capital in D1", async () => {
   assert.equal((await reloaded.json()).total_amount, 25_000);
 });
 
+test("exchanges the owner secret for signed bearer and HttpOnly cookie sessions", async () => {
+  const bearerEnrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ transport: "bearer" }),
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(bearerEnrollment.status, 200);
+  const bearerPayload = await bearerEnrollment.json();
+  assert.match(bearerPayload.token, /^ats1\./);
+
+  const bearerSession = await worker.fetch(new Request("https://example.test/api/v1/auth/session", {
+    headers: { authorization: `Bearer ${bearerPayload.token}` },
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  const refreshedBearerPayload = await bearerSession.json();
+  assert.equal(refreshedBearerPayload.authorized, true);
+  assert.match(refreshedBearerPayload.token, /^ats1\./);
+  assert.notEqual(refreshedBearerPayload.token, bearerPayload.token);
+
+  const tokenParts = bearerPayload.token.split(".");
+  tokenParts[3] = `${tokenParts[3].startsWith("A") ? "B" : "A"}${tokenParts[3].slice(1)}`;
+  const tamperedToken = tokenParts.join(".");
+  const tamperedSession = await worker.fetch(new Request("https://example.test/api/v1/auth/session", {
+    headers: { authorization: `Bearer ${tamperedToken}` },
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(tamperedSession.status, 401);
+
+  const malformedCookie = await worker.fetch(new Request("https://example.test/api/v1/auth/session", {
+    headers: { cookie: "alpha_owner_session=%broken" },
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(malformedCookie.status, 401);
+
+  const cookieEnrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ transport: "cookie" }),
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  const setCookie = cookieEnrollment.headers.get("set-cookie");
+  assert.match(setCookie, /alpha_owner_session=ats1\./);
+  assert.match(setCookie, /HttpOnly/);
+  assert.match(setCookie, /Secure/);
+  assert.match(setCookie, /SameSite=Strict/);
+  assert.equal((await cookieEnrollment.json()).token, undefined);
+
+  const cookie = setCookie.split(";", 1)[0];
+  const cookieSession = await worker.fetch(new Request("https://example.test/api/v1/auth/session", {
+    headers: { cookie },
+  }), { OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(cookieSession.status, 200);
+});
+
+test("creates the only local password account without exposing the owner token", async () => {
+  const DB = createSimulationDatabase();
+  const env = {
+    DB,
+    DEVICE_SESSION_SECRET: "device-session-secret-abcdefghijklmnopqrstuvwxyz",
+    OWNER_API_TOKEN: OWNER_TOKEN,
+  };
+  const initialStatus = await worker.fetch(
+    new Request("https://example.test/api/v1/auth/password/status"),
+    env,
+  );
+  assert.deepEqual(await initialStatus.json(), { setup_required: true });
+
+  const setup = await worker.fetch(new Request("https://example.test/api/v1/auth/password/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "Owner@Example.Test", password: "correct-password", transport: "bearer" }),
+  }), env);
+  assert.equal(setup.status, 200);
+  assert.match((await setup.json()).token, /^ats1\./);
+  assert.equal([...DB.passwordCredentials.values()][0].password_iterations, 0);
+
+  const duplicateSetup = await worker.fetch(new Request("https://example.test/api/v1/auth/password/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "another-owner", password: "another-password", transport: "bearer" }),
+  }), env);
+  assert.equal(duplicateSetup.status, 409);
+  assert.deepEqual(await duplicateSetup.json(), { detail: "账号已创建，请直接登录" });
+
+  const registeredStatus = await worker.fetch(
+    new Request("https://example.test/api/v1/auth/password/status"),
+    env,
+  );
+  assert.deepEqual(await registeredStatus.json(), { setup_required: false });
+
+  const login = await worker.fetch(new Request("https://example.test/api/v1/auth/password/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.8" },
+    body: JSON.stringify({ username: "owner@example.test", password: "correct-password", transport: "cookie" }),
+  }), env);
+  assert.equal(login.status, 200);
+  assert.match(login.headers.get("set-cookie"), /alpha_owner_session=ats1\./);
+  assert.equal((await login.json()).token, undefined);
+});
+
+test("locks a password account after five failed attempts", async () => {
+  const DB = createSimulationDatabase();
+  const env = { DB, DEVICE_SESSION_SECRET: "device-session-secret-abcdefghijklmnopqrstuvwxyz", OWNER_API_TOKEN: OWNER_TOKEN };
+  await worker.fetch(new Request("https://example.test/api/v1/auth/password/setup", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "owner", password: "correct-password", transport: "bearer" }),
+  }), env);
+
+  let response;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    response = await worker.fetch(new Request("https://example.test/api/v1/auth/password/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" },
+      body: JSON.stringify({ username: "owner", password: "incorrect-password" }),
+    }), env);
+  }
+  assert.equal(response.status, 429);
+
+  const stillLocked = await worker.fetch(new Request("https://example.test/api/v1/auth/password/login", {
+    method: "POST",
+    headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" },
+    body: JSON.stringify({ username: "owner", password: "correct-password" }),
+  }), env);
+  assert.equal(stillLocked.status, 429);
+});
+
+test("keeps device sessions valid when the owner token rotates", async () => {
+  const sessionSecret = "device-session-secret-abcdefghijklmnopqrstuvwxyz";
+  const enrolled = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ transport: "bearer" }),
+  }), { DEVICE_SESSION_SECRET: sessionSecret, OWNER_API_TOKEN: OWNER_TOKEN });
+  const { token } = await enrolled.json();
+
+  const checked = await worker.fetch(new Request("https://example.test/api/v1/auth/session", {
+    headers: { authorization: `Bearer ${token}` },
+  }), {
+    DEVICE_SESSION_SECRET: sessionSecret,
+    OWNER_API_TOKEN: "rotated-owner-token-abcdefghijklmnopqrstuvwxyz",
+  });
+  assert.equal(checked.status, 200);
+});
+
 test("refuses to proxy secrets to an insecure backend", async () => {
   const response = await worker.fetch(
     new Request("https://example.test/api/v1/executions/active", { headers: authHeaders }),
@@ -146,6 +339,54 @@ test("refuses to proxy secrets to an insecure backend", async () => {
 
   assert.equal(response.status, 503);
   assert.match((await response.json()).detail, /HTTPS/);
+});
+
+test("reports a server configuration error when the backend rejects the Worker token", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  const errors = [];
+  globalThis.fetch = async () => Response.json({ detail: "访问令牌无效" }, { status: 401 });
+  console.error = (...args) => errors.push(args.join(" "));
+
+  try {
+    const response = await worker.fetch(
+      new Request("https://example.test/api/v1/executions/active", { headers: authHeaders }),
+      { BACKEND_API_URL: "https://backend.example.test", OWNER_API_TOKEN: OWNER_TOKEN },
+    );
+
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { detail: "服务端访问令牌配置不一致" });
+    assert.match(errors.join("\n"), /后端拒绝了 Worker 访问令牌/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+  }
+});
+
+test("falls back to the edge rule engine when the backend rejects the Worker token", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  globalThis.fetch = async () => Response.json({ detail: "访问令牌无效" }, { status: 401 });
+  console.error = () => undefined;
+
+  try {
+    const response = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: authHeaders },
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB: createSimulationDatabase(),
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.opportunities.length, 4);
+    assert.ok(payload.opportunities.every((item) => item.analysis_engine === "rules"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+  }
 });
 
 test("serves existing static assets without a fallback", async () => {
@@ -229,7 +470,7 @@ test("does not turn missing API or write requests into the app shell", async () 
   }
 });
 
-test("serves public market data and proxies AI decisions to the Python backend", async () => {
+test("serves public market data and keeps a rule fallback when the Python backend is absent", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (_url, init) => {
     if (_url instanceof Request && new URL(_url.url).hostname === "backend.example.test") {
@@ -273,12 +514,31 @@ test("serves public market data and proxies AI decisions to the Python backend",
     const payload = await opportunities.json();
     assert.equal(payload.proxied, true);
 
-    const unavailable = await worker.fetch(new Request(
+    const enrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ transport: "bearer" }),
+    }), { OWNER_API_TOKEN: OWNER_TOKEN });
+    const { token: deviceToken } = await enrollment.json();
+    const sessionOpportunities = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: { authorization: `Bearer ${deviceToken}` } },
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+    assert.equal(sessionOpportunities.status, 200);
+    assert.equal((await sessionOpportunities.json()).proxied, true);
+
+    const edgeRules = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
       { headers: authHeaders },
     ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
-    assert.equal(unavailable.status, 503);
-    assert.match((await unavailable.json()).detail, /完整后端服务/);
+    assert.equal(edgeRules.status, 200);
+    const edgePayload = await edgeRules.json();
+    assert.equal(edgePayload.opportunities.length, 4);
+    assert.ok(edgePayload.opportunities.every((item) => item.analysis_engine === "rules"));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -299,8 +559,10 @@ test("keeps the Cloudflare deployment contract at the repository root", async ()
   assert.equal(config.main, "./mobile-app/worker/app.js");
   assert.equal(config.assets.directory, "./mobile-app/dist/client");
   assert.equal(config.d1_databases[0].migrations_dir, "./mobile-app/migrations");
-  assert.equal(config.ai.binding, "AI");
-  assert.deepEqual(config.secrets.required, ["OWNER_API_TOKEN"]);
+  assert.deepEqual(config.secrets.required, [
+    "OWNER_API_TOKEN",
+    "DEVICE_SESSION_SECRET",
+  ]);
 });
 
 test("provides installable PWA metadata and icons", async () => {
@@ -328,7 +590,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.2"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.8"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

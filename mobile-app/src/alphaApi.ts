@@ -256,7 +256,11 @@ export interface SimulationWalletResponse extends SimulationWalletState {
 
 const API_BASE = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
 const REQUEST_TIMEOUT_MS = 12_000;
+const AI_REQUEST_TIMEOUT_MS = 45_000;
 export const API_ACCESS_TOKEN_KEY = "alpha-owner-api-token";
+export const API_ACCESS_INVALIDATED_EVENT = "alpha-api-access-invalidated";
+const COOKIE_SESSION_MARKER = "cookie-session";
+const DEVICE_SESSION_PREFIX = "ats1.";
 
 interface OwnerTokenPlugin {
   getToken(): Promise<{ token: string }>;
@@ -268,21 +272,195 @@ const OwnerToken = registerPlugin<OwnerTokenPlugin>("OwnerToken");
 let cachedApiAccessToken: string | null = null;
 let apiAccessTokenLoad: Promise<string> | null = null;
 
+class ApiResponseError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+function usesLocalDevelopmentApi() {
+  return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(API_BASE);
+}
+
+async function parseApiError(response: Response, fallback: string) {
+  const payload = await response.json().catch(() => null) as { detail?: string } | null;
+  return new ApiResponseError(payload?.detail || fallback, response.status);
+}
+
+function isAuthenticationError(error: unknown) {
+  return error instanceof ApiResponseError && (error.status === 401 || error.status === 403);
+}
+
+async function clearInvalidAccessToken() {
+  if (Capacitor.isNativePlatform()) await OwnerToken.clearToken().catch(() => undefined);
+  globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  cachedApiAccessToken = "";
+  apiAccessTokenLoad = null;
+  if (typeof globalThis.dispatchEvent === "function") {
+    globalThis.dispatchEvent(new Event(API_ACCESS_INVALIDATED_EVENT));
+  }
+}
+
+async function exchangeOwnerToken(ownerToken: string) {
+  const native = Capacitor.isNativePlatform();
+  const response = await fetch(`${API_BASE}/auth/device`, {
+    method: "POST",
+    credentials: native ? "omit" : "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ownerToken}`,
+    },
+    body: JSON.stringify({ transport: native ? "bearer" : "cookie" }),
+  });
+  // 本地 FastAPI 尚未提供设备会话端点时，保留旧的会话级 Bearer 开发方式。
+  if (response.status === 404 && usesLocalDevelopmentApi() && !native) return ownerToken;
+  if (!response.ok) throw await parseApiError(response, "设备授权失败");
+  const payload = await response.json() as { authorized?: boolean; token?: string };
+  if (!payload.authorized) throw new Error("设备授权失败");
+  if (!native) return COOKIE_SESSION_MARKER;
+  const sessionToken = payload.token?.trim() ?? "";
+  if (!sessionToken.startsWith(DEVICE_SESSION_PREFIX)) throw new Error("设备会话格式无效");
+  await OwnerToken.setToken({ token: sessionToken });
+  return sessionToken;
+}
+
+async function completePasswordAuth(response: Response, fallback: string) {
+  if (!response.ok) throw await parseApiError(response, fallback);
+  const payload = await response.json() as { authorized?: boolean; token?: string };
+  if (!payload.authorized) throw new Error(fallback);
+  const native = Capacitor.isNativePlatform();
+  const sessionToken = native ? payload.token?.trim() ?? "" : COOKIE_SESSION_MARKER;
+  if (native && !sessionToken.startsWith(DEVICE_SESSION_PREFIX)) throw new Error("设备会话格式无效");
+  if (native) await OwnerToken.setToken({ token: sessionToken });
+  globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  cachedApiAccessToken = sessionToken;
+  apiAccessTokenLoad = Promise.resolve(sessionToken);
+  return sessionToken;
+}
+
+export async function loginWithPassword(username: string, password: string) {
+  const native = Capacitor.isNativePlatform();
+  const response = await fetch(`${API_BASE}/auth/password/login`, {
+    method: "POST",
+    credentials: native ? "omit" : "same-origin",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ username, password, transport: native ? "bearer" : "cookie" }),
+  });
+  return completePasswordAuth(response, "账号密码登录失败");
+}
+
+export async function setupPassword(username: string, password: string) {
+  const native = Capacitor.isNativePlatform();
+  const response = await fetch(`${API_BASE}/auth/password/setup`, {
+    method: "POST",
+    credentials: native ? "omit" : "same-origin",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password, transport: native ? "bearer" : "cookie" }),
+  });
+  return completePasswordAuth(response, "账号密码设置失败");
+}
+
+export async function loadPasswordAuthStatus() {
+  const response = await fetch(`${API_BASE}/auth/password/status`, {
+    headers: { Accept: "application/json" },
+    credentials: Capacitor.isNativePlatform() ? "omit" : "same-origin",
+  });
+  if (!response.ok) throw await parseApiError(response, "无法检查账号状态");
+  return response.json() as Promise<{ setup_required: boolean }>;
+}
+
+async function loadCookieSession() {
+  const response = await fetch(`${API_BASE}/auth/session`, {
+    headers: { Accept: "application/json" },
+    credentials: "same-origin",
+  }).catch(() => null);
+  return response?.ok ? COOKIE_SESSION_MARKER : "";
+}
+
+async function validateDeviceSession(token: string) {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/auth/session`, {
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      credentials: "omit",
+    });
+  } catch {
+    // 离线时保留设备会话，避免网络波动导致用户被迫重新授权。
+    return token;
+  }
+  if (response.ok) {
+    const payload = await response.json().catch(() => null) as { authorized?: boolean; token?: string } | null;
+    const refreshedToken = payload?.token?.trim() || token;
+    if (!refreshedToken.startsWith(DEVICE_SESSION_PREFIX)) {
+      await clearInvalidAccessToken();
+      return "";
+    }
+    if (refreshedToken !== token) await OwnerToken.setToken({ token: refreshedToken });
+    return refreshedToken;
+  }
+  if (response.status === 401 || response.status === 403) {
+    await clearInvalidAccessToken();
+    return "";
+  }
+  return token;
+}
+
 export function getApiAccessToken() {
   if (cachedApiAccessToken !== null) return cachedApiAccessToken;
   if (Capacitor.isNativePlatform()) return "";
-  cachedApiAccessToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY) ?? "";
+  if (usesLocalDevelopmentApi()) {
+    cachedApiAccessToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY) ?? "";
+    return cachedApiAccessToken;
+  }
+  cachedApiAccessToken = "";
   return cachedApiAccessToken;
 }
 
 export function loadApiAccessToken(): Promise<string> {
-  if (cachedApiAccessToken !== null) return Promise.resolve(cachedApiAccessToken);
-  if (!Capacitor.isNativePlatform()) return Promise.resolve(getApiAccessToken());
+  if (cachedApiAccessToken) return Promise.resolve(cachedApiAccessToken);
   if (!apiAccessTokenLoad) {
+    if (!Capacitor.isNativePlatform()) {
+      const legacyToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY)?.trim() ?? "";
+      apiAccessTokenLoad = (legacyToken ? exchangeOwnerToken(legacyToken) : loadCookieSession())
+        .then((token) => {
+          if (usesLocalDevelopmentApi() && token === legacyToken) {
+            globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, token);
+          } else {
+            globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+          }
+          cachedApiAccessToken = token;
+          return token;
+        })
+        .catch(() => {
+          cachedApiAccessToken = "";
+          return "";
+        });
+      return apiAccessTokenLoad;
+    }
     apiAccessTokenLoad = OwnerToken.getToken()
-      .then(({ token }) => {
-        cachedApiAccessToken = token.trim();
-        return cachedApiAccessToken;
+      .then(async ({ token }) => {
+        const storedToken = token.trim();
+        if (!storedToken) return "";
+        if (storedToken.startsWith(DEVICE_SESSION_PREFIX)) return validateDeviceSession(storedToken);
+        // 旧版保存的是所有者主令牌；升级后立即换成权限更小的设备会话。
+        try {
+          return await exchangeOwnerToken(storedToken);
+        } catch (error) {
+          if (isAuthenticationError(error)) await clearInvalidAccessToken();
+          return "";
+        }
+      })
+      .then((token) => {
+        cachedApiAccessToken = token;
+        return token;
       })
       .catch(() => {
         cachedApiAccessToken = "";
@@ -294,38 +472,51 @@ export function loadApiAccessToken(): Promise<string> {
 
 export async function setApiAccessToken(token: string) {
   const normalized = token.trim();
-  if (Capacitor.isNativePlatform()) {
-    if (normalized) await OwnerToken.setToken({ token: normalized });
-    else await OwnerToken.clearToken();
-    // 清除旧版本可能留下的会话副本，Android 只使用原生安全存储。
-    globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
-  } else if (normalized) {
-    globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, normalized);
+  if (normalized) {
+    try {
+      cachedApiAccessToken = await exchangeOwnerToken(normalized);
+    } catch (error) {
+      if (isAuthenticationError(error)) await clearInvalidAccessToken();
+      throw error;
+    }
   } else {
+    await fetch(`${API_BASE}/auth/logout`, {
+      method: "POST",
+      credentials: Capacitor.isNativePlatform() ? "omit" : "same-origin",
+    }).catch(() => undefined);
+    if (Capacitor.isNativePlatform()) await OwnerToken.clearToken();
     globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+    cachedApiAccessToken = "";
   }
-  cachedApiAccessToken = normalized;
-  apiAccessTokenLoad = Promise.resolve(normalized);
+  // Android 永远不保留主令牌；网页正式环境只保留不可读的 HttpOnly Cookie。
+  globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  if (usesLocalDevelopmentApi() && !Capacitor.isNativePlatform() && cachedApiAccessToken === normalized) {
+    globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, normalized);
+  }
+  apiAccessTokenLoad = Promise.resolve(cachedApiAccessToken);
+  return cachedApiAccessToken ?? "";
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const upstreamSignal = init.signal;
   const controller = new AbortController();
   const abortFromUpstream = () => controller.abort();
-  const timeoutId = globalThis.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = globalThis.setTimeout(() => controller.abort(), timeoutMs);
 
   if (upstreamSignal?.aborted) controller.abort();
   else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
 
   let response: Response;
+  let token = "";
   try {
-    const token = await loadApiAccessToken();
+    token = await loadApiAccessToken();
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
+      credentials: Capacitor.isNativePlatform() ? "omit" : "same-origin",
       signal: controller.signal,
       headers: {
         Accept: "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(token && token !== COOKIE_SESSION_MARKER ? { Authorization: `Bearer ${token}` } : {}),
         ...init.headers,
       },
     });
@@ -340,8 +531,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (!response.ok) {
-    const payload = await response.json().catch(() => null) as { detail?: string } | null;
-    throw new Error(payload?.detail || `行情接口请求失败：${response.status}`);
+    const error = await parseApiError(response, `行情接口请求失败：${response.status}`);
+    if (token && isAuthenticationError(error)) {
+      await clearInvalidAccessToken();
+      throw new Error("登录已过期，请重新登录");
+    }
+    throw error;
   }
 
   return response.json() as Promise<T>;
@@ -387,7 +582,7 @@ export function loadAnalysis(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ symbol, timeframe, platform }),
     signal,
-  });
+  }, AI_REQUEST_TIMEOUT_MS);
 }
 
 export function loadOpportunities(
@@ -395,8 +590,8 @@ export function loadOpportunities(
   signal?: AbortSignal,
   platform: MarketPlatform = "hyperliquid",
 ) {
-  const query = new URLSearchParams({ timeframe, limit: "8", platform });
-  return request<OpportunityScanResponse>(`/ai/opportunities?${query}`, { signal });
+  const query = new URLSearchParams({ timeframe, limit: "4", platform });
+  return request<OpportunityScanResponse>(`/ai/opportunities?${query}`, { signal }, AI_REQUEST_TIMEOUT_MS);
 }
 
 export function loadCapitalSettings(signal?: AbortSignal) {
