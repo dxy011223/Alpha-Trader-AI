@@ -879,6 +879,40 @@ test("reports a server configuration error when the backend rejects the Worker t
   }
 });
 
+test("signs authenticated backend requests without exposing the signing key", async () => {
+  const originalFetch = globalThis.fetch;
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  );
+  const privateKey = Buffer.from(await crypto.subtle.exportKey("pkcs8", keyPair.privateKey)).toString("base64");
+  globalThis.fetch = async (input) => {
+    assert.ok(input.headers.get("x-alpha-worker-timestamp"));
+    assert.ok(input.headers.get("x-alpha-worker-signature"));
+    assert.deepEqual(await input.json(), { symbol: "BTC", timeframe: "4h" });
+    return Response.json({ proxied: true });
+  };
+
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/v1/ai/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ symbol: "BTC", timeframe: "4h" }),
+    }), {
+      BACKEND_API_URL: "https://backend.example.test",
+      BACKEND_SIGNING_PRIVATE_KEY: privateKey,
+      DB: createSimulationDatabase(),
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { proxied: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("falls back to the edge rule engine when the backend rejects the Worker token", async () => {
   const originalFetch = globalThis.fetch;
   const originalError = console.error;
@@ -922,6 +956,44 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
     assert.deepEqual(updatedPlan.take_profit, firstPlan.take_profit);
     assert.equal(firstPlan.position_sizing.margin_amount, 0);
     assert.equal(updatedPlan.position_sizing.margin_amount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.error = originalError;
+  }
+});
+
+test("preserves a POST body when analysis falls back after backend authentication fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalError = console.error;
+  globalThis.fetch = async (input, init) => {
+    if (input instanceof Request && new URL(input.url).hostname === "backend.example.test") {
+      assert.deepEqual(await input.json(), { symbol: "BTC", timeframe: "4h" });
+      return Response.json({ detail: "访问令牌无效" }, { status: 401 });
+    }
+    const payload = JSON.parse(init.body);
+    if (payload.type === "metaAndAssetCtxs") {
+      return Response.json([
+        { universe: [{ name: "BTC" }] },
+        [{ markPx: "100", prevDayPx: "98", dayNtlVlm: "1000000", funding: "0.0001", openInterest: "50000" }],
+      ]);
+    }
+    return Response.json([{ t: 1, T: 2, o: "99", h: "101", l: "98", c: "100", v: "42" }]);
+  };
+  console.error = () => undefined;
+
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/v1/ai/analyze", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ symbol: "BTC", timeframe: "4h" }),
+    }), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB: createSimulationDatabase(),
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).analysis_engine, "rules");
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;

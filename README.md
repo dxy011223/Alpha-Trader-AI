@@ -51,7 +51,7 @@ docker compose up --build
 
 ## Render 后端部署
 
-仓库根目录的 `render.yaml` 会创建免费预览规格的 FastAPI Web Service、PostgreSQL 和 Redis-compatible Key Value。首次创建 Blueprint 时必须在 Render 控制台填写 `OWNER_API_TOKEN`；仅需启用 AI 复盘和策略优化时才填写 `AI_API_KEY`。Render 与 Cloudflare Worker 的 `OWNER_API_TOKEN` 必须保持同值，轮换时需同步更新两端，否则 Worker 会将后端鉴权失败标记为服务端配置错误。其余连接地址和加密密钥由平台注入或生成。部署完成后，把 Web Service 的 HTTPS 地址配置为 Cloudflare Worker 的 `BACKEND_API_URL`。
+仓库根目录的 `render.yaml` 会创建免费预览规格的 FastAPI Web Service、PostgreSQL 和 Redis-compatible Key Value。首次创建 Blueprint 时必须在 Render 控制台填写 `OWNER_API_TOKEN`；仅需启用 AI 复盘和策略优化时才填写 `AI_API_KEY`。Cloudflare Worker 到 Render 的访问使用 60 秒有效的 ECDSA 请求签名，不再要求两端 `OWNER_API_TOKEN` 保持同值；Render 的令牌仅保留为直接维护接口的兼容鉴权。其余连接地址和加密密钥由平台注入或生成。部署完成后，把 Web Service 的 HTTPS 地址配置为 Cloudflare Worker 的 `BACKEND_API_URL`。
 
 免费 Web Service 在空闲后会休眠，免费 PostgreSQL 会在 30 天后到期，因此仅适合功能验收；正式长期运行应升级对应实例或迁移到长期托管数据库。
 
@@ -94,7 +94,7 @@ Docker Compose 会同时启动 PostgreSQL、Redis、API、Celery Worker 与 Cele
 
 ## Cloudflare Sites 与 APK
 
-Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定。`npm run deploy:cloudflare` 会先显式执行 `wrangler d1 migrations apply alpha-trader-ai-db --remote`，成功后才发布 Worker，避免代码先于数据库结构上线。`OWNER_API_TOKEN` 必须作为运行时 secret 配置；如需真实钱包、成交与 AI 复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。完整后端休眠或不可用时，Worker 可直接读取 Hyperliquid、Binance 与 OKX 公共行情和 K 线，并在边缘计算 EMA、RSI、MACD、ATR、成交量及资金费率准入规则，继续生成规则决策和执行模拟交易；真实账户、真实成交核验与 AI 复盘不会由边缘端伪造。
+Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定。`npm run deploy:cloudflare` 会先显式执行 `wrangler d1 migrations apply alpha-trader-ai-db --remote`，成功后才发布 Worker，避免代码先于数据库结构上线。`OWNER_API_TOKEN` 和 `BACKEND_SIGNING_PRIVATE_KEY` 必须作为 Worker 运行时 secret 配置；后者只保存在 Cloudflare，用于向后端发送带时间戳和请求体摘要的签名。若需真实钱包、成交与 AI 复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。完整后端休眠或不可用时，Worker 可直接读取 Hyperliquid、Binance 与 OKX 公共行情和 K 线，并在边缘计算 EMA、RSI、MACD、ATR、成交量及资金费率准入规则，继续生成规则决策和执行模拟交易；真实账户、真实成交核验与 AI 复盘不会由边缘端伪造。
 
 可在 `mobile-app` 目录运行 `node scripts/ensure-owner-token.mjs` 生成或保留本机 `.env.local` 中的所有者令牌；脚本不会打印令牌，且该文件不会提交到 Git。
 

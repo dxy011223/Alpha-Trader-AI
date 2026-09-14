@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import secrets
 import time
@@ -7,6 +8,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -19,6 +24,13 @@ _minute_counts: dict[tuple[str, int], int] = defaultdict(int)
 _day_counts: dict[tuple[str, int], int] = defaultdict(int)
 _concurrency: asyncio.Semaphore | None = None
 _concurrency_size = 0
+
+_WORKER_SIGNING_PUBLIC_KEY = b"""-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIxHD9f9bENpeXkebAeNBiILIR/b5
+oRYJpm3uB8ZoSrmV2wfCrpS8rnbsyYnB66qamup5sHLBlPtAzwHwLYV2DQ==
+-----END PUBLIC KEY-----
+"""
+_WORKER_SIGNATURE_MAX_AGE_SECONDS = 60
 
 _QUOTA_SCRIPT = """
 local minute_count = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -38,11 +50,38 @@ class AIBudgetUnavailable(RuntimeError):
     """模型预算不可用或已经耗尽，调用方必须保留规则分析结果。"""
 
 
-def require_owner(
+async def _has_valid_worker_signature(request: Request) -> bool:
+    """校验 Cloudflare Worker 的短时签名，避免托管平台间同步共享密钥。"""
+    timestamp_value = request.headers.get("x-alpha-worker-timestamp", "")
+    signature_value = request.headers.get("x-alpha-worker-signature", "")
+    try:
+        timestamp = int(timestamp_value)
+        if abs(int(time.time()) - timestamp) > _WORKER_SIGNATURE_MAX_AGE_SECONDS:
+            return False
+        padding = "=" * (-len(signature_value) % 4)
+        signature = base64.urlsafe_b64decode(signature_value + padding)
+        if len(signature) == 64:
+            signature = encode_dss_signature(
+                int.from_bytes(signature[:32], "big"),
+                int.from_bytes(signature[32:], "big"),
+            )
+        body_hash = hashlib.sha256(await request.body()).hexdigest()
+        path = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        message = f"{timestamp_value}\n{request.method.upper()}\n{path}\n{body_hash}".encode()
+        public_key = serialization.load_pem_public_key(_WORKER_SIGNING_PUBLIC_KEY)
+        public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, TypeError, ValueError):
+        return False
+
+
+async def require_owner(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> str:
-    """校验个人部署的唯一所有者令牌，不在日志或响应中暴露令牌。"""
+    """校验 Worker 签名或个人部署的所有者令牌，不暴露敏感信息。"""
+    if await _has_valid_worker_signature(request):
+        return hashlib.sha256(b"cloudflare-worker-owner").hexdigest()[:24]
     settings = get_settings()
     expected = (settings.owner_api_token or "").strip()
     client_host = request.client.host if request.client else ""

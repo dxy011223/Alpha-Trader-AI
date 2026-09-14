@@ -103,6 +103,36 @@ function decodeBase64Url(value) {
   }
 }
 
+function decodeBase64(value) {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+}
+
+async function createBackendSignature(request, privateKeyValue) {
+  const privateKey = String(privateKeyValue || "").trim();
+  if (!privateKey) return null;
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const body = await request.clone().arrayBuffer();
+  const bodyHash = Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", body)),
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const url = new URL(request.url);
+  const message = `${timestamp}\n${request.method.toUpperCase()}\n${url.pathname}${url.search}\n${bodyHash}`;
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    decodeBase64(privateKey),
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    new TextEncoder().encode(message),
+  );
+  return { timestamp, signature: encodeBase64Url(new Uint8Array(signature)) };
+}
+
 async function sessionKey(secret, usage) {
   return crypto.subtle.importKey(
     "raw",
@@ -1253,7 +1283,8 @@ async function proxyBackend(
     return json({ detail: "完整后端必须使用 HTTPS" }, 503);
   }
   const target = new URL(source.pathname + source.search, backend);
-  const upstream = new Request(target, request);
+  // 代理使用克隆副本，保留原请求体供完整后端失败后的边缘规则回退使用。
+  const upstream = new Request(target, request.clone());
   if (!authenticated) return fetch(upstream);
   const headers = new Headers(upstream.headers);
   headers.set("authorization", `Bearer ${String(env.OWNER_API_TOKEN).trim()}`);
@@ -1262,6 +1293,11 @@ async function proxyBackend(
   }
   if (historyPolicy) {
     headers.set("x-alpha-history-policy", JSON.stringify(historyPolicy));
+  }
+  const workerSignature = await createBackendSignature(request, env.BACKEND_SIGNING_PRIVATE_KEY);
+  if (workerSignature) {
+    headers.set("x-alpha-worker-timestamp", workerSignature.timestamp);
+    headers.set("x-alpha-worker-signature", workerSignature.signature);
   }
   headers.delete("cookie");
   const response = await fetch(new Request(upstream, { headers }));
