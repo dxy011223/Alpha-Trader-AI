@@ -473,6 +473,17 @@ const riskLabels: Record<AnalysisResponse["risk"], string> = {
   high: "高",
 };
 
+function getDecisionStatusLabel(analysis: AnalysisResponse | null) {
+  if (analysis?.decision_status === "executable") return "可执行";
+  if (analysis?.decision_status === "target_reached") return "目标已达";
+  if (analysis?.decision_status === "invalidated") return "已失效";
+  if (/K 线.*不可用|数据不足|指标暂不可用/.test(analysis?.status_reason ?? "")) return "数据不足";
+  if (analysis?.decision_status === "confirming") return "待确认";
+  if (analysis?.decision_status === "missed_entry") return "等待回踩";
+  if (!analysis || analysis.direction === "WAIT") return "继续观察";
+  return "等待入场";
+}
+
 function DecisionMarketChartCard({ selection, platform }: { selection: DecisionMarketSelection; platform: MarketPlatform }) {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [state, setState] = useState<"loading" | "ready" | "offline">("loading");
@@ -925,7 +936,7 @@ function DecisionScreen({
   const [symbol, setSymbol] = useState<AssetSymbol | null>(lockedDecision?.analysis.symbol ?? null);
   const [timeframe, setTimeframe] = useState<MarketInterval>(lockedDecision?.timeframe ?? "4h");
   const [candidates, setCandidates] = useState<AnalysisResponse[]>([]);
-  const [scanStats, setScanStats] = useState({ scanned: 0, eligible: 0 });
+  const [scanStats, setScanStats] = useState({ scanned: 0, eligible: 0, unavailable: 0 });
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanRetry, setScanRetry] = useState(0);
   const forceScanRefreshRef = useRef(false);
@@ -980,7 +991,7 @@ function DecisionScreen({
     }
     if (!apiAccessToken) {
       setCandidates([]);
-      setScanStats({ scanned: 0, eligible: 0 });
+      setScanStats({ scanned: 0, eligible: 0, unavailable: 0 });
       setScanError("登录状态缺失，请重新登录");
       setRemoteState("offline");
       return;
@@ -998,11 +1009,18 @@ function DecisionScreen({
       try {
         const scan = await loadOpportunities(timeframe, controller.signal, platform, bypassCache);
         if (!controller.signal.aborted) {
-          const results = scan.opportunities;
-          setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets });
+          // 前端再次校验平台与行情来源，避免旧网关把演示回退误当成当前平台决策。
+          const results = scan.opportunities.filter((item) => (
+            item.platform === platform && item.source === "live"
+          ));
+          const rejectedFallbacks = scan.opportunities.length - results.length;
+          const unavailable = (scan.data_unavailable_markets ?? 0) + rejectedFallbacks;
+          setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets, unavailable });
           if (results.length === 0) {
             setCandidates([]);
-            setScanError("当前没有通过流动性筛选的市场");
+            setScanError(unavailable > 0
+              ? `K 线行情暂不可用，${unavailable} 个候选未生成决策，请稍后重新扫描`
+              : "当前没有通过流动性筛选的市场");
             setRemoteState("offline");
             return;
           }
@@ -1020,7 +1038,7 @@ function DecisionScreen({
       } catch (error: unknown) {
         if (!controller.signal.aborted) {
           setCandidates([]);
-          setScanStats({ scanned: 0, eligible: 0 });
+          setScanStats({ scanned: 0, eligible: 0, unavailable: 0 });
           setScanError(error instanceof Error ? error.message : "机会扫描暂时不可用");
           setRemoteState("offline");
         }
@@ -1057,17 +1075,7 @@ function DecisionScreen({
   const historyPolicy = analysis?.history_policy;
   const direction = analysis?.direction ?? "WAIT";
   const decisionExecutable = analysis?.is_executable === true;
-  const decisionStatusLabel = analysis?.decision_status === "executable"
-    ? "可执行"
-    : analysis?.decision_status === "target_reached"
-      ? "目标已达"
-      : analysis?.decision_status === "invalidated"
-        ? "已失效"
-        : analysis?.decision_status === "confirming"
-          ? "待确认"
-          : analysis?.decision_status === "missed_entry"
-            ? "等待回踩"
-            : "等待入场";
+  const decisionStatusLabel = getDecisionStatusLabel(analysis);
   const opportunity = getOpportunity(score);
   const entryRange = analysis?.entry_range ?? [0, 0];
   const stopLoss = analysis?.stop_loss ?? 0;
@@ -1166,7 +1174,7 @@ function DecisionScreen({
         <div className="opportunity-radar-heading">
           <div>
             <strong id="opportunity-radar-title">全市场机会雷达</strong>
-            <span aria-live="polite">{remoteState === "offline" ? "扫描未完成 · 可手动重试" : remoteState === "loading" ? (scanStats.scanned > 0 ? "正在刷新市场决策" : "正在读取全部永续合约市场") : `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选`}</span>
+            <span aria-live="polite">{remoteState === "offline" ? "扫描未完成 · 可手动重试" : remoteState === "loading" ? (scanStats.scanned > 0 ? "正在刷新市场决策" : "正在读取全部永续合约市场") : `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选${scanStats.unavailable > 0 ? ` · ${scanStats.unavailable} 个 K 线暂不可用` : ""}`}</span>
           </div>
           <div className="opportunity-radar-actions">
             <button
@@ -1201,7 +1209,7 @@ function DecisionScreen({
                 key={candidate.symbol}
               >
                 <span><small>#{index + 1}</small><strong>{candidate.symbol}</strong></span>
-                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.is_executable ? "可执行" : candidate.decision_status === "target_reached" ? "目标已达" : candidate.decision_status === "invalidated" ? "已失效" : candidate.decision_status === "confirming" ? "待确认" : candidate.decision_status === "missed_entry" ? "等待回踩" : "等待入场"}`} </em>
+                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${getDecisionStatusLabel(candidate)}`} </em>
               </button>
             );
           }) : remoteState === "offline" ? (
@@ -2098,12 +2106,7 @@ function TradingPrototype() {
     .join("");
   const [marketMode, setMarketMode] = useState<MarketMode>("free");
   const [freeMarketSymbol, setFreeMarketSymbol] = useState<AssetSymbol>("BTC");
-  const [decisionMarketSelections, setDecisionMarketSelections] = useState<DecisionMarketSelection[]>([
-    { symbol: "BTC", timeframe: "4h", score: 0, direction: "WAIT" },
-    { symbol: "ETH", timeframe: "4h", score: 0, direction: "WAIT" },
-    { symbol: "SOL", timeframe: "4h", score: 0, direction: "WAIT" },
-    { symbol: "HYPE", timeframe: "4h", score: 0, direction: "WAIT" },
-  ]);
+  const [decisionMarketSelections, setDecisionMarketSelections] = useState<DecisionMarketSelection[]>([]);
   const [sheetContext, setSheetContext] = useState<{
     analysis: AnalysisResponse | null;
     symbol: AssetSymbol;
@@ -2177,6 +2180,14 @@ function TradingPrototype() {
   useEffect(() => {
     window.localStorage.setItem("alpha-market-platform", marketPlatform);
   }, [marketPlatform]);
+
+  const changeMarketPlatform = (nextPlatform: MarketPlatform) => {
+    if (nextPlatform === marketPlatform) return;
+    // 切换平台后立即移除旧平台决策，再读取该平台的服务端统一决策批次。
+    setDecisionMarketSelections([]);
+    setLockedDecision(null);
+    setMarketPlatform(nextPlatform);
+  };
 
   useEffect(() => {
     window.localStorage.setItem(SIMULATION_WALLETS_KEY, JSON.stringify(simulationWallets));
@@ -2495,7 +2506,7 @@ function TradingPrototype() {
               onFreeSymbolChange={setFreeMarketSymbol}
               decisionSelections={decisionMarketSelections}
               platform={marketPlatform}
-              onPlatformChange={setMarketPlatform}
+              onPlatformChange={changeMarketPlatform}
               simulationWallet={simulationWallet}
               simulationSyncState={simulationSyncState}
               simulationExecutorHealthy={simulationExecutorHealthy}
@@ -2538,6 +2549,7 @@ function TradingPrototype() {
             />
           ) : activeTab === "decision" ? (
             <DecisionScreen
+              key={marketPlatform}
               lockedDecision={lockedDecision?.analysis.platform === marketPlatform ? lockedDecision : null}
               activeDecisions={simulationWallet.enabled
                 ? simulationWallet.activeTrades.map(simulatedTradeToLockedDecision)

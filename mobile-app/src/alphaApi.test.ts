@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { cancelExecution, completePosition, createExecution, loadActiveExecution, loadAnalysis, loadCandles, loadCapitalSettings, loadCompletedTrades, loadMarket, loadNews, loadOpportunities, loadPlatformAccount, loadPlatformCredentialStatus, loadReviews, loadSimulationWallet, loadWallet, loadWalletSettings, saveCapitalSettings, savePlatformCredentials, saveSimulationWallet, saveWalletSettings, setApiAccessToken } from "./alphaApi";
+import { cancelExecution, completePosition, createExecution, loadActiveExecution, loadAnalysis, loadCandles, loadCapitalSettings, loadCompletedTrades, loadMarket, loadNews, loadOpportunities, loadPlatformAccount, loadPlatformCredentialStatus, loadReviews, loadSimulationWallet, loadWallet, loadWalletSettings, loginWithPassword, saveCapitalSettings, savePlatformCredentials, saveSimulationWallet, saveWalletSettings, setApiAccessToken } from "./alphaApi";
 
 const apiBase = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
 
@@ -15,6 +15,29 @@ afterEach(async () => {
 });
 
 describe("Alpha Trader API 适配器", () => {
+  it("本地 HTTP 测试窗使用短期 Bearer 会话完成登录", async () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("location", { protocol: "http:" });
+    vi.stubGlobal("sessionStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    });
+    const sessionToken = "ats1.valid.nonce.signature";
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      authorized: true,
+      token: sessionToken,
+    }), { status: 200, headers: { "content-type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(loginWithPassword("owner", "correct-password")).resolves.toBe(sessionToken);
+    expect(fetchMock).toHaveBeenCalledWith(`${apiBase}/auth/password/login`, expect.objectContaining({
+      credentials: "omit",
+      body: JSON.stringify({ username: "owner", password: "correct-password", transport: "bearer" }),
+    }));
+    expect(values.get("alpha-owner-api-token")).toBe(sessionToken);
+  });
+
   it("拒绝通过远程明文 HTTP 提交交易所凭证", () => {
     vi.stubGlobal("isSecureContext", false);
 

@@ -19,6 +19,12 @@ const MISSED_ENTRY_CONFIRMATIONS = 2;
 const MAX_DECISION_REVISIONS = 3;
 const MAX_MISSED_ENTRY_ATR = 0.5;
 const MAX_TARGET_PROGRESS = 0.5;
+const CANDLE_REQUEST_MAX_ATTEMPTS = 3;
+const CANDLE_RETRY_BASE_MS = 400;
+const CANDLE_RETRY_MAX_MS = 3_000;
+const CANDLE_FETCH_CONCURRENCY = 2;
+const CANDLE_RETRIABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+const DECISION_SCAN_CACHE_MS = 360_000;
 const TECHNICAL_RULES = {
   minimumEmaSpreadPercent: 0.1,
   maximumEmaSpreadAtrFactor: 0.25,
@@ -123,7 +129,12 @@ async function requestHyperliquid(payload) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!response.ok) throw new Error(`Hyperliquid 请求失败：${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`Hyperliquid 请求失败：${response.status}`);
+    error.status = response.status;
+    error.retryAfter = response.headers.get("retry-after");
+    throw error;
+  }
   return response.json();
 }
 
@@ -155,8 +166,34 @@ async function getHyperliquidMarkets() {
 
 async function requestJson(url, init) {
   const response = await fetch(url, init);
-  if (!response.ok) throw new Error(`公开行情请求失败：${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`公开行情请求失败：${response.status}`);
+    error.status = response.status;
+    error.retryAfter = response.headers.get("retry-after");
+    throw error;
+  }
   return response.json();
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(items[index], index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 async function getPlatformMarket(symbol, platform) {
@@ -227,38 +264,58 @@ async function getCandles(symbol, interval, limit, platform = "hyperliquid") {
   const intervalMs = INTERVAL_MS[interval];
   if (!intervalMs) return null;
   const endTime = Date.now();
-  try {
-    if (platform === "binance") {
-      const items = await requestJson(
-        `${BINANCE_FUTURES_URL}/fapi/v1/klines?symbol=${symbol}USDT&interval=${interval}&limit=${Math.min(limit, 1500)}`,
-      );
+  for (let attempt = 0; attempt < CANDLE_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      if (platform === "binance") {
+        const items = await requestJson(
+          `${BINANCE_FUTURES_URL}/fapi/v1/klines?symbol=${symbol}USDT&interval=${interval}&limit=${Math.min(limit, 1500)}`,
+        );
+        return items.map((item) => ({
+          open_time: Number(item[0]), close_time: Number(item[6]), open: Number(item[1]),
+          high: Number(item[2]), low: Number(item[3]), close: Number(item[4]), volume: Number(item[5]),
+        })).sort((left, right) => left.open_time - right.open_time);
+      }
+      if (platform === "okx") {
+        const okxInterval = { "1h": "1H", "4h": "4H", "1d": "1Dutc" }[interval] || interval;
+        const payload = await requestJson(
+          `${OKX_API_URL}/api/v5/market/candles?instId=${symbol}-USDT-SWAP&bar=${okxInterval}&limit=${Math.min(limit, 300)}`,
+        );
+        return (payload.data || []).map((item) => ({
+          open_time: Number(item[0]), close_time: Number(item[0]) + intervalMs - 1,
+          open: Number(item[1]), high: Number(item[2]), low: Number(item[3]),
+          close: Number(item[4]), volume: Number(item[5]),
+        })).sort((left, right) => left.open_time - right.open_time);
+      }
+      const items = await requestHyperliquid({
+        type: "candleSnapshot",
+        req: { coin: symbol, interval, startTime: endTime - intervalMs * limit, endTime },
+      });
       return items.map((item) => ({
-        open_time: Number(item[0]), close_time: Number(item[6]), open: Number(item[1]),
-        high: Number(item[2]), low: Number(item[3]), close: Number(item[4]), volume: Number(item[5]),
+        open_time: item.t, close_time: item.T, open: Number(item.o), high: Number(item.h),
+        low: Number(item.l), close: Number(item.c), volume: Number(item.v),
       })).sort((left, right) => left.open_time - right.open_time);
+    } catch (error) {
+      const retriable = CANDLE_RETRIABLE_STATUS_CODES.has(Number(error?.status));
+      if (retriable && attempt + 1 < CANDLE_REQUEST_MAX_ATTEMPTS) {
+        const retryAfterSeconds = Number(error?.retryAfter);
+        const delay = Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+          ? Math.min(CANDLE_RETRY_MAX_MS, retryAfterSeconds * 1_000)
+          : Math.min(CANDLE_RETRY_MAX_MS, CANDLE_RETRY_BASE_MS * (2 ** attempt));
+        console.warn(`${platform} K 线请求返回 ${error.status}，第 ${attempt + 1}/${CANDLE_REQUEST_MAX_ATTEMPTS} 次尝试后等待 ${delay} 毫秒重试`);
+        await wait(delay);
+        continue;
+      }
+      console.warn(`${platform} ${symbol} K 线数据获取失败，本轮不生成该市场决策`);
+      return [];
     }
-    if (platform === "okx") {
-      const okxInterval = { "1h": "1H", "4h": "4H", "1d": "1Dutc" }[interval] || interval;
-      const payload = await requestJson(
-        `${OKX_API_URL}/api/v5/market/candles?instId=${symbol}-USDT-SWAP&bar=${okxInterval}&limit=${Math.min(limit, 300)}`,
-      );
-      return (payload.data || []).map((item) => ({
-        open_time: Number(item[0]), close_time: Number(item[0]) + intervalMs - 1,
-        open: Number(item[1]), high: Number(item[2]), low: Number(item[3]),
-        close: Number(item[4]), volume: Number(item[5]),
-      })).sort((left, right) => left.open_time - right.open_time);
-    }
-    const items = await requestHyperliquid({
-      type: "candleSnapshot",
-      req: { coin: symbol, interval, startTime: endTime - intervalMs * limit, endTime },
-    });
-    return items.map((item) => ({
-      open_time: item.t, close_time: item.T, open: Number(item.o), high: Number(item.h),
-      low: Number(item.l), close: Number(item.c), volume: Number(item.v),
-    })).sort((left, right) => left.open_time - right.open_time);
-  } catch {
-    return [];
   }
+  return [];
+}
+
+function hasCompleteTrendData(decision) {
+  return decision?.source === "live"
+    && [decision?.indicators?.ema20, decision?.indicators?.ema50, decision?.indicators?.ema200]
+    .every(Number.isFinite);
 }
 
 function ema(values, period) {
@@ -721,10 +778,13 @@ async function readDecisionPlans(env, ownerId, platform, timeframe) {
   if (!env.DB || !ownerId) return null;
   try {
     const row = await env.DB.prepare(`
-      SELECT scan_json FROM owner_decision_plan_scans
+      SELECT scan_json, updated_at FROM owner_decision_plan_scans
       WHERE owner_id = ? AND platform = ? AND timeframe = ?
     `).bind(ownerId, platform, timeframe).first();
-    return row?.scan_json ? JSON.parse(row.scan_json) : null;
+    return row?.scan_json ? {
+      scan: JSON.parse(row.scan_json),
+      storedAt: Number(row.updated_at || 0),
+    } : null;
   } catch (error) {
     console.error("边缘决策计划读取失败", error);
     return null;
@@ -753,6 +813,7 @@ function readEdgeHistoryPolicy(request, platform) {
     return {
       threshold_adjustment: Math.max(-2, Math.min(4, Number(raw.threshold_adjustment) || 0)),
       risk_multiplier: Math.max(0.5, Math.min(1.05, Number(raw.risk_multiplier) || 1)),
+      fingerprint: typeof raw.fingerprint === "string" ? raw.fingerprint : "baseline",
     };
   } catch {
     return null;
@@ -797,21 +858,67 @@ async function handleApi(request, url, env) {
     if (!Number.isFinite(totalAmount) || totalAmount <= 0) return json({ detail: "缺少已验证的资金设置" }, 503);
     const limit = Math.min(4, Math.max(1, Number(url.searchParams.get("limit") || 4)));
     const timeframe = INTERVAL_MS[url.searchParams.get("timeframe")] ? url.searchParams.get("timeframe") : "4h";
+    const ownerId = request.headers.get("x-alpha-owner-id");
+    const historyPolicy = readEdgeHistoryPolicy(request, platform);
+    const historyFingerprint = historyPolicy?.fingerprint || "baseline";
+    const storedPrevious = await readDecisionPlans(env, ownerId, platform, timeframe);
+    const previous = storedPrevious?.scan || null;
+    const cachedOpportunities = (previous?.opportunities || []).filter(hasCompleteTrendData);
+    const forceRefresh = url.searchParams.get("force_refresh") === "true";
+    const cacheMatchesRequest = previous?.platform === platform
+      && Number(previous?.total_amount) === totalAmount
+      && previous?.history_fingerprint === historyFingerprint
+      && cachedOpportunities.length > 0
+      && cachedOpportunities.length === previous.opportunities.length;
+    if (!forceRefresh && cacheMatchesRequest
+      && storedPrevious.storedAt > Date.now() - DECISION_SCAN_CACHE_MS) {
+      return json({
+        ...previous,
+        opportunities: cachedOpportunities.slice(0, limit),
+        scan_source: "scheduled_cache",
+      });
+    }
     const markets = await getMarkets(platform);
     const eligible = markets.filter((market) => market.volume >= 500_000 && market.open_interest >= 250_000);
-    const historyPolicy = readEdgeHistoryPolicy(request, platform);
+    const indicatorCandidates = [...eligible]
+      .sort((left, right) => right.volume - left.volume || Math.abs(right.change_24h) - Math.abs(left.change_24h))
+      .slice(0, Math.max(limit * 2, 12));
     const candlesBySymbol = new Map();
-    const refreshed = (await Promise.all(eligible.map(async (market) => {
+    const analyzed = await mapWithConcurrency(indicatorCandidates, CANDLE_FETCH_CONCURRENCY, async (market) => {
       const candles = await getCandles(market.symbol, timeframe, 205, platform) || [];
       candlesBySymbol.set(market.symbol, candles);
       return analyzeMarket(market, totalAmount, calculateTechnicalIndicators(candles), historyPolicy);
-    })))
+    });
+    const dataUnavailableMarkets = analyzed.filter((item) => !hasCompleteTrendData(item)).length;
+    const refreshed = analyzed
+      .filter(hasCompleteTrendData)
       .sort((a, b) => b.score - a.score)
       .slice(0, Math.max(limit * 2, 12));
-    const ownerId = request.headers.get("x-alpha-owner-id");
-    const previous = await readDecisionPlans(env, ownerId, platform, timeframe);
+    if (refreshed.length === 0) {
+      const previousOpportunities = (previous?.opportunities || [])
+        .filter(hasCompleteTrendData)
+        .slice(0, limit)
+        .map((item) => ({
+          ...item,
+          decision_status: "confirming",
+          is_executable: false,
+          status_reason: "最新 K 线暂不可用，保留上次有效计划但暂停执行",
+          reasons: ["最新 K 线暂不可用，保留上次有效计划但暂停执行", ...(item.reasons || [])],
+        }));
+      return json({
+        scanned_markets: markets.length,
+        eligible_markets: eligible.length,
+        updated_at: previousOpportunities.length > 0 ? previous.updated_at : new Date().toISOString(),
+        opportunities: previousOpportunities,
+        scan_source: previousOpportunities.length > 0 ? "scheduled_cache" : "edge_live_scan",
+        platform,
+        total_amount: totalAmount,
+        history_fingerprint: historyFingerprint,
+        data_unavailable_markets: dataUnavailableMarkets,
+      });
+    }
     const previousBySymbol = new Map((previous?.opportunities || []).map((item) => [item.symbol, item]));
-    const priceBySymbol = new Map(eligible.map((market) => [market.symbol, market.price]));
+    const priceBySymbol = new Map(indicatorCandidates.map((market) => [market.symbol, market.price]));
     const opportunities = refreshed
       .map((item) => previousBySymbol.has(item.symbol)
         ? refreshDecisionPlan(
@@ -823,7 +930,17 @@ async function handleApi(request, url, env) {
         || Number(b.decision_status === "watching") - Number(a.decision_status === "watching")
         || b.score - a.score)
       .slice(0, limit);
-    const scan = { scanned_markets: markets.length, eligible_markets: eligible.length, updated_at: new Date().toISOString(), opportunities, scan_source: "edge_live_scan", platform };
+    const scan = {
+      scanned_markets: markets.length,
+      eligible_markets: eligible.length,
+      updated_at: new Date().toISOString(),
+      opportunities,
+      scan_source: "edge_live_scan",
+      platform,
+      total_amount: totalAmount,
+      history_fingerprint: historyFingerprint,
+      data_unavailable_markets: dataUnavailableMarkets,
+    };
     await writeDecisionPlans(env, ownerId, platform, timeframe, scan);
     return json(scan);
   }

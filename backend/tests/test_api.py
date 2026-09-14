@@ -247,24 +247,35 @@ def test_ai_opportunities_are_ranked(monkeypatch):
         assert platform == "hyperliquid"
         return markets
 
-    async def fake_get_candles(symbol: str, _interval: str, _limit: int, _platform: str):
-        market_price = next(market.price for market in markets if market.symbol == symbol)
-        def relative_price(index: int) -> float:
-            pullback = 0.003 if index % 2 == 0 else -0.003
-            return 0.85 + index / 239 * 0.15 + pullback
+    active_candle_requests = 0
+    maximum_candle_requests = 0
 
-        return [
-            Candle(
-                open_time=index * 60_000,
-                close_time=(index + 1) * 60_000,
-                open=market_price * relative_price(index),
-                high=market_price * (relative_price(index) + 0.002),
-                low=market_price * (relative_price(index) - 0.002),
-                close=market_price * relative_price(index),
-                volume=1_000,
-            )
-            for index in range(240)
-        ]
+    async def fake_get_candles(symbol: str, _interval: str, _limit: int, _platform: str):
+        nonlocal active_candle_requests, maximum_candle_requests
+        active_candle_requests += 1
+        maximum_candle_requests = max(maximum_candle_requests, active_candle_requests)
+        try:
+            await asyncio.sleep(0.01)
+            market_price = next(market.price for market in markets if market.symbol == symbol)
+
+            def relative_price(index: int) -> float:
+                pullback = 0.003 if index % 2 == 0 else -0.003
+                return 0.85 + index / 239 * 0.15 + pullback
+
+            return [
+                Candle(
+                    open_time=index * 60_000,
+                    close_time=(index + 1) * 60_000,
+                    open=market_price * relative_price(index),
+                    high=market_price * (relative_price(index) + 0.002),
+                    low=market_price * (relative_price(index) - 0.002),
+                    close=market_price * relative_price(index),
+                    volume=1_000,
+                )
+                for index in range(240)
+            ]
+        finally:
+            active_candle_requests -= 1
 
     monkeypatch.setattr("app.market_scanner.read_scan_cache", lambda *_args: None)
     monkeypatch.setattr("app.market_scanner.read_decision_plan_cache", lambda *_args: None)
@@ -289,6 +300,40 @@ def test_ai_opportunities_are_ranked(monkeypatch):
     top_opportunity = payload["opportunities"][0]
     assert top_opportunity["entry_range"][0] != top_opportunity["entry_range"][1]
     assert top_opportunity["stop_loss"] < top_opportunity["entry_range"][0]
+    assert maximum_candle_requests <= 2
+
+
+def test_ai_opportunities_exclude_markets_without_complete_candles(monkeypatch):
+    markets = [
+        MarketSnapshot(
+            symbol=symbol, price=100, change_24h=2, volume=2_000_000,
+            volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+        )
+        for symbol in ("BTC", "ETH", "SOL", "HYPE")
+    ]
+    plan_writes: list[object] = []
+
+    async def fake_get_live_markets(_platform: str):
+        return markets
+
+    monkeypatch.setattr("app.market_scanner.read_scan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.read_decision_plan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.acquire_scan_lock", lambda *_args: "lease")
+    monkeypatch.setattr("app.market_scanner.release_scan_lock", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.write_timeframe_scan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.write_decision_plan_cache", lambda *args: plan_writes.append(args))
+    monkeypatch.setattr("app.market_scanner.get_live_markets", fake_get_live_markets)
+    monkeypatch.setattr(
+        "app.market_scanner.get_candles", lambda *_args: asyncio.sleep(0, result=[])
+    )
+
+    response = client.get("/api/v1/ai/opportunities?timeframe=4h")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["opportunities"] == []
+    assert payload["data_unavailable_markets"] == 4
+    assert plan_writes == []
 
 
 def test_ai_opportunities_can_force_refresh(monkeypatch):

@@ -137,6 +137,50 @@ def test_okx_candles_are_normalized_to_ascending_order(monkeypatch):
     assert candles[0].close == 110
 
 
+def test_candles_retry_after_rate_limit(monkeypatch):
+    attempts = 0
+    delays: list[float] = []
+
+    class Response:
+        headers = {"retry-after": "0.01"}
+
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise services.httpx.HTTPStatusError(
+                    "请求失败", request=services.httpx.Request("POST", "https://example.test"), response=self
+                )
+
+        def json(self):
+            return [{"t": 1000, "T": 1999, "o": "100", "h": "110", "l": "90", "c": "105", "v": "10"}]
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, json):
+            nonlocal attempts
+            attempts += 1
+            return Response(429 if attempts == 1 else 200)
+
+    async def fake_sleep(delay: float):
+        delays.append(delay)
+
+    monkeypatch.setattr(services.httpx, "AsyncClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(services.asyncio, "sleep", fake_sleep)
+
+    candles = asyncio.run(services.get_candles("BTC", "4h", 220))
+
+    assert attempts == 2
+    assert delays == [0.01]
+    assert candles[0].close == 105
+
+
 def test_okx_market_converts_base_volume_to_quote_value(monkeypatch):
     responses = iter([
         {"data": [{"last": "100", "open24h": "98", "volCcy24h": "12500"}]},

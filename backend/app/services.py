@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -44,6 +45,10 @@ SHORT_RSI_EXHAUSTION = 25
 EMA_SLOPE_LOOKBACK = 3
 MIN_VOLUME_RATIO = 0.5
 MAX_CROWDED_FUNDING_RATE = 0.05
+CANDLE_REQUEST_MAX_ATTEMPTS = 3
+CANDLE_RETRY_BASE_SECONDS = 0.4
+CANDLE_RETRY_MAX_SECONDS = 3.0
+CANDLE_RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 MIN_ATR_PRICE_RATE = 0.0025
 MAX_ATR_PRICE_RATE = 0.03
 ENTRY_ATR_NEAR = 0.25
@@ -314,20 +319,39 @@ async def get_candles(
     end_time = int(time.time() * 1000)
     try:
         async with httpx.AsyncClient(timeout=4.0) as client:
-            if platform == "binance":
-                response = await client.get(
-                    f"{BINANCE_FUTURES_URL}/fapi/v1/klines",
-                    params={"symbol": f"{symbol.upper()}USDT", "interval": interval, "limit": limit},
+            for attempt in range(CANDLE_REQUEST_MAX_ATTEMPTS):
+                if platform == "binance":
+                    response = await client.get(
+                        f"{BINANCE_FUTURES_URL}/fapi/v1/klines",
+                        params={"symbol": f"{symbol.upper()}USDT", "interval": interval, "limit": limit},
+                    )
+                elif platform == "okx":
+                    okx_interval = {"1h": "1H", "4h": "4H", "1d": "1Dutc"}.get(interval, interval)
+                    response = await client.get(
+                        f"{OKX_API_URL}/api/v5/market/candles",
+                        params={"instId": f"{symbol.upper()}-USDT-SWAP", "bar": okx_interval, "limit": min(limit, 300)},
+                    )
+                else:
+                    payload = {"type": "candleSnapshot", "req": {"coin": symbol.upper(), "interval": interval, "startTime": end_time - interval_ms * limit, "endTime": end_time}}
+                    response = await client.post(HYPERLIQUID_INFO_URL, json=payload)
+                status_code = getattr(response, "status_code", 200)
+                if status_code not in CANDLE_RETRIABLE_STATUS_CODES or attempt + 1 >= CANDLE_REQUEST_MAX_ATTEMPTS:
+                    break
+                retry_after = getattr(response, "headers", {}).get("retry-after")
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = CANDLE_RETRY_BASE_SECONDS * (2 ** attempt)
+                delay = max(0.0, min(CANDLE_RETRY_MAX_SECONDS, delay))
+                logger.warning(
+                    "%s K 线请求返回 %s，第 %s/%s 次尝试后等待 %.2f 秒重试",
+                    platform,
+                    status_code,
+                    attempt + 1,
+                    CANDLE_REQUEST_MAX_ATTEMPTS,
+                    delay,
                 )
-            elif platform == "okx":
-                okx_interval = {"1h": "1H", "4h": "4H", "1d": "1Dutc"}.get(interval, interval)
-                response = await client.get(
-                    f"{OKX_API_URL}/api/v5/market/candles",
-                    params={"instId": f"{symbol.upper()}-USDT-SWAP", "bar": okx_interval, "limit": min(limit, 300)},
-                )
-            else:
-                payload = {"type": "candleSnapshot", "req": {"coin": symbol.upper(), "interval": interval, "startTime": end_time - interval_ms * limit, "endTime": end_time}}
-                response = await client.post(HYPERLIQUID_INFO_URL, json=payload)
+                await asyncio.sleep(delay)
             response.raise_for_status()
         data = response.json()
         if platform == "binance":

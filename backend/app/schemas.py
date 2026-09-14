@@ -179,6 +179,7 @@ class OpportunityScanResponse(BaseModel):
     scan_source: Literal["live_scan", "scheduled_cache"] = "live_scan"
     platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
     total_amount: float | None = None
+    data_unavailable_markets: int = Field(default=0, ge=0)
 
 
 class CapitalSettingsUpdate(BaseModel):

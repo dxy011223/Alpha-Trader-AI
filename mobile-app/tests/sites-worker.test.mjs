@@ -978,29 +978,8 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
 
     assert.equal(response.status, 200);
     const payload = await response.json();
-    assert.equal(payload.opportunities.length, 4);
-    assert.ok(payload.opportunities.every((item) => item.analysis_engine === "rules"));
-    assert.ok(payload.opportunities.every((item) => item.reference_price > 0));
-    assert.ok(payload.opportunities.every((item) => item.is_executable === false));
-    assert.ok(payload.opportunities.every((item) => item.direction === "WAIT"));
-    assert.ok(payload.opportunities.every((item) => item.position_sizing.margin_amount === 0));
-    assert.ok(payload.opportunities.every((item) => item.status_reason.includes("均线方向不明确")));
-
-    const firstPlan = payload.opportunities[0];
-    await worker.fetch(new Request("https://example.test/api/v1/settings/capital", {
-      method: "PUT",
-      headers: { "content-type": "application/json", ...authHeaders },
-      body: JSON.stringify({ total_amount: 20_000 }),
-    }), env);
-    const rescanned = await worker.fetch(new Request(
-      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
-      { headers: authHeaders },
-    ), env);
-    const updatedPlan = (await rescanned.json()).opportunities.find((item) => item.symbol === firstPlan.symbol);
-    assert.deepEqual(updatedPlan.entry_range, firstPlan.entry_range);
-    assert.deepEqual(updatedPlan.take_profit, firstPlan.take_profit);
-    assert.equal(firstPlan.position_sizing.margin_amount, 0);
-    assert.equal(updatedPlan.position_sizing.margin_amount, 0);
+    assert.deepEqual(payload.opportunities, []);
+    assert.equal(payload.data_unavailable_markets, 4);
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;
@@ -1194,11 +1173,8 @@ test("serves public market data and keeps a rule fallback when the Python backen
     ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
     assert.equal(edgeRules.status, 200);
     const edgePayload = await edgeRules.json();
-    assert.equal(edgePayload.opportunities.length, 4);
-    assert.ok(edgePayload.opportunities.every((item) => item.analysis_engine === "rules"));
-    assert.ok(edgePayload.opportunities.every((item) => item.direction === "WAIT"));
-    assert.ok(edgePayload.opportunities.every((item) => item.position_sizing.margin_amount === 0));
-    assert.ok(edgePayload.opportunities.every((item) => item.status_reason.includes("均线方向不明确")));
+    assert.deepEqual(edgePayload.opportunities, []);
+    assert.equal(edgePayload.data_unavailable_markets, 4);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1221,6 +1197,8 @@ test("calculates complete edge gates and safely revises a missed entry without t
   });
   const lastPrice = candles.at(-1).c;
   let marketScanCount = 0;
+  const candleAttempts = new Map();
+  let rejectCandles = false;
   globalThis.fetch = async (_url, init) => {
     const payload = JSON.parse(init.body);
     if (payload.type === "metaAndAssetCtxs") {
@@ -1237,16 +1215,43 @@ test("calculates complete edge gates and safely revises a missed entry without t
         })),
       ]);
     }
+    const symbol = payload.req.coin;
+    const attempts = (candleAttempts.get(symbol) || 0) + 1;
+    candleAttempts.set(symbol, attempts);
+    if (rejectCandles) {
+      return Response.json({ detail: "持续限流" }, {
+        status: 429,
+        headers: { "retry-after": "0" },
+      });
+    }
+    if (attempts === 1) {
+      return Response.json({ detail: "请求过多" }, {
+        status: 429,
+        headers: { "retry-after": "0" },
+      });
+    }
     return Response.json(candles);
   };
   try {
     const DB = createSimulationDatabase();
     const env = { DB, OWNER_API_TOKEN: OWNER_TOKEN };
-    const scan = () => worker.fetch(new Request(
-      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
-      { headers: authHeaders },
+    const bearerEnrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ transport: "bearer" }),
+    }), env);
+    const androidHeaders = { authorization: `Bearer ${(await bearerEnrollment.json()).token}` };
+    const cookieEnrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ transport: "cookie" }),
+    }), env);
+    const webHeaders = { cookie: cookieEnrollment.headers.get("set-cookie").split(";", 1)[0] };
+    const scan = (headers, forceRefresh = false) => worker.fetch(new Request(
+      `https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4${forceRefresh ? "&force_refresh=true" : ""}`,
+      { headers },
     ), env, {});
-    const response = await scan();
+    const response = await scan(androidHeaders);
     const payload = await response.json();
     assert.equal(response.status, 200);
     assert.equal(payload.scan_source, "edge_live_scan");
@@ -1255,8 +1260,15 @@ test("calculates complete edge gates and safely revises a missed entry without t
     assert.ok(payload.opportunities.every((item) => !item.status_reason.includes("数据不足")));
     assert.ok(payload.opportunities.every((item) => item.direction === "LONG"));
     assert.ok(payload.opportunities.every((item) => item.decision_revision === 1));
+    assert.ok([...candleAttempts.values()].every((attempts) => attempts === 2));
 
-    const confirmingMiss = await (await scan()).json();
+    const sharedWebSnapshot = await (await scan(webHeaders)).json();
+    assert.equal(sharedWebSnapshot.scan_source, "scheduled_cache");
+    assert.equal(sharedWebSnapshot.updated_at, payload.updated_at);
+    assert.deepEqual(sharedWebSnapshot.opportunities, payload.opportunities);
+    assert.equal(marketScanCount, 1);
+
+    const confirmingMiss = await (await scan(androidHeaders, true)).json();
     assert.ok(
       confirmingMiss.opportunities.every((item) => item.decision_status === "missed_entry"),
       JSON.stringify(confirmingMiss.opportunities.map((item) => ({
@@ -1265,12 +1277,20 @@ test("calculates complete edge gates and safely revises a missed entry without t
     );
     assert.ok(confirmingMiss.opportunities.every((item) => item.missed_entry_count === 1));
 
-    const revised = await (await scan()).json();
+    const revised = await (await scan(webHeaders, true)).json();
     assert.ok(revised.opportunities.every((item) => item.decision_revision === 2));
     assert.ok(revised.opportunities.every((item) => item.revision_history.length === 1));
     assert.ok(revised.opportunities.every((item, index) => (
       item.plan_id === payload.opportunities[index].plan_id
     )));
+
+    rejectCandles = true;
+    const paused = await (await scan(androidHeaders, true)).json();
+    assert.equal(paused.scan_source, "scheduled_cache");
+    assert.equal(paused.data_unavailable_markets, 4);
+    assert.ok(paused.opportunities.every((item) => item.decision_status === "confirming"));
+    assert.ok(paused.opportunities.every((item) => item.is_executable === false));
+    assert.ok(paused.opportunities.every((item) => item.status_reason.includes("暂停执行")));
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1361,7 +1381,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.9"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.10"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

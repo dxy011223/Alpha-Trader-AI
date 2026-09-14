@@ -246,11 +246,16 @@ test.beforeEach(async ({ page }) => {
     }
     if (url.pathname.endsWith("/ai/opportunities")) {
       const platform = url.searchParams.get("platform") ?? "hyperliquid";
+      const symbols = platform === "binance"
+        ? ["BNB", "XRP", "DOGE", "SOL"]
+        : platform === "okx"
+          ? ["OKB", "BTC", "ETH", "SOL"]
+          : ["ETH", "SOL", "DOGE", "HYPE"];
       await route.fulfill({ json: {
         scanned_markets: 20,
         eligible_markets: 8,
         updated_at: "2026-09-11T00:00:00Z",
-        opportunities: [analysis("ETH", platform), analysis("SOL", platform), analysis("DOGE", platform), analysis("HYPE", platform)],
+        opportunities: symbols.map((symbol) => analysis(symbol, platform)),
         platform,
       } });
       return;
@@ -296,10 +301,83 @@ test("机会扫描失败会显示原因并可手动重试", async ({ page }) => 
   await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
 });
 
+test("K 线全部不可用时不展示伪机会并提示重新扫描", async ({ page }) => {
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    await route.fulfill({ json: {
+      scanned_markets: 80,
+      eligible_markets: 12,
+      data_unavailable_markets: 12,
+      updated_at: "2026-09-14T00:00:00Z",
+      opportunities: [],
+      scan_source: "live_scan",
+      platform: "hyperliquid",
+    } });
+  });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+
+  await expect(page.getByRole("alert")).toContainText("K 线行情暂不可用，12 个候选未生成决策");
+  await expect(page.getByRole("button", { name: "重新扫描" })).toBeVisible();
+});
+
+test("旧接口混入回退数据时仅展示当前平台真实决策", async ({ page }) => {
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    await route.fulfill({ json: {
+      scanned_markets: 80,
+      eligible_markets: 12,
+      updated_at: "2026-09-14T00:00:00Z",
+      opportunities: [
+        analysis("ETH"),
+        { ...analysis("BTC"), source: "demo" },
+        { ...analysis("SOL"), source: "demo" },
+        { ...analysis("BNB", "binance"), source: "demo" },
+      ],
+      scan_source: "live_scan",
+      platform: "hyperliquid",
+    } });
+  });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+
+  await expect(page.getByRole("tab")).toHaveCount(1);
+  await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
+  await expect(page.getByText("3 个 K 线暂不可用")).toBeVisible();
+  await expect(page.getByRole("tab", { name: /BTC|SOL|BNB/ })).toHaveCount(0);
+});
+
+test("WAIT 决策显示继续观察而不是等待入场", async ({ page }) => {
+  const waiting = {
+    ...analysis("BTC"),
+    direction: "WAIT",
+    decision_status: "watching",
+    is_executable: false,
+    status_reason: "技术准入未通过：均线方向不明确",
+  };
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    await route.fulfill({ json: {
+      scanned_markets: 20,
+      eligible_markets: 8,
+      updated_at: "2026-09-14T00:00:00Z",
+      opportunities: [waiting],
+      scan_source: "live_scan",
+      platform: "hyperliquid",
+    } });
+  });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+
+  await expect(page.getByRole("tab", { name: /80 · 继续观察/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "继续观察" })).toBeDisabled();
+});
+
 test("决策页可手动刷新且刷新期间防止重复请求", async ({ page }) => {
   let opportunityRequests = 0;
+  let forcedRequests = 0;
   await page.route("**/api/v1/ai/opportunities**", async (route) => {
     opportunityRequests += 1;
+    if (new URL(route.request().url()).searchParams.get("force_refresh") === "true") {
+      forcedRequests += 1;
+    }
     if (opportunityRequests === 2) {
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
@@ -317,6 +395,7 @@ test("决策页可手动刷新且刷新期间防止重复请求", async ({ page 
   await expect(refreshButton).toBeDisabled();
   await expect(page.getByText("正在刷新市场决策")).toBeVisible();
   await expect.poll(() => opportunityRequests).toBe(2);
+  expect(forcedRequests).toBe(1);
   await expect(refreshButton).toHaveText("手动刷新");
   await expect(refreshButton).toBeEnabled();
 });
@@ -401,6 +480,13 @@ test("持仓页可连接浏览器钱包并同步 Hyperliquid 数据", async ({ p
 test("平台切换会更新所有页面数据并持久化", async ({ page }) => {
   const requestedUrls: string[] = [];
   page.on("request", (request) => requestedUrls.push(request.url()));
+  const navigation = page.locator(".bottom-nav button");
+  await navigation.nth(1).click();
+  await expect(page.getByText("ETH-PERP", { exact: true })).toBeVisible();
+  await navigation.nth(0).click();
+  await page.getByRole("button", { name: "决策", exact: true }).first().click();
+  await expect(page.locator(".decision-market-chart-card")).toHaveCount(4);
+
   await page.getByRole("button", { name: "行情平台设置" }).click();
   await expect(page.getByRole("heading", { name: "设置" })).toBeVisible();
 
@@ -409,12 +495,22 @@ test("平台切换会更新所有页面数据并持久化", async ({ page }) => 
     return url.pathname.endsWith("/market/BTC") && url.searchParams.get("platform") === "binance";
   });
   await page.getByRole("radio", { name: /Binance 永续/ }).click();
+  await expect(page.locator(".decision-market-chart-card")).toHaveCount(0);
+  await page.getByRole("button", { name: "自由", exact: true }).click();
   await binanceRequest;
   await expect(page.getByText(/Binance 永续 · 实时数据/)).toBeVisible();
 
-  const navigation = page.locator(".bottom-nav button");
+  const binanceDecisionRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname.endsWith("/ai/opportunities")
+      && url.searchParams.get("platform") === "binance";
+  });
   await navigation.nth(1).click();
+  const decisionRequest = await binanceDecisionRequest;
+  expect(new URL(decisionRequest.url()).searchParams.get("force_refresh")).toBe(null);
   await expect(page.getByText("Binance 永续 · 策略决策引擎")).toBeVisible();
+  await expect(page.getByText("BNB-PERP", { exact: true })).toBeVisible();
+  await expect(page.getByText("ETH-PERP", { exact: true })).toHaveCount(0);
   await navigation.nth(2).click();
   await expect(page.getByText("Binance 永续 · 新闻雷达")).toBeVisible();
   await navigation.nth(3).click();

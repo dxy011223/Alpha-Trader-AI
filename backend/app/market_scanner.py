@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete
@@ -13,6 +14,15 @@ from app.services import MarketPlatform, analyze_market, calculate_technical_ind
 
 
 _scan_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+CANDLE_FETCH_CONCURRENCY = 2
+logger = logging.getLogger(__name__)
+
+
+def _has_complete_trend_data(decision) -> bool:
+    indicators = decision.indicators
+    return decision.source == "live" and indicators is not None and all(
+        value is not None for value in (indicators.ema20, indicators.ema50, indicators.ema200)
+    )
 
 
 class MarketScanBusy(RuntimeError):
@@ -40,12 +50,16 @@ async def compute_market_scan(
         key=lambda item: (item.volume, abs(item.change_24h)),
         reverse=True,
     )[: max(limit * 2, 12)]
+    candle_semaphore = asyncio.Semaphore(CANDLE_FETCH_CONCURRENCY)
+
+    async def load_candidate_candles(symbol: str):
+        async with candle_semaphore:
+            return await get_candles(symbol, timeframe, 220, platform)
+
     candle_sets = await asyncio.gather(*(
-        get_candles(market.symbol, timeframe, 220, platform)
-        for market in indicator_candidates
+        load_candidate_candles(market.symbol) for market in indicator_candidates
     ))
-    refreshed_decisions = sorted(
-        (
+    analyzed_decisions = [
             analyze_market(
                 AnalysisRequest(symbol=market.symbol, timeframe=timeframe, platform=platform),
                 market.model_copy(update={"volatility": indicators.atr_percent})
@@ -56,7 +70,12 @@ async def compute_market_scan(
             )
             for market, candles in zip(indicator_candidates, candle_sets, strict=True)
             for indicators in [calculate_technical_indicators(candles)]
-        ),
+    ]
+    data_unavailable_markets = sum(
+        not _has_complete_trend_data(item) for item in analyzed_decisions
+    )
+    refreshed_decisions = sorted(
+        (item for item in analyzed_decisions if _has_complete_trend_data(item)),
         key=lambda item: item.score,
         reverse=True,
     )
@@ -68,6 +87,30 @@ async def compute_market_scan(
     previous_by_symbol = {
         item.symbol: item for item in previous_scan.opportunities
     } if previous_scan else {}
+    if not refreshed_decisions:
+        previous_opportunities = [
+            item.model_copy(update={
+                "decision_status": "confirming",
+                "is_executable": False,
+                "status_reason": "最新 K 线暂不可用，保留上次有效计划但暂停执行",
+                "reasons": [
+                    "最新 K 线暂不可用，保留上次有效计划但暂停执行",
+                    *item.reasons,
+                ],
+            })
+            for item in (previous_scan.opportunities if previous_scan else [])
+            if _has_complete_trend_data(item)
+        ][:limit]
+        return OpportunityScanResponse(
+            scanned_markets=len(markets),
+            eligible_markets=len(eligible_markets),
+            updated_at=previous_scan.updated_at if previous_opportunities else datetime.now(UTC).isoformat(),
+            opportunities=previous_opportunities,
+            scan_source="scheduled_cache" if previous_opportunities else "live_scan",
+            platform=platform,
+            total_amount=total_amount,
+            data_unavailable_markets=data_unavailable_markets,
+        )
     market_by_symbol = {market.symbol: market for market in indicator_candidates}
     candles_by_symbol = {
         market.symbol: candles
@@ -97,6 +140,7 @@ async def compute_market_scan(
         scan_source="live_scan",
         platform=platform,
         total_amount=total_amount,
+        data_unavailable_markets=data_unavailable_markets,
     )
     await asyncio.to_thread(
         write_decision_plan_cache, timeframe, scan, history_scope_key
@@ -119,7 +163,12 @@ async def get_cached_or_compute_market_scan(
         cached = await asyncio.to_thread(
             read_scan_cache, timeframe, limit, platform, total_amount, history_key
         )
-        if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
+        if (
+            cached is not None
+            and bool(cached.opportunities)
+            and all(_has_complete_trend_data(item) for item in cached.opportunities)
+            and all(item.analysis_engine == "rules" for item in cached.opportunities)
+        ):
             return cached
     key = (platform, timeframe, history_key)
     lock = _scan_locks.setdefault(key, asyncio.Lock())
@@ -128,7 +177,12 @@ async def get_cached_or_compute_market_scan(
             cached = await asyncio.to_thread(
                 read_scan_cache, timeframe, limit, platform, total_amount, history_key
             )
-            if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
+            if (
+                cached is not None
+                and bool(cached.opportunities)
+                and all(_has_complete_trend_data(item) for item in cached.opportunities)
+                and all(item.analysis_engine == "rules" for item in cached.opportunities)
+            ):
                 return cached
         lease = await asyncio.to_thread(
             acquire_scan_lock, timeframe, platform, total_amount, history_key
@@ -141,7 +195,12 @@ async def get_cached_or_compute_market_scan(
                 cached = await asyncio.to_thread(
                     read_scan_cache, timeframe, limit, platform, total_amount, history_key
                 )
-                if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
+                if (
+                    cached is not None
+                    and bool(cached.opportunities)
+                    and all(_has_complete_trend_data(item) for item in cached.opportunities)
+                    and all(item.analysis_engine == "rules" for item in cached.opportunities)
+                ):
                     return cached
             raise MarketScanBusy("相同市场扫描正在其他实例中运行，请稍后重试")
         if lease is None and get_settings().environment.lower() == "production":
@@ -150,9 +209,10 @@ async def get_cached_or_compute_market_scan(
             scan = await compute_market_scan(
                 timeframe, limit, platform, total_amount, history_policy
             )
-            await asyncio.to_thread(
-                write_timeframe_scan_cache, timeframe, scan, history_key
-            )
+            if scan.scan_source == "live_scan" and scan.opportunities:
+                await asyncio.to_thread(
+                    write_timeframe_scan_cache, timeframe, scan, history_key
+                )
             return scan
         finally:
             if lease:
@@ -172,6 +232,11 @@ async def run_scheduled_market_scan(
     platform: MarketPlatform = "hyperliquid",
 ) -> OpportunityScanResponse:
     scan = await compute_market_scan(timeframe, limit, platform)
+    if not scan.opportunities or scan.scan_source != "live_scan":
+        logger.warning(
+            "定时市场扫描未获得完整 K 线决策，本轮不覆盖历史扫描记录"
+        )
+        return scan
     with SessionLocal.begin() as session:
         session.execute(
             delete(MarketScanRecord).where(

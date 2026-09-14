@@ -155,8 +155,9 @@ export interface OpportunityScanResponse {
   eligible_markets: number;
   updated_at: string;
   opportunities: AnalysisResponse[];
-  scan_source: "live_scan" | "scheduled_cache";
+  scan_source: "live_scan" | "scheduled_cache" | "edge_live_scan";
   platform: MarketPlatform;
+  data_unavailable_markets?: number;
 }
 
 export interface CapitalSettings {
@@ -348,6 +349,14 @@ function usesLocalDevelopmentApi() {
   return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(API_BASE);
 }
 
+function usesBrowserBearerSession() {
+  return !Capacitor.isNativePlatform() && globalThis.location?.protocol === "http:";
+}
+
+function usesBearerSession() {
+  return Capacitor.isNativePlatform() || usesBrowserBearerSession();
+}
+
 async function parseApiError(response: Response, fallback: string) {
   const payload = await response.json().catch(() => null) as { detail?: string } | null;
   return new ApiResponseError(payload?.detail || fallback, response.status);
@@ -369,25 +378,27 @@ async function clearInvalidAccessToken() {
 
 async function exchangeOwnerToken(ownerToken: string) {
   const native = Capacitor.isNativePlatform();
+  const bearer = usesBearerSession();
   const response = await fetch(`${API_BASE}/auth/device`, {
     method: "POST",
-    credentials: native ? "omit" : "same-origin",
+    credentials: bearer ? "omit" : "same-origin",
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
       Authorization: `Bearer ${ownerToken}`,
     },
-    body: JSON.stringify({ transport: native ? "bearer" : "cookie" }),
+    body: JSON.stringify({ transport: bearer ? "bearer" : "cookie" }),
   });
   // 本地 FastAPI 尚未提供设备会话端点时，保留旧的会话级 Bearer 开发方式。
   if (response.status === 404 && usesLocalDevelopmentApi() && !native) return ownerToken;
   if (!response.ok) throw await parseApiError(response, "设备授权失败");
   const payload = await response.json() as { authorized?: boolean; token?: string };
   if (!payload.authorized) throw new Error("设备授权失败");
-  if (!native) return COOKIE_SESSION_MARKER;
+  if (!bearer) return COOKIE_SESSION_MARKER;
   const sessionToken = payload.token?.trim() ?? "";
   if (!sessionToken.startsWith(DEVICE_SESSION_PREFIX)) throw new Error("设备会话格式无效");
-  await OwnerToken.setToken({ token: sessionToken });
+  if (native) await OwnerToken.setToken({ token: sessionToken });
+  else globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, sessionToken);
   return sessionToken;
 }
 
@@ -396,36 +407,38 @@ async function completePasswordAuth(response: Response, fallback: string) {
   const payload = await response.json() as { authorized?: boolean; token?: string };
   if (!payload.authorized) throw new Error(fallback);
   const native = Capacitor.isNativePlatform();
-  const sessionToken = native ? payload.token?.trim() ?? "" : COOKIE_SESSION_MARKER;
-  if (native && !sessionToken.startsWith(DEVICE_SESSION_PREFIX)) throw new Error("设备会话格式无效");
+  const bearer = usesBearerSession();
+  const sessionToken = bearer ? payload.token?.trim() ?? "" : COOKIE_SESSION_MARKER;
+  if (bearer && !sessionToken.startsWith(DEVICE_SESSION_PREFIX)) throw new Error("设备会话格式无效");
   if (native) await OwnerToken.setToken({ token: sessionToken });
-  globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  else if (bearer) globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, sessionToken);
+  else globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
   cachedApiAccessToken = sessionToken;
   apiAccessTokenLoad = Promise.resolve(sessionToken);
   return sessionToken;
 }
 
 export async function loginWithPassword(username: string, password: string) {
-  const native = Capacitor.isNativePlatform();
+  const bearer = usesBearerSession();
   const response = await fetch(`${API_BASE}/auth/password/login`, {
     method: "POST",
-    credentials: native ? "omit" : "same-origin",
+    credentials: bearer ? "omit" : "same-origin",
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ username, password, transport: native ? "bearer" : "cookie" }),
+    body: JSON.stringify({ username, password, transport: bearer ? "bearer" : "cookie" }),
   });
   return completePasswordAuth(response, "账号密码登录失败");
 }
 
 export async function setupPassword(username: string, password: string) {
-  const native = Capacitor.isNativePlatform();
+  const bearer = usesBearerSession();
   const response = await fetch(`${API_BASE}/auth/password/setup`, {
     method: "POST",
-    credentials: native ? "omit" : "same-origin",
+    credentials: bearer ? "omit" : "same-origin",
     headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ username, password, transport: native ? "bearer" : "cookie" }),
+    body: JSON.stringify({ username, password, transport: bearer ? "bearer" : "cookie" }),
   });
   return completePasswordAuth(response, "账号密码设置失败");
 }
@@ -433,7 +446,7 @@ export async function setupPassword(username: string, password: string) {
 export async function loadPasswordAuthStatus() {
   const response = await fetch(`${API_BASE}/auth/password/status`, {
     headers: { Accept: "application/json" },
-    credentials: Capacitor.isNativePlatform() ? "omit" : "same-origin",
+    credentials: usesBearerSession() ? "omit" : "same-origin",
   });
   if (!response.ok) throw await parseApiError(response, "无法检查账号状态");
   return response.json() as Promise<{ setup_required: boolean }>;
@@ -481,7 +494,7 @@ async function validateDeviceSession(token: string) {
 export function getApiAccessToken() {
   if (cachedApiAccessToken !== null) return cachedApiAccessToken;
   if (Capacitor.isNativePlatform()) return "";
-  if (usesLocalDevelopmentApi()) {
+  if (usesBrowserBearerSession() || usesLocalDevelopmentApi()) {
     cachedApiAccessToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY) ?? "";
     return cachedApiAccessToken;
   }
@@ -492,6 +505,13 @@ export function getApiAccessToken() {
 export function loadApiAccessToken(): Promise<string> {
   if (cachedApiAccessToken) return Promise.resolve(cachedApiAccessToken);
   if (!apiAccessTokenLoad) {
+    if (usesBrowserBearerSession()) {
+      const sessionToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY)?.trim() ?? "";
+      cachedApiAccessToken = sessionToken.startsWith(DEVICE_SESSION_PREFIX) ? sessionToken : "";
+      if (!cachedApiAccessToken) globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+      apiAccessTokenLoad = Promise.resolve(cachedApiAccessToken);
+      return apiAccessTokenLoad;
+    }
     if (!Capacitor.isNativePlatform()) {
       const legacyToken = globalThis.sessionStorage?.getItem(API_ACCESS_TOKEN_KEY)?.trim() ?? "";
       apiAccessTokenLoad = (legacyToken ? exchangeOwnerToken(legacyToken) : loadCookieSession())
@@ -553,8 +573,12 @@ export async function setApiAccessToken(token: string) {
     globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
     cachedApiAccessToken = "";
   }
-  // Android 永远不保留主令牌；网页正式环境只保留不可读的 HttpOnly Cookie。
-  globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  // Android 使用安全存储；正式网页使用 HttpOnly Cookie；本地 HTTP 仅保存短期设备会话。
+  if (usesBrowserBearerSession() && cachedApiAccessToken?.startsWith(DEVICE_SESSION_PREFIX)) {
+    globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, cachedApiAccessToken);
+  } else {
+    globalThis.sessionStorage?.removeItem(API_ACCESS_TOKEN_KEY);
+  }
   if (usesLocalDevelopmentApi() && !Capacitor.isNativePlatform() && cachedApiAccessToken === normalized) {
     globalThis.sessionStorage?.setItem(API_ACCESS_TOKEN_KEY, normalized);
   }
@@ -577,7 +601,7 @@ async function request<T>(path: string, init: RequestInit = {}, timeoutMs = REQU
     token = await loadApiAccessToken();
     response = await fetch(`${API_BASE}${path}`, {
       ...init,
-      credentials: Capacitor.isNativePlatform() ? "omit" : "same-origin",
+      credentials: usesBearerSession() ? "omit" : "same-origin",
       signal: controller.signal,
       headers: {
         Accept: "application/json",
