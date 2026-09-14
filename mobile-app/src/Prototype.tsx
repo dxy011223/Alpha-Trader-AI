@@ -903,6 +903,7 @@ function DecisionScreen({
   const [scanStats, setScanStats] = useState({ scanned: 0, eligible: 0 });
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanRetry, setScanRetry] = useState(0);
+  const forceScanRefreshRef = useRef(false);
   const [selectionMode, setSelectionMode] = useState<"auto" | "manual">("auto");
   const [remoteState, setRemoteState] = useState<RemoteState>("loading");
   const [totalAmount, setTotalAmount] = useState(10_000);
@@ -961,14 +962,16 @@ function DecisionScreen({
     }
     const controller = new AbortController();
     let refreshInFlight = false;
+    const forceRefresh = forceScanRefreshRef.current;
+    forceScanRefreshRef.current = false;
     setRemoteState("loading");
     setScanError(null);
 
-    const refresh = async () => {
+    const refresh = async (bypassCache = false) => {
       if (refreshInFlight) return;
       refreshInFlight = true;
       try {
-        const scan = await loadOpportunities(timeframe, controller.signal, platform);
+        const scan = await loadOpportunities(timeframe, controller.signal, platform, bypassCache);
         if (!controller.signal.aborted) {
           const results = scan.opportunities;
           setScanStats({ scanned: scan.scanned_markets, eligible: scan.eligible_markets });
@@ -1000,7 +1003,7 @@ function DecisionScreen({
         refreshInFlight = false;
       }
     };
-    void refresh();
+    void refresh(forceRefresh);
     const intervalId = window.setInterval(() => void refresh(), 30_000);
 
     return () => {
@@ -1082,6 +1085,15 @@ function DecisionScreen({
   const parsedAmount = Number(amountDraft.replace(/,/g, ""));
   const amountIsValid = Number.isFinite(parsedAmount) && parsedAmount > 0 && parsedAmount <= 1_000_000_000;
 
+  const requestManualRefresh = () => {
+    if (remoteState === "loading") return;
+    // 手动刷新仅绕过下一次扫描缓存，定时刷新仍复用缓存以控制请求负载。
+    forceScanRefreshRef.current = true;
+    setRemoteState("loading");
+    setScanError(null);
+    setScanRetry((current) => current + 1);
+  };
+
   const persistTotalAmount = async () => {
     if (simulationEnabled || !amountIsValid || capitalState === "saving") return;
     setCapitalState("saving");
@@ -1121,19 +1133,24 @@ function DecisionScreen({
         <div className="opportunity-radar-heading">
           <div>
             <strong id="opportunity-radar-title">全市场机会雷达</strong>
-            <span>{remoteState === "offline" ? "扫描未完成 · 可手动重试" : scanStats.scanned > 0 ? `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选` : "正在读取全部永续合约市场"}</span>
+            <span aria-live="polite">{remoteState === "offline" ? "扫描未完成 · 可手动重试" : remoteState === "loading" ? (scanStats.scanned > 0 ? "正在刷新市场决策" : "正在读取全部永续合约市场") : `已扫描 ${scanStats.scanned} 个市场 · ${scanStats.eligible} 个通过流动性筛选`}</span>
           </div>
-          <button
-            type="button"
-            aria-pressed={selectionMode === "auto"}
-            className={selectionMode === "auto" ? "active" : ""}
-            onClick={() => {
-              setSelectionMode("auto");
-              setSymbol(candidates[0]?.symbol ?? null);
-            }}
-          >
-            {selectionMode === "auto" ? "自动跟随" : "恢复智能优选"}
-          </button>
+          <div className="opportunity-radar-actions">
+            <button
+              type="button"
+              aria-pressed={selectionMode === "auto"}
+              className={selectionMode === "auto" ? "active" : ""}
+              onClick={() => {
+                setSelectionMode("auto");
+                setSymbol(candidates[0]?.symbol ?? null);
+              }}
+            >
+              {selectionMode === "auto" ? "自动跟随" : "恢复智能优选"}
+            </button>
+            <button type="button" disabled={remoteState === "loading"} onClick={requestManualRefresh}>
+              {remoteState === "loading" ? "刷新中…" : "手动刷新"}
+            </button>
+          </div>
         </div>
         <div className="opportunity-switcher" role="tablist" aria-label="AI 机会排名">
           {visibleCandidates.length > 0 ? visibleCandidates.map((candidate, index) => {
@@ -1157,7 +1174,7 @@ function DecisionScreen({
           }) : remoteState === "offline" ? (
             <div className="opportunity-loading error" role="alert">
               <span>{scanError ?? "机会扫描暂时不可用"}</span>
-              <button type="button" onClick={() => setScanRetry((current) => current + 1)}>重新扫描</button>
+              <button type="button" onClick={requestManualRefresh}>重新扫描</button>
             </div>
           ) : <div className="opportunity-loading">正在等待 AI 扫描并计算完整决策…</div>}
         </div>

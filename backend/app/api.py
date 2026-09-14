@@ -2,7 +2,7 @@ import asyncio
 from datetime import UTC, date
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 
 from app.ai_analysis import enrich_review_with_openai
 from app.capital_settings import read_capital_settings, write_capital_settings
@@ -13,6 +13,7 @@ from app.market_scanner import MarketScanBusy, get_cached_or_compute_market_scan
 from app.security import require_owner, require_secure_transport
 from app.platform_credentials import PrivatePlatform, read_platform_credential_status, read_platform_credentials, write_platform_credentials
 from app.position_monitor import monitor_active_positions
+from app.scan_cache import clear_market_scan_cache
 from app.schemas import AnalysisRequest, AnalysisResponse, Candle, CapitalSettingsResponse, CapitalSettingsUpdate, CompletedTradeResponse, CompletionResponse, ExecutionCreate, ExecutionStateResponse, MarketSnapshot, NewsArchiveResponse, NewsItem, OpportunityScanResponse, PlatformCredentialResponse, PlatformCredentialUpdate, PositionMonitorResponse, ReviewRecordResponse, SimulationWalletResponse, SimulationWalletUpdate, StrategyVersionResponse, WalletSettingsResponse, WalletSettingsUpdate, WalletSnapshot
 from app.simulation_wallet import read_simulation_wallet, write_simulation_wallet
 from app.strategy_versions import (
@@ -71,7 +72,9 @@ def capital_settings() -> CapitalSettingsResponse:
 
 @router.put("/settings/capital", response_model=CapitalSettingsResponse, summary="保存总资金设置", dependencies=[Depends(require_owner)])
 def update_capital_settings(payload: CapitalSettingsUpdate) -> CapitalSettingsResponse:
-    return write_capital_settings(payload)
+    saved = write_capital_settings(payload)
+    clear_market_scan_cache()
+    return saved
 
 
 @router.get("/settings/wallet", response_model=WalletSettingsResponse | None, summary="读取只读钱包设置", dependencies=[Depends(require_owner)])
@@ -164,7 +167,12 @@ async def position_monitors(
 
 
 @router.post("/executions", response_model=ExecutionStateResponse, status_code=201, summary="开始跟踪决策", dependencies=[Depends(require_owner)])
-async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
+async def start_execution(
+    payload: ExecutionCreate,
+    owner_capital: float | None = Header(
+        default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
+    ),
+) -> ExecutionStateResponse:
     try:
         platform = payload.analysis.platform
         market, candles = await asyncio.gather(
@@ -173,7 +181,7 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
         )
         if market is None:
             raise ValueError("当前平台不存在该交易品种")
-        capital = read_capital_settings()
+        total_amount = owner_capital or read_capital_settings().total_amount
         indicators = calculate_technical_indicators(candles)
         if indicators.atr_percent is not None:
             market = market.model_copy(update={"volatility": indicators.atr_percent})
@@ -184,7 +192,7 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
                 platform=platform,
             ),
             market,
-            capital.total_amount,
+            total_amount,
             indicators,
         )
         verified_analysis = refresh_decision_plan(
@@ -192,12 +200,13 @@ async def start_execution(payload: ExecutionCreate) -> ExecutionStateResponse:
             verified_analysis,
             market.price,
             payload.timeframe,
+            total_amount,
         )
         if not verified_analysis.is_executable:
             raise ValueError(f"当前决策不可执行：{verified_analysis.status_reason}")
         verified_payload = payload.model_copy(update={
             "analysis": verified_analysis,
-            "total_amount": capital.total_amount,
+            "total_amount": total_amount,
         })
         if platform == "hyperliquid":
             wallet = read_wallet_settings()
@@ -305,14 +314,19 @@ def strategy_versions(
 
 
 @router.post("/ai/analyze", response_model=AnalysisResponse, summary="生成规则交易计划", dependencies=[Depends(require_owner)])
-async def ai_analyze(payload: AnalysisRequest) -> AnalysisResponse:
+async def ai_analyze(
+    payload: AnalysisRequest,
+    owner_capital: float | None = Header(
+        default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
+    ),
+) -> AnalysisResponse:
     market, candles = await asyncio.gather(
         get_live_market(payload.symbol, payload.platform),
         get_candles(payload.symbol, payload.timeframe, 220, payload.platform),
     )
     if market is None:
         raise HTTPException(status_code=404, detail="暂不支持该交易品种")
-    total_amount = read_capital_settings().total_amount
+    total_amount = owner_capital or read_capital_settings().total_amount
     indicators = calculate_technical_indicators(candles)
     if indicators.atr_percent is not None:
         market = market.model_copy(update={"volatility": indicators.atr_percent})
@@ -329,9 +343,15 @@ async def ai_opportunities(
     timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"] = "4h",
     limit: int = Query(default=8, ge=4, le=20),
     platform: MarketPlatform = Query(default="hyperliquid"),
+    force_refresh: bool = Query(default=False, description="忽略短期扫描缓存并重新计算"),
+    owner_capital: float | None = Header(
+        default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
+    ),
 ) -> OpportunityScanResponse:
     try:
-        return await get_cached_or_compute_market_scan(timeframe, limit, platform)
+        return await get_cached_or_compute_market_scan(
+            timeframe, limit, platform, owner_capital, force_refresh
+        )
     except MarketScanBusy as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

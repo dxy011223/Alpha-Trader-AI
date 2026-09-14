@@ -30,6 +30,16 @@ class FakeRedis:
         del self.values[key]
         return 1
 
+    def delete(self, *keys: str) -> int:
+        deleted = sum(key in self.values for key in keys)
+        for key in keys:
+            self.values.pop(key, None)
+        return deleted
+
+    def scan_iter(self, *, match: str):
+        prefix = match.removesuffix("*")
+        return (key for key in list(self.values) if key.startswith(prefix))
+
 
 def test_scan_cache_round_trip(monkeypatch):
     fake = FakeRedis()
@@ -73,6 +83,49 @@ def test_decision_plan_cache_uses_a_separate_long_lived_key(monkeypatch):
     assert cached is not None
     assert cached.updated_at == scan.updated_at
     assert "alpha-trader:decision-plans:hyperliquid:4h" in fake.values
+
+
+def test_capital_change_clears_scan_cache_but_preserves_fixed_plans(monkeypatch):
+    fake = FakeRedis()
+    monkeypatch.setattr(scan_cache, "get_settings", lambda: SimpleNamespace(
+        redis_url="redis://test",
+        market_scan_cache_seconds=360,
+    ))
+    monkeypatch.setattr(scan_cache.Redis, "from_url", lambda *_args, **_kwargs: fake)
+    scan = OpportunityScanResponse(
+        scanned_markets=100,
+        eligible_markets=80,
+        updated_at="2026-09-13T00:00:00Z",
+        opportunities=[],
+    )
+    scan_cache.write_timeframe_scan_cache("4h", scan)
+    scan_cache.write_decision_plan_cache("4h", scan)
+
+    scan_cache.clear_market_scan_cache()
+
+    assert scan_cache.read_scan_cache("4h", 4) is None
+    assert scan_cache.read_decision_plan_cache("4h") is not None
+
+
+def test_scan_cache_separates_different_capital_amounts(monkeypatch):
+    fake = FakeRedis()
+    monkeypatch.setattr(scan_cache, "get_settings", lambda: SimpleNamespace(
+        redis_url="redis://test",
+        market_scan_cache_seconds=360,
+    ))
+    monkeypatch.setattr(scan_cache.Redis, "from_url", lambda *_args, **_kwargs: fake)
+    scan = OpportunityScanResponse(
+        scanned_markets=100,
+        eligible_markets=80,
+        updated_at="2026-09-14T00:00:00Z",
+        opportunities=[],
+        total_amount=10_000,
+    )
+
+    scan_cache.write_timeframe_scan_cache("4h", scan)
+
+    assert scan_cache.read_scan_cache("4h", 4, total_amount=10_000) is not None
+    assert scan_cache.read_scan_cache("4h", 4, total_amount=20_000) is None
 
 
 def test_scan_lock_uses_owner_token_when_releasing(monkeypatch):

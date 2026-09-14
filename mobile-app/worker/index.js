@@ -228,14 +228,23 @@ function analyzeMarket(market, totalAmount) {
   };
 }
 
-function refreshDecisionPlan(original, refreshed, currentPrice, timeframe, now = Date.now()) {
+function refreshDecisionPlan(original, refreshed, currentPrice, timeframe, totalAmount, now = Date.now()) {
   const generatedAt = Date.parse(original.generated_at || "");
   const validityMs = DECISION_VALIDITY_MS[timeframe] || DECISION_VALIDITY_MS["4h"];
   if (original.direction === "WAIT" || !Number.isFinite(generatedAt) || now - generatedAt >= validityMs) {
     return refreshed;
   }
+  const resizedPosition = positionSizing({
+    direction: original.direction,
+    confidence: refreshed.score,
+    risk: original.risk,
+    entryRange: original.entry_range,
+    stopLoss: original.stop_loss,
+    leverage: original.leverage,
+    totalAmount,
+  });
   if (["invalidated", "target_reached"].includes(original.decision_status)) {
-    return { ...original, current_price: currentPrice };
+    return { ...original, current_price: currentPrice, position_sizing: resizedPosition };
   }
 
   const [entryLow, entryHigh] = [...original.entry_range].sort((a, b) => a - b);
@@ -280,6 +289,7 @@ function refreshDecisionPlan(original, refreshed, currentPrice, timeframe, now =
     score_breakdown: refreshed.score_breakdown,
     source: refreshed.source,
     current_price: currentPrice,
+    position_sizing: resizedPosition,
     decision_status: decisionStatus,
     is_executable: isExecutable,
     status_reason: statusReason,
@@ -359,7 +369,7 @@ async function handleApi(request, url, env) {
     const priceBySymbol = new Map(eligible.map((market) => [market.symbol, market.price]));
     const opportunities = refreshed
       .map((item) => previousBySymbol.has(item.symbol)
-        ? refreshDecisionPlan(previousBySymbol.get(item.symbol), item, priceBySymbol.get(item.symbol), timeframe)
+        ? refreshDecisionPlan(previousBySymbol.get(item.symbol), item, priceBySymbol.get(item.symbol), timeframe, totalAmount)
         : item)
       .sort((a, b) => Number(b.is_executable) - Number(a.is_executable)
         || Number(b.decision_status === "watching") - Number(a.decision_status === "watching")

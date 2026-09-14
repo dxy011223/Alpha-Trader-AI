@@ -490,6 +490,7 @@ def refresh_decision_plan(
     refreshed: AnalysisResponse,
     current_price: float,
     timeframe: str,
+    total_amount: float,
     now: datetime | None = None,
 ) -> AnalysisResponse:
     """固定原计划价格，只根据最新行情重评其生命周期与可执行性。"""
@@ -505,9 +506,22 @@ def refresh_decision_plan(
     if original.direction == "WAIT" or (now - generated_at).total_seconds() >= validity_seconds:
         return refreshed
 
+    # 决策价格边界固定，但未执行前的仓位应跟随最新账户资金与最新评分重算。
+    position_sizing = calculate_position_sizing(
+        total_amount=total_amount,
+        direction=original.direction,
+        confidence=refreshed.score,
+        risk=original.risk,
+        entry_range=original.entry_range,
+        stop_loss=original.stop_loss,
+        leverage=original.leverage,
+    )
     terminal_statuses = {"invalidated", "target_reached"}
     if original.decision_status in terminal_statuses:
-        return original.model_copy(update={"current_price": current_price})
+        return original.model_copy(update={
+            "current_price": current_price,
+            "position_sizing": position_sizing,
+        })
 
     entry_low, entry_high = sorted(original.entry_range[:2])
     first_target = original.take_profit[0]
@@ -559,6 +573,7 @@ def refresh_decision_plan(
         "indicators": refreshed.indicators,
         "source": refreshed.source,
         "current_price": current_price,
+        "position_sizing": position_sizing,
         "decision_status": status,
         "is_executable": executable,
         "status_reason": reason,

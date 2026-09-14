@@ -145,6 +145,18 @@ describe("Alpha Trader API 适配器", () => {
     );
   });
 
+  it("手动扫描会请求服务端绕过短期缓存", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ opportunities: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await loadOpportunities("4h", undefined, "binance", true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      `${apiBase}/ai/opportunities?timeframe=4h&limit=4&platform=binance&force_refresh=true`,
+      expect.any(Object),
+    );
+  });
+
   it("持久化并恢复执行中的决策", async () => {
     const analysis = { symbol: "BTC" } as never;
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(

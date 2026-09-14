@@ -595,8 +595,10 @@ export function loadOpportunities(
   timeframe: MarketInterval,
   signal?: AbortSignal,
   platform: MarketPlatform = "hyperliquid",
+  forceRefresh = false,
 ) {
   const query = new URLSearchParams({ timeframe, limit: "4", platform });
+  if (forceRefresh) query.set("force_refresh", "true");
   return request<OpportunityScanResponse>(`/ai/opportunities?${query}`, { signal }, AI_REQUEST_TIMEOUT_MS);
 }
 

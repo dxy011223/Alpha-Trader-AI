@@ -374,14 +374,16 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
   console.error = () => undefined;
 
   try {
+    const DB = createSimulationDatabase();
+    const env = {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    };
     const response = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
       { headers: authHeaders },
-    ), {
-      BACKEND_API_URL: "https://backend.example.test",
-      DB: createSimulationDatabase(),
-      OWNER_API_TOKEN: OWNER_TOKEN,
-    });
+    ), env);
 
     assert.equal(response.status, 200);
     const payload = await response.json();
@@ -389,6 +391,21 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
     assert.ok(payload.opportunities.every((item) => item.analysis_engine === "rules"));
     assert.ok(payload.opportunities.every((item) => item.reference_price > 0));
     assert.ok(payload.opportunities.every((item) => item.is_executable === false));
+
+    const firstPlan = payload.opportunities[0];
+    await worker.fetch(new Request("https://example.test/api/v1/settings/capital", {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ total_amount: 20_000 }),
+    }), env);
+    const rescanned = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: authHeaders },
+    ), env);
+    const updatedPlan = (await rescanned.json()).opportunities.find((item) => item.symbol === firstPlan.symbol);
+    assert.deepEqual(updatedPlan.entry_range, firstPlan.entry_range);
+    assert.deepEqual(updatedPlan.take_profit, firstPlan.take_profit);
+    assert.equal(updatedPlan.position_sizing.margin_amount, firstPlan.position_sizing.margin_amount * 2);
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;
@@ -481,6 +498,7 @@ test("serves public market data and keeps a rule fallback when the Python backen
   globalThis.fetch = async (_url, init) => {
     if (_url instanceof Request && new URL(_url.url).hostname === "backend.example.test") {
       assert.equal(_url.headers.get("authorization"), `Bearer ${OWNER_TOKEN}`);
+      assert.equal(_url.headers.get("x-alpha-owner-capital"), "10000");
       return Response.json({ proxied: true });
     }
     if (!init?.body) return Response.json({ Data: [] });

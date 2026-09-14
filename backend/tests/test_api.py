@@ -9,7 +9,7 @@ os.environ["OWNER_API_TOKEN"] = "test-owner-token-abcdefghijklmnopqrstuvwxyz"
 get_settings.cache_clear()
 
 from app.main import app
-from app.schemas import AnalysisRequest, MarketSnapshot
+from app.schemas import AnalysisRequest, MarketSnapshot, OpportunityScanResponse
 from app.services import analyze_market, calculate_position_sizing
 
 
@@ -118,6 +118,49 @@ def test_rule_analysis_does_not_require_an_ai_service(monkeypatch):
     assert response.json()["analysis_engine"] == "rules"
 
 
+def test_rule_analysis_uses_verified_owner_capital_header(monkeypatch):
+    async def fake_market(_symbol: str, _platform: str):
+        return MarketSnapshot(
+            symbol="BTC", price=100, change_24h=2, volume=1_000_000,
+            volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+        )
+
+    monkeypatch.setattr("app.api.get_live_market", fake_market)
+    monkeypatch.setattr("app.api.get_candles", lambda *_args: asyncio.sleep(0, result=[]))
+    monkeypatch.setattr(
+        "app.api.read_capital_settings",
+        lambda: (_ for _ in ()).throw(AssertionError("不应读取后端旧资金")),
+    )
+
+    response = client.post(
+        "/api/v1/ai/analyze",
+        json={"symbol": "BTC", "timeframe": "4h"},
+        headers={**AUTH_HEADERS, "X-Alpha-Owner-Capital": "20000"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["position_sizing"]["risk_budget_amount"] > 100
+
+
+def test_updating_capital_clears_the_short_lived_scan_cache(monkeypatch):
+    cleared: list[bool] = []
+    monkeypatch.setattr(
+        "app.api.write_capital_settings",
+        lambda payload: {
+            "total_amount": payload.total_amount,
+            "currency": payload.currency,
+            "updated_at": "2026-09-14T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr("app.api.clear_market_scan_cache", lambda: cleared.append(True))
+
+    response = client.put("/api/v1/settings/capital", json={"total_amount": 20_000})
+
+    assert response.status_code == 200
+    assert response.json()["total_amount"] == 20_000
+    assert cleared == [True]
+
+
 def test_position_sizing_uses_risk_and_stop_distance():
     sizing = calculate_position_sizing(
         total_amount=10_000,
@@ -222,3 +265,28 @@ def test_ai_opportunities_are_ranked(monkeypatch):
     top_opportunity = payload["opportunities"][0]
     assert top_opportunity["entry_range"][0] != top_opportunity["entry_range"][1]
     assert top_opportunity["stop_loss"] < top_opportunity["entry_range"][0]
+
+
+def test_ai_opportunities_can_force_refresh(monkeypatch):
+    calls: list[tuple[str, int, str, float | None, bool]] = []
+
+    async def fake_scan(timeframe, limit, platform, total_amount, force_refresh):
+        calls.append((timeframe, limit, platform, total_amount, force_refresh))
+        return OpportunityScanResponse(
+            scanned_markets=0,
+            eligible_markets=0,
+            updated_at="2026-09-14T00:00:00Z",
+            opportunities=[],
+            platform=platform,
+            total_amount=total_amount,
+        )
+
+    monkeypatch.setattr("app.api.get_cached_or_compute_market_scan", fake_scan)
+
+    response = client.get(
+        "/api/v1/ai/opportunities?timeframe=1h&limit=4&platform=binance&force_refresh=true",
+        headers={**AUTH_HEADERS, "X-Alpha-Owner-Capital": "20000"},
+    )
+
+    assert response.status_code == 200
+    assert calls == [("1h", 4, "binance", 20_000, True)]

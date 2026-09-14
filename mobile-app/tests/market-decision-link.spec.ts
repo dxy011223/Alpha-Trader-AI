@@ -225,6 +225,31 @@ test("机会扫描失败会显示原因并可手动重试", async ({ page }) => 
   await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
 });
 
+test("决策页可手动刷新且刷新期间防止重复请求", async ({ page }) => {
+  let opportunityRequests = 0;
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    opportunityRequests += 1;
+    if (opportunityRequests === 2) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    await route.fallback();
+  });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+  await expect(page.getByRole("tab", { name: /ETH/ })).toBeVisible();
+  await expect.poll(() => opportunityRequests).toBe(1);
+
+  const refreshButton = page.getByRole("button", { name: /手动刷新|刷新中/ });
+  await expect(refreshButton).toBeEnabled();
+  await refreshButton.click();
+
+  await expect(refreshButton).toBeDisabled();
+  await expect(page.getByText("正在刷新市场决策")).toBeVisible();
+  await expect.poll(() => opportunityRequests).toBe(2);
+  await expect(refreshButton).toHaveText("手动刷新");
+  await expect(refreshButton).toBeEnabled();
+});
+
 test("决策页展示固定参考价、当前复核价和可执行状态", async ({ page }) => {
   await page.locator(".bottom-nav button").nth(1).click();
 

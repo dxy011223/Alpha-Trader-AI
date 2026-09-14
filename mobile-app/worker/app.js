@@ -552,7 +552,7 @@ async function handleSimulationWallet(request, env, ownerId, clientId, platform)
   return json({ detail: "不支持的请求方法" }, 405);
 }
 
-async function proxyBackend(request, env, authenticated = false) {
+async function proxyBackend(request, env, authenticated = false, totalAmount = null) {
   const base = String(env.BACKEND_API_URL || "").trim();
   if (!base) return null;
   const source = new URL(request.url);
@@ -570,6 +570,9 @@ async function proxyBackend(request, env, authenticated = false) {
   if (!authenticated) return fetch(upstream);
   const headers = new Headers(upstream.headers);
   headers.set("authorization", `Bearer ${String(env.OWNER_API_TOKEN).trim()}`);
+  if (Number.isFinite(totalAmount) && totalAmount > 0) {
+    headers.set("x-alpha-owner-capital", String(totalAmount));
+  }
   headers.delete("cookie");
   const response = await fetch(new Request(upstream, { headers }));
   if (response.status === 401 || response.status === 403) {
@@ -602,7 +605,8 @@ async function handleRequest(request, env, ctx) {
     if (fullBackendRoute) {
       const auth = await authenticateOwner(request, env);
       if (auth.error) return auth.error;
-      const proxied = await proxyBackend(request, env, true);
+      const capital = await readCapital(env, auth.ownerId);
+      const proxied = await proxyBackend(request, env, true, capital?.total_amount);
       return proxied ?? json({ detail: "当前部署尚未配置完整后端服务" }, 503);
     }
 
@@ -620,10 +624,10 @@ async function handleRequest(request, env, ctx) {
         return handleCapital(request, env, auth.ownerId);
       }
       if (aiRoute) {
-        const proxied = await proxyBackend(request, env, true);
+        const capital = await readCapital(env, auth.ownerId);
+        const proxied = await proxyBackend(request, env, true, capital?.total_amount);
         if (proxied?.ok || (proxied && proxied.status < 500)) return proxied;
         if (proxied) console.error("完整后端决策暂时不可用，切换到边缘规则引擎");
-        const capital = await readCapital(env, auth.ownerId);
         if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
         const headers = new Headers(request.headers);
         headers.set("x-alpha-owner-capital", String(capital.total_amount));

@@ -122,6 +122,7 @@ class OpportunityScanResponse(BaseModel):
     opportunities: list[AnalysisResponse]
     scan_source: Literal["live_scan", "scheduled_cache"] = "live_scan"
     platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
+    total_amount: float | None = None
 
 
 class CapitalSettingsUpdate(BaseModel):

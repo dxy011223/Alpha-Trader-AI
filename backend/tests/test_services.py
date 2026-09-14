@@ -1,6 +1,8 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app import services
 from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem
 
@@ -234,8 +236,13 @@ def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_rang
         AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000
     )
 
+    baseline = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=30),
+    )
     decision = services.refresh_decision_plan(
-        original, refreshed, refreshed_market.price, "4h", generated_at + timedelta(minutes=30)
+        original, refreshed, refreshed_market.price, "4h", 20_000,
+        generated_at + timedelta(minutes=30),
     )
 
     assert decision.entry_range == original.entry_range
@@ -244,6 +251,12 @@ def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_rang
     assert decision.current_price == 99.5
     assert decision.decision_status == "executable"
     assert decision.is_executable is True
+    assert decision.position_sizing.margin_amount == pytest.approx(
+        baseline.position_sizing.margin_amount * 2, rel=1e-5
+    )
+    assert decision.position_sizing.position_value == pytest.approx(
+        baseline.position_sizing.position_value * 2, rel=1e-5
+    )
 
 
 def test_decision_plan_marks_original_target_as_reached_instead_of_chasing_price():
@@ -261,7 +274,8 @@ def test_decision_plan_marks_original_target_as_reached_instead_of_chasing_price
     )
 
     decision = services.refresh_decision_plan(
-        original, refreshed, refreshed_market.price, "4h", generated_at + timedelta(hours=1)
+        original, refreshed, refreshed_market.price, "4h", 10_000,
+        generated_at + timedelta(hours=1),
     )
 
     assert decision.entry_range == original.entry_range
@@ -285,7 +299,8 @@ def test_decision_plan_invalidates_when_latest_signal_no_longer_meets_threshold(
     )
 
     decision = services.refresh_decision_plan(
-        original, refreshed, weak_market.price, "4h", generated_at + timedelta(minutes=30)
+        original, refreshed, weak_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=30),
     )
 
     assert decision.decision_status == "invalidated"
@@ -308,7 +323,8 @@ def test_expired_decision_plan_allows_a_new_plan():
     )
 
     decision = services.refresh_decision_plan(
-        original, refreshed, refreshed_market.price, "1h", generated_at + timedelta(hours=1, seconds=1)
+        original, refreshed, refreshed_market.price, "1h", 10_000,
+        generated_at + timedelta(hours=1, seconds=1),
     )
 
     assert decision.entry_range == refreshed.entry_range

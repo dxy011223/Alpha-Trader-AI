@@ -17,15 +17,41 @@ return 0
 """
 
 
-def _key(timeframe: str, platform: str = "hyperliquid") -> str:
-    return f"alpha-trader:opportunities:{platform}:{timeframe}"
+def _key(
+    timeframe: str,
+    platform: str = "hyperliquid",
+    total_amount: float | None = None,
+) -> str:
+    capital_key = "default" if total_amount is None else format(total_amount, ".12g")
+    return f"alpha-trader:opportunities:{platform}:{timeframe}:{capital_key}"
 
 
 def _plan_key(timeframe: str, platform: str = "hyperliquid") -> str:
     return f"alpha-trader:decision-plans:{platform}:{timeframe}"
 
 
-def acquire_scan_lock(timeframe: str, platform: str) -> str | None:
+def clear_market_scan_cache() -> None:
+    """资金设置变化后清除短期扫描结果，保留固定决策计划。"""
+    settings = get_settings()
+    client = None
+    try:
+        client = Redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        keys = [key for key in client.scan_iter(match="alpha-trader:opportunities:*") if not key.endswith(":lock")]
+        if keys:
+            client.delete(*keys)
+    except (RedisError, ValueError) as exc:
+        logger.warning("Redis 市场扫描缓存清理失败：%s", exc)
+    finally:
+        if client is not None:
+            client.close()
+
+
+def acquire_scan_lock(timeframe: str, platform: str, total_amount: float | None = None) -> str | None:
     """返回租约令牌；空字符串表示其他进程持有，None 表示 Redis 不可用。"""
     settings = get_settings()
     client = None
@@ -38,7 +64,7 @@ def acquire_scan_lock(timeframe: str, platform: str) -> str | None:
             socket_timeout=1,
         )
         acquired = client.set(
-            f"{_key(timeframe, platform)}:lock", token, nx=True, ex=90
+            f"{_key(timeframe, platform, total_amount)}:lock", token, nx=True, ex=90
         )
         return token if acquired else ""
     except (RedisError, ValueError) as exc:
@@ -49,7 +75,9 @@ def acquire_scan_lock(timeframe: str, platform: str) -> str | None:
             client.close()
 
 
-def release_scan_lock(timeframe: str, platform: str, token: str) -> None:
+def release_scan_lock(
+    timeframe: str, platform: str, token: str, total_amount: float | None = None
+) -> None:
     if not token:
         return
     settings = get_settings()
@@ -61,7 +89,12 @@ def release_scan_lock(timeframe: str, platform: str, token: str) -> None:
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        client.eval(_RELEASE_LOCK_SCRIPT, 1, f"{_key(timeframe, platform)}:lock", token)
+        client.eval(
+            _RELEASE_LOCK_SCRIPT,
+            1,
+            f"{_key(timeframe, platform, total_amount)}:lock",
+            token,
+        )
     except (RedisError, ValueError) as exc:
         logger.warning("Redis 市场扫描租约释放失败：%s", exc)
     finally:
@@ -79,7 +112,11 @@ def write_timeframe_scan_cache(timeframe: str, scan: OpportunityScanResponse) ->
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        client.setex(_key(timeframe, scan.platform), settings.market_scan_cache_seconds, scan.model_dump_json())
+        client.setex(
+            _key(timeframe, scan.platform, scan.total_amount),
+            settings.market_scan_cache_seconds,
+            scan.model_dump_json(),
+        )
     except (RedisError, ValueError) as exc:
         logger.warning("Redis 市场扫描缓存写入失败：%s", exc)
     finally:
@@ -107,7 +144,10 @@ def write_decision_plan_cache(timeframe: str, scan: OpportunityScanResponse) -> 
 
 
 def read_scan_cache(
-    timeframe: str, limit: int, platform: str = "hyperliquid"
+    timeframe: str,
+    limit: int,
+    platform: str = "hyperliquid",
+    total_amount: float | None = None,
 ) -> OpportunityScanResponse | None:
     settings = get_settings()
     client = None
@@ -118,7 +158,7 @@ def read_scan_cache(
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        value = client.get(_key(timeframe, platform))
+        value = client.get(_key(timeframe, platform, total_amount))
         if not value:
             return None
         scan = OpportunityScanResponse.model_validate_json(value)

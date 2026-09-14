@@ -337,12 +337,13 @@
   background: var(--surface);
 }
 .opportunity-radar-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
-.opportunity-radar-heading > div { display: grid; gap: 2px; }
+.opportunity-radar-heading > div:first-child { display: grid; gap: 2px; }
 .opportunity-radar-heading strong { font-size: 12px; }
 .opportunity-radar-heading span { color: var(--muted); font-size: 8px; }
-.opportunity-radar-heading > button { min-height: 27px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 8px; font-weight: 700; }
-.opportunity-radar-heading > button.active { border-color: rgba(66, 215, 160, 0.3); background: rgba(66, 215, 160, 0.1); color: var(--mint); }
-.opportunity-radar-heading > button.locked { border-color: rgba(247, 190, 67, 0.4); background: rgba(247, 190, 67, 0.12); color: var(--amber); }
+.opportunity-radar-actions { display: flex; flex: 0 0 auto; gap: 4px; }
+.opportunity-radar-actions > button { min-height: 27px; padding: 0 7px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); color: var(--muted); font-size: 8px; font-weight: 700; }
+.opportunity-radar-actions > button.active { border-color: rgba(66, 215, 160, 0.3); background: rgba(66, 215, 160, 0.1); color: var(--mint); }
+.opportunity-radar-actions > button:disabled { cursor: not-allowed; opacity: 0.5; }
 .opportunity-switcher { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
 .opportunity-switcher > button { display: grid; gap: 4px; min-width: 0; min-height: 49px; padding: 6px 5px; border: 1px solid var(--line); border-radius: 8px; background: #0b141a; color: #aeb8c1; text-align: left; }
 .opportunity-switcher > button > span { display: flex; gap: 4px; align-items: baseline; }
