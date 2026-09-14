@@ -98,7 +98,27 @@ export interface AnalysisResponse {
   reference_price?: number | null;
   current_price?: number | null;
   generated_at?: string | null;
-  decision_status?: "watching" | "executable" | "invalidated" | "target_reached";
+  plan_id?: string;
+  decision_revision?: number;
+  revision_reason?: string | null;
+  revision_history?: Array<{
+    revision: number;
+    reference_price: number | null;
+    entry_range: number[];
+    stop_loss: number;
+    take_profit: number[];
+    leverage: number;
+    risk: "low" | "medium" | "high";
+    score: number;
+    confidence: number;
+    generated_at: string | null;
+    archived_at: string;
+    archive_reason: string;
+    revision_reason: string | null;
+  }>;
+  soft_failure_count?: number;
+  missed_entry_count?: number;
+  decision_status?: "watching" | "confirming" | "missed_entry" | "executable" | "invalidated" | "target_reached";
   is_executable?: boolean;
   status_reason?: string;
 }

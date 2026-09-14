@@ -1037,7 +1037,11 @@ function DecisionScreen({
       ? "目标已达"
       : analysis?.decision_status === "invalidated"
         ? "已失效"
-        : "等待入场";
+        : analysis?.decision_status === "confirming"
+          ? "待确认"
+          : analysis?.decision_status === "missed_entry"
+            ? "等待回踩"
+            : "等待入场";
   const opportunity = getOpportunity(score);
   const entryRange = analysis?.entry_range ?? [0, 0];
   const stopLoss = analysis?.stop_loss ?? 0;
@@ -1064,6 +1068,9 @@ function DecisionScreen({
   const referencePriceLabel = analysis?.reference_price ? formatPrice(analysis.reference_price) : "--";
   const currentPriceLabel = analysis?.current_price ? formatPrice(analysis.current_price) : "--";
   const strategyParameters = analysis?.strategy_parameters;
+  const decisionRevision = analysis?.decision_revision ?? 1;
+  const revisionHistory = analysis?.revision_history ?? [];
+  const previousRevision = revisionHistory.length > 0 ? revisionHistory[revisionHistory.length - 1] : null;
   const scoreItems: Array<[keyof typeof breakdown, string, number]> = [
     ["trend", "趋势", strategyParameters?.trend_weight ?? 30],
     ["structure", "技术结构", strategyParameters?.structure_weight ?? 25],
@@ -1168,7 +1175,7 @@ function DecisionScreen({
                 key={candidate.symbol}
               >
                 <span><small>#{index + 1}</small><strong>{candidate.symbol}</strong></span>
-                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.is_executable ? "可执行" : candidate.decision_status === "target_reached" ? "目标已达" : candidate.decision_status === "invalidated" ? "已失效" : "等待入场"}`} </em>
+                <em>{candidateIsExecuting ? "执行中 · 快照已锁定" : `${candidate.score} · ${candidate.is_executable ? "可执行" : candidate.decision_status === "target_reached" ? "目标已达" : candidate.decision_status === "invalidated" ? "已失效" : candidate.decision_status === "confirming" ? "待确认" : candidate.decision_status === "missed_entry" ? "等待回踩" : "等待入场"}`} </em>
               </button>
             );
           }) : remoteState === "offline" ? (
@@ -1267,7 +1274,14 @@ function DecisionScreen({
       </section>
 
       <section className="decision-detail-card" aria-labelledby="execution-plan-title">
-        <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划</h2></div><em>{isExecuting ? "快照已锁定" : decisionStatusLabel}</em></div>
+        <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划{decisionRevision > 1 ? ` · V${decisionRevision}` : ""}</h2></div><em>{isExecuting ? "快照已锁定" : decisionStatusLabel}</em></div>
+        {decisionRevision > 1 && previousRevision && (
+          <div className="decision-revision-note">
+            <strong>因错过原入场区间重新报价</strong>
+            <span>原 V{previousRevision.revision} 入场 {previousRevision.entry_range.map(formatPrice).join(" – ")} · 止损 {formatPrice(previousRevision.stop_loss)}</span>
+            <small>{analysis?.revision_reason}</small>
+          </div>
+        )}
         <div className="execution-grid">
           <div><span>决策参考价</span><strong>{referencePriceLabel}</strong></div>
           <div><span>当前复核价</span><strong>{currentPriceLabel}</strong></div>

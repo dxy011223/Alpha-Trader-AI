@@ -1,5 +1,6 @@
 from datetime import date, datetime
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -84,6 +85,22 @@ class TechnicalIndicators(BaseModel):
     realized_volatility: float | None = None
 
 
+class DecisionRevisionSnapshot(BaseModel):
+    revision: int = Field(ge=1, le=3)
+    reference_price: float | None = None
+    entry_range: list[float]
+    stop_loss: float
+    take_profit: list[float]
+    leverage: int
+    risk: Literal["low", "medium", "high"]
+    score: int = Field(ge=0, le=100)
+    confidence: int = Field(ge=0, le=100)
+    generated_at: str | None = None
+    archived_at: str
+    archive_reason: str
+    revision_reason: str | None = None
+
+
 class AnalysisResponse(BaseModel):
     symbol: str
     instrument: str
@@ -110,7 +127,15 @@ class AnalysisResponse(BaseModel):
     reference_price: float | None = None
     current_price: float | None = None
     generated_at: str | None = None
-    decision_status: Literal["watching", "executable", "invalidated", "target_reached"] = "watching"
+    plan_id: str = Field(default_factory=lambda: uuid4().hex)
+    decision_revision: int = Field(default=1, ge=1, le=3)
+    revision_reason: str | None = None
+    revision_history: list[DecisionRevisionSnapshot] = Field(default_factory=list)
+    soft_failure_count: int = Field(default=0, ge=0, le=2)
+    missed_entry_count: int = Field(default=0, ge=0, le=2)
+    decision_status: Literal[
+        "watching", "confirming", "missed_entry", "executable", "invalidated", "target_reached"
+    ] = "watching"
     is_executable: bool = False
     status_reason: str = "等待进入计划入场区间"
 

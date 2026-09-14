@@ -614,7 +614,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.8"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.9"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

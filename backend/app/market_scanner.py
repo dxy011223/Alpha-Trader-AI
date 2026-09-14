@@ -63,6 +63,10 @@ async def compute_market_scan(
         item.symbol: item for item in previous_scan.opportunities
     } if previous_scan else {}
     market_by_symbol = {market.symbol: market for market in indicator_candidates}
+    candles_by_symbol = {
+        market.symbol: candles
+        for market, candles in zip(indicator_candidates, candle_sets, strict=True)
+    }
     decisions = [
         refresh_decision_plan(
             previous_by_symbol[item.symbol],
@@ -70,11 +74,13 @@ async def compute_market_scan(
             market_by_symbol[item.symbol].price,
             timeframe,
             total_amount,
+            candles=candles_by_symbol[item.symbol],
         ) if item.symbol in previous_by_symbol else item
         for item in refreshed_decisions
     ]
+    # 机会质量以评分为主；同分时优先展示可执行、其次展示观察中的决策。
     decisions.sort(
-        key=lambda item: (item.is_executable, item.decision_status == "watching", item.score),
+        key=lambda item: (item.score, item.is_executable, item.decision_status == "watching"),
         reverse=True,
     )
     scan = OpportunityScanResponse(

@@ -84,7 +84,7 @@ export default function DownloadLanding() {
         </div>
 
         <div className="download-actions">
-          <a className="download-install" href="/downloads/alpha-trader-ai.apk?v=1.4.8" download>
+          <a className="download-install" href="/downloads/alpha-trader-ai.apk?v=1.4.9" download>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 5-5m-5 5-5-5M5 20h14" /></svg>
             下载 Android APK
           </a>
@@ -95,7 +95,7 @@ export default function DownloadLanding() {
         </div>
 
         {notice && <p className="download-notice" role="status">{notice}</p>}
-        <p className="download-footnote">Android 7 及以上 · v1.4.8 已签名发布版 · 支持账号登录与自动续签</p>
+        <p className="download-footnote">Android 7 及以上 · v1.4.9 已签名发布版 · 支持账号登录与自动续签</p>
       </section>
     </main>
   );

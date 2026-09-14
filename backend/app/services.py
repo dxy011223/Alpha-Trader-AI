@@ -8,7 +8,7 @@ from typing import Literal
 import httpx
 
 from app.news_sources import fetch_live_news
-from app.schemas import AnalysisRequest, AnalysisResponse, Candle, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
+from app.schemas import AnalysisRequest, AnalysisResponse, Candle, DecisionRevisionSnapshot, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
 from app.strategy_scoring import apply_strategy_weights, normalize_strategy_parameters
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,12 @@ DECISION_VALIDITY_SECONDS = {
     "1d": 86_400,
 }
 MIN_REMAINING_REWARD_RISK = 1.5
+DECISION_SCORE_HYSTERESIS = 2
+SOFT_FAILURE_CONFIRMATIONS = 2
+MISSED_ENTRY_CONFIRMATIONS = 2
+MAX_DECISION_REVISIONS = 3
+MAX_MISSED_ENTRY_ATR = 0.5
+MAX_TARGET_PROGRESS = 0.5
 
 
 MARKETS = {
@@ -492,8 +498,9 @@ def refresh_decision_plan(
     timeframe: str,
     total_amount: float,
     now: datetime | None = None,
+    candles: list[Candle] | None = None,
 ) -> AnalysisResponse:
-    """固定原计划价格，只根据最新行情重评其生命周期与可执行性。"""
+    """重评决策生命周期；仅在确认错过入场且风险约束满足时生成受控修订版。"""
     now = now or datetime.now(UTC)
     try:
         generated_at = datetime.fromisoformat(original.generated_at or "")
@@ -516,6 +523,34 @@ def refresh_decision_plan(
         stop_loss=original.stop_loss,
         leverage=original.leverage,
     )
+
+    def keep_plan_with_review(
+        *,
+        decision_status: Literal[
+            "watching", "confirming", "missed_entry", "executable", "invalidated", "target_reached"
+        ],
+        reason: str,
+        is_executable: bool = False,
+        soft_failure_count: int = 0,
+        missed_entry_count: int = 0,
+    ) -> AnalysisResponse:
+        """保留当前计划价格，只更新最新评估、仓位与生命周期状态。"""
+        return original.model_copy(update={
+            "confidence": refreshed.confidence,
+            "score": refreshed.score,
+            "score_breakdown": refreshed.score_breakdown,
+            "indicators": refreshed.indicators,
+            "source": refreshed.source,
+            "current_price": current_price,
+            "position_sizing": position_sizing,
+            "decision_status": decision_status,
+            "is_executable": is_executable,
+            "status_reason": reason,
+            "reasons": [reason, *refreshed.reasons],
+            "soft_failure_count": soft_failure_count,
+            "missed_entry_count": missed_entry_count,
+        })
+
     terminal_statuses = {"invalidated", "target_reached"}
     if original.decision_status in terminal_statuses:
         return original.model_copy(update={
@@ -526,30 +561,164 @@ def refresh_decision_plan(
     entry_low, entry_high = sorted(original.entry_range[:2])
     first_target = original.take_profit[0]
     min_trade_score = int(refreshed.strategy_parameters.get("min_trade_score", 70))
-    status: Literal["watching", "executable", "invalidated", "target_reached"] = "watching"
+    status: Literal[
+        "watching", "confirming", "missed_entry", "executable", "invalidated", "target_reached"
+    ] = "watching"
     executable = False
 
+    generated_at_ms = int(generated_at.timestamp() * 1000)
+    observed_candles = [item for item in candles or [] if item.open_time >= generated_at_ms]
+    observed_high = max([current_price, *(item.high for item in observed_candles)])
+    observed_low = min([current_price, *(item.low for item in observed_candles)])
+
     target_reached = (
-        original.direction == "LONG" and current_price >= first_target
+        original.direction == "LONG" and observed_high >= first_target
     ) or (
-        original.direction == "SHORT" and current_price <= first_target
+        original.direction == "SHORT" and observed_low <= first_target
     )
     stop_reached = (
-        original.direction == "LONG" and current_price <= original.stop_loss
+        original.direction == "LONG" and observed_low <= original.stop_loss
     ) or (
-        original.direction == "SHORT" and current_price >= original.stop_loss
+        original.direction == "SHORT" and observed_high >= original.stop_loss
     )
 
-    if target_reached:
-        status = "target_reached"
-        reason = "价格已达到原决策首个止盈目标，本轮预测完成，禁止追价入场"
-    elif stop_reached:
+    # 同一根 K 线无法确认触发先后时按止损优先，避免高估策略表现。
+    if stop_reached:
         status = "invalidated"
         reason = "价格已触及原决策结构止损，本轮计划失效"
-    elif refreshed.direction != original.direction or refreshed.score < min_trade_score:
-        status = "invalidated"
-        reason = "最新方向或综合评分已不满足原决策的可执行标准"
-    elif entry_low <= current_price <= entry_high:
+        return keep_plan_with_review(decision_status=status, reason=reason)
+    elif target_reached:
+        status = "target_reached"
+        reason = "价格已达到原决策首个止盈目标，本轮预测完成，禁止追价入场"
+        return keep_plan_with_review(decision_status=status, reason=reason)
+    else:
+        opposite_direction = refreshed.direction in {"LONG", "SHORT"} and refreshed.direction != original.direction
+        severe_score_drop = refreshed.score < max(0, min_trade_score - DECISION_SCORE_HYSTERESIS)
+        if opposite_direction or severe_score_drop:
+            soft_failure_count = min(original.soft_failure_count + 1, SOFT_FAILURE_CONFIRMATIONS)
+            if soft_failure_count >= SOFT_FAILURE_CONFIRMATIONS:
+                status = "invalidated"
+                reason = "最新方向或综合评分已连续两次不满足原决策的可执行标准"
+            else:
+                status = "confirming"
+                reason = "最新方向或评分首次异常，暂停执行并等待下一次复核确认"
+            return keep_plan_with_review(
+                decision_status=status,
+                reason=reason,
+                soft_failure_count=soft_failure_count,
+            )
+
+        release_score = min(100, min_trade_score + DECISION_SCORE_HYSTERESIS)
+        if refreshed.direction == "WAIT" or refreshed.score < release_score:
+            reason = f"最新评分处于确认缓冲区，达到 {release_score} 分且方向一致后恢复执行判断"
+            return keep_plan_with_review(decision_status="confirming", reason=reason)
+
+        reference_price = original.reference_price or sum(original.entry_range[:2]) / 2
+        favorable_miss = (
+            original.direction == "LONG" and current_price > max(entry_high, reference_price)
+        ) or (
+            original.direction == "SHORT" and current_price < min(entry_low, reference_price)
+        )
+        if favorable_miss:
+            missed_entry_count = min(original.missed_entry_count + 1, MISSED_ENTRY_CONFIRMATIONS)
+            favorable_entry = entry_high if original.direction == "LONG" else entry_low
+            target_distance = abs(first_target - favorable_entry)
+            missed_distance = abs(current_price - favorable_entry)
+            target_progress = missed_distance / target_distance if target_distance > 0 else 1.0
+            atr14 = refreshed.indicators.atr14 if refreshed.indicators else None
+            within_atr = atr14 is not None and atr14 > 0 and missed_distance <= atr14 * MAX_MISSED_ENTRY_ATR
+            new_entry_mid = sum(refreshed.entry_range[:2]) / 2
+            new_risk_distance = abs(new_entry_mid - refreshed.stop_loss)
+            new_reward_distance = abs(refreshed.take_profit[0] - new_entry_mid)
+            new_reward_risk = new_reward_distance / new_risk_distance if new_risk_distance > 0 else 0
+            can_reprice = (
+                missed_entry_count >= MISSED_ENTRY_CONFIRMATIONS
+                and original.decision_revision < MAX_DECISION_REVISIONS
+                and target_progress < MAX_TARGET_PROGRESS
+                and within_atr
+                and new_reward_risk >= MIN_REMAINING_REWARD_RISK
+            )
+            if can_reprice:
+                revision = original.decision_revision + 1
+                revision_reason = (
+                    f"价格朝原方向错过入场，偏离 {missed_distance:.6g}，"
+                    f"目标进度 {target_progress * 100:.1f}%，重新报价"
+                )
+                leverage = min(original.leverage, refreshed.leverage)
+                revised_sizing = calculate_position_sizing(
+                    total_amount=total_amount,
+                    direction=original.direction,
+                    confidence=refreshed.score,
+                    risk=refreshed.risk,
+                    entry_range=refreshed.entry_range,
+                    stop_loss=refreshed.stop_loss,
+                    leverage=leverage,
+                )
+                archived = DecisionRevisionSnapshot(
+                    revision=original.decision_revision,
+                    reference_price=original.reference_price,
+                    entry_range=original.entry_range,
+                    stop_loss=original.stop_loss,
+                    take_profit=original.take_profit,
+                    leverage=original.leverage,
+                    risk=original.risk,
+                    score=original.score,
+                    confidence=original.confidence,
+                    generated_at=original.generated_at,
+                    archived_at=now.isoformat(),
+                    archive_reason="missed_entry",
+                    revision_reason=original.revision_reason,
+                )
+                reason = f"已生成修订版 V{revision}，等待价格进入新的计划入场区间"
+                return original.model_copy(update={
+                    "confidence": refreshed.confidence,
+                    "score": refreshed.score,
+                    "score_breakdown": refreshed.score_breakdown,
+                    "entry_range": refreshed.entry_range,
+                    "stop_loss": refreshed.stop_loss,
+                    "take_profit": refreshed.take_profit,
+                    "leverage": leverage,
+                    "risk": refreshed.risk,
+                    "position_sizing": revised_sizing,
+                    "indicators": refreshed.indicators,
+                    "reasons": [reason, revision_reason, *refreshed.reasons],
+                    "source": refreshed.source,
+                    "analysis_engine": refreshed.analysis_engine,
+                    "analysis_model": refreshed.analysis_model,
+                    "decision_schema_version": refreshed.decision_schema_version,
+                    "strategy_version": refreshed.strategy_version,
+                    "strategy_parameters": refreshed.strategy_parameters,
+                    "reference_price": current_price,
+                    "current_price": current_price,
+                    "generated_at": now.isoformat(),
+                    "decision_revision": revision,
+                    "revision_reason": revision_reason,
+                    "revision_history": [*original.revision_history, archived],
+                    "soft_failure_count": 0,
+                    "missed_entry_count": 0,
+                    "decision_status": "watching",
+                    "is_executable": False,
+                    "status_reason": reason,
+                })
+
+            status = "missed_entry"
+            if original.decision_revision >= MAX_DECISION_REVISIONS:
+                reason = "已达到最多两次重新报价上限，等待回踩原修订区间"
+            elif target_progress >= MAX_TARGET_PROGRESS:
+                reason = f"原目标路径已完成 {target_progress * 100:.1f}%，禁止追价重新报价"
+            elif not within_atr:
+                reason = "价格偏离超过 0.5 ATR 或 ATR 数据不足，等待回踩"
+            elif missed_entry_count < MISSED_ENTRY_CONFIRMATIONS:
+                reason = "首次确认错过入场，等待下一次复核后再决定是否重新报价"
+            else:
+                reason = f"新计划剩余盈亏比 {new_reward_risk:.2f} 不足，等待回踩"
+            return keep_plan_with_review(
+                decision_status=status,
+                reason=reason,
+                missed_entry_count=missed_entry_count,
+            )
+
+    if entry_low <= current_price <= entry_high:
         risk_distance = abs(current_price - original.stop_loss)
         remaining_reward = abs(first_target - current_price)
         reward_risk = remaining_reward / risk_distance if risk_distance > 0 else 0
@@ -566,19 +735,11 @@ def refresh_decision_plan(
     else:
         reason = "价格已穿过原入场区间但尚未触及止损，等待重新进入计划区间"
 
-    return original.model_copy(update={
-        "confidence": refreshed.confidence,
-        "score": refreshed.score,
-        "score_breakdown": refreshed.score_breakdown,
-        "indicators": refreshed.indicators,
-        "source": refreshed.source,
-        "current_price": current_price,
-        "position_sizing": position_sizing,
-        "decision_status": status,
-        "is_executable": executable,
-        "status_reason": reason,
-        "reasons": [reason, *refreshed.reasons],
-    })
+    return keep_plan_with_review(
+        decision_status=status,
+        reason=reason,
+        is_executable=executable,
+    )
 
 
 def analyze_market(

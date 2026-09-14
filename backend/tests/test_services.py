@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app import services
-from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem
+from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem, TechnicalIndicators
 
 
 def test_user_fills_by_time_paginates_and_deduplicates(monkeypatch):
@@ -298,14 +298,128 @@ def test_decision_plan_invalidates_when_latest_signal_no_longer_meets_threshold(
         AnalysisRequest(symbol="TEST", timeframe="4h"), weak_market, 10_000
     )
 
-    decision = services.refresh_decision_plan(
+    first_review = services.refresh_decision_plan(
         original, refreshed, weak_market.price, "4h", 10_000,
         generated_at + timedelta(minutes=30),
     )
+    decision = services.refresh_decision_plan(
+        first_review, refreshed, weak_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=31),
+    )
 
+    assert first_review.decision_status == "confirming"
+    assert first_review.soft_failure_count == 1
     assert decision.decision_status == "invalidated"
     assert decision.is_executable is False
-    assert "不满足" in decision.status_reason
+    assert "连续两次" in decision.status_reason
+
+
+def test_missed_entry_creates_a_versioned_reprice_after_two_reviews():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed_market = market.model_copy(update={"price": 100.2, "change_24h": 2.2})
+    indicators = TechnicalIndicators(atr14=1.5, atr_percent=1.5)
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000, indicators
+    ).model_copy(update={
+        "direction": original.direction,
+        "score": max(original.score, 75),
+        "confidence": max(original.confidence, 75),
+    })
+
+    first_review = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=1),
+    )
+    revised = services.refresh_decision_plan(
+        first_review, refreshed, refreshed_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=2),
+    )
+
+    assert first_review.decision_status == "missed_entry"
+    assert first_review.missed_entry_count == 1
+    assert revised.plan_id == original.plan_id
+    assert revised.decision_revision == 2
+    assert revised.entry_range == refreshed.entry_range
+    assert revised.entry_range != original.entry_range
+    assert revised.stop_loss == refreshed.stop_loss
+    assert revised.take_profit == refreshed.take_profit
+    assert revised.revision_history[0].entry_range == original.entry_range
+    assert revised.revision_history[0].archive_reason == "missed_entry"
+    assert "重新报价" in revised.revision_reason
+
+
+def test_missed_entry_does_not_create_more_than_two_reprices():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    ).model_copy(update={
+        "generated_at": generated_at.isoformat(),
+        "decision_revision": 3,
+        "missed_entry_count": 1,
+    })
+    refreshed_market = market.model_copy(update={"price": 100.2, "change_24h": 2.2})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"),
+        refreshed_market,
+        10_000,
+        TechnicalIndicators(atr14=1.5, atr_percent=1.5),
+    ).model_copy(update={
+        "direction": original.direction,
+        "score": max(original.score, 75),
+        "confidence": max(original.confidence, 75),
+    })
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, refreshed_market.price, "4h", 10_000,
+        generated_at + timedelta(minutes=1),
+    )
+
+    assert decision.decision_revision == 3
+    assert decision.decision_status == "missed_entry"
+    assert "最多两次" in decision.status_reason
+
+
+def test_post_decision_candle_uses_stop_first_when_target_and_stop_both_touched():
+    generated_at = datetime(2026, 9, 13, 8, tzinfo=UTC)
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=2, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+    )
+    candle = Candle(
+        open_time=int(generated_at.timestamp() * 1000) + 1,
+        close_time=int(generated_at.timestamp() * 1000) + 60_000,
+        open=100,
+        high=max(original.take_profit[0], original.stop_loss) + 1,
+        low=min(original.take_profit[0], original.stop_loss) - 1,
+        close=100,
+        volume=1000,
+    )
+
+    decision = services.refresh_decision_plan(
+        original, refreshed, 100, "4h", 10_000,
+        generated_at + timedelta(minutes=1),
+        candles=[candle],
+    )
+
+    assert decision.decision_status == "invalidated"
+    assert "止损" in decision.status_reason
 
 
 def test_expired_decision_plan_allows_a_new_plan():

@@ -259,6 +259,44 @@ test("决策页展示固定参考价、当前复核价和可执行状态", async
   await expect(page.getByText("价格进入原入场区间，信号仍然有效。")).toBeVisible();
 });
 
+test("决策页展示错过入场后的修订版本和原计划", async ({ page }) => {
+  const revised = {
+    ...analysis("ETH"),
+    decision_revision: 2,
+    revision_reason: "价格朝原方向错过入场，重新报价",
+    revision_history: [{
+      revision: 1,
+      reference_price: 101,
+      entry_range: [98, 99],
+      stop_loss: 94,
+      take_profit: [107, 114],
+      leverage: 3,
+      risk: "medium",
+      score: 78,
+      confidence: 78,
+      generated_at: "2026-09-13T00:00:00Z",
+      archived_at: "2026-09-13T00:02:00Z",
+      archive_reason: "missed_entry",
+      revision_reason: null,
+    }],
+  };
+  await page.route("**/api/v1/ai/opportunities**", async (route) => {
+    await route.fulfill({ json: {
+      scanned_markets: 20,
+      eligible_markets: 8,
+      updated_at: "2026-09-13T00:02:00Z",
+      opportunities: [revised, analysis("SOL"), analysis("DOGE"), analysis("HYPE")],
+      platform: "hyperliquid",
+    } });
+  });
+
+  await page.locator(".bottom-nav button").nth(1).click();
+
+  await expect(page.getByRole("heading", { name: "执行计划 · V2" })).toBeVisible();
+  await expect(page.getByText("因错过原入场区间重新报价")).toBeVisible();
+  await expect(page.getByText(/原 V1 入场/)).toBeVisible();
+});
+
 test("缺少访问令牌时显示账号密码登录且不发送 AI 扫描请求", async ({ page }) => {
   await page.evaluate(() => {
     window.localStorage.setItem("alpha-e2e-skip-owner-token", "1");

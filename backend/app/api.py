@@ -201,6 +201,7 @@ async def start_execution(
             market.price,
             payload.timeframe,
             total_amount,
+            candles=candles,
         )
         if not verified_analysis.is_executable:
             raise ValueError(f"当前决策不可执行：{verified_analysis.status_reason}")
