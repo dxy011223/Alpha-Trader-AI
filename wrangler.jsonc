@@ -7,8 +7,22 @@
   "triggers": {
     "crons": ["* * * * *"]
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SIMULATION_SCHEDULER",
+        "class_name": "SimulationScheduler"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SimulationScheduler"]
+    }
+  ],
   "secrets": {
-    "required": ["OWNER_API_TOKEN", "DEVICE_SESSION_SECRET"]
+    "required": ["OWNER_API_TOKEN", "DEVICE_SESSION_SECRET", "BACKEND_SIGNING_PRIVATE_KEY"]
   },
   "assets": {
     "directory": "./mobile-app/dist/client",

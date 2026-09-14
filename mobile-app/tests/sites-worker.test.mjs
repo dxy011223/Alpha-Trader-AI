@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { access, readFile, stat } from "node:fs/promises";
 import test from "node:test";
-import worker from "../worker/app.js";
+import worker, { SimulationScheduler } from "../worker/app.js";
 import {
   findSimulationCandleGap,
   openServerSimulatedTrade,
@@ -554,6 +554,51 @@ test("scheduled simulation closes positions and persists heartbeat and audit eve
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("Durable Object scheduler starts once and always renews its alarm", async () => {
+  let alarm = null;
+  const storage = {
+    getAlarm: async () => alarm,
+    setAlarm: async (value) => { alarm = value; },
+  };
+  const state = { storage, waitUntil: () => undefined };
+  const scheduler = new SimulationScheduler(state, {});
+
+  assert.equal((await scheduler.fetch()).status, 204);
+  const firstAlarm = alarm;
+  assert.ok(firstAlarm > Date.now());
+  await scheduler.fetch();
+  assert.equal(alarm, firstAlarm);
+
+  const originalError = console.error;
+  console.error = () => undefined;
+  try {
+    await scheduler.alarm();
+  } finally {
+    console.error = originalError;
+  }
+  assert.ok(alarm >= firstAlarm);
+});
+
+test("app entry starts the backup scheduler without delaying the response", async () => {
+  const pending = [];
+  let starts = 0;
+  const response = await worker.fetch(new Request("https://example.test/app"), {
+    ASSETS: { fetch: async () => new Response("app", { headers: { "content-type": "text/html" } }) },
+    SIMULATION_SCHEDULER: {
+      getByName: (name) => {
+        assert.equal(name, "simulation-executor");
+        return { fetch: async () => { starts += 1; } };
+      },
+    },
+  }, {
+    waitUntil: (promise) => pending.push(promise),
+  });
+
+  assert.equal(response.status, 200);
+  await Promise.all(pending);
+  assert.equal(starts, 1);
 });
 
 test("deduplicates simulation history and proxies only anonymous decision policy", async () => {
@@ -1276,6 +1321,13 @@ test("keeps the Cloudflare deployment contract at the repository root", async ()
   assert.deepEqual(config.secrets.required, [
     "OWNER_API_TOKEN",
     "DEVICE_SESSION_SECRET",
+    "BACKEND_SIGNING_PRIVATE_KEY",
+  ]);
+  assert.deepEqual(config.durable_objects.bindings, [
+    { name: "SIMULATION_SCHEDULER", class_name: "SimulationScheduler" },
+  ]);
+  assert.deepEqual(config.migrations, [
+    { tag: "v1", new_sqlite_classes: ["SimulationScheduler"] },
   ]);
   assert.match(packageJson.scripts["migrate:cloudflare"], /d1 migrations apply alpha-trader-ai-db --remote/);
   assert.match(

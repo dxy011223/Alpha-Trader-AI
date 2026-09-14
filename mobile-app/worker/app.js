@@ -24,6 +24,7 @@ const SIMULATION_EXECUTOR_HEALTHY_MS = 3 * 60 * 1_000;
 const SIMULATION_EXECUTOR_WALLET_LIMIT = 30;
 const SIMULATION_MARKET_TIMEOUT_MS = 12_000;
 const SIMULATION_OPPORTUNITY_TIMEOUT_MS = 30_000;
+const SIMULATION_SCHEDULER_INTERVAL_MS = 60_000;
 
 function appendVary(headers, value) {
   const values = (headers.get("vary") || "").split(",").map((item) => item.trim().toLowerCase());
@@ -1263,6 +1264,41 @@ async function runScheduledSimulation(env, ctx) {
   }
 }
 
+export class SimulationScheduler {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch() {
+    if (await this.state.storage.getAlarm() === null) {
+      await this.state.storage.setAlarm(Date.now() + 1_000);
+    }
+    return new Response(null, { status: 204 });
+  }
+
+  async alarm() {
+    try {
+      await runScheduledSimulation(this.env, {
+        waitUntil: (promise) => this.state.waitUntil(promise),
+      });
+    } catch (error) {
+      console.error("模拟交易备用调度执行失败", error);
+    } finally {
+      // Alarm 不会自动重复，必须在每轮结束后显式续约。
+      await this.state.storage.setAlarm(Date.now() + SIMULATION_SCHEDULER_INTERVAL_MS);
+    }
+  }
+}
+
+function startSimulationScheduler(env, ctx) {
+  if (!env.SIMULATION_SCHEDULER || typeof ctx?.waitUntil !== "function") return;
+  const scheduler = env.SIMULATION_SCHEDULER.getByName("simulation-executor");
+  ctx.waitUntil(scheduler.fetch("https://simulation-scheduler.invalid/ensure").catch((error) => {
+    console.error("模拟交易备用调度启动失败", error);
+  }));
+}
+
 async function proxyBackend(
   request,
   env,
@@ -1392,6 +1428,9 @@ async function handleRequest(request, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (["/", "/app", "/index.html"].includes(url.pathname)) {
+      startSimulationScheduler(env, ctx);
+    }
     if (request.method === "OPTIONS" && url.pathname.startsWith("/api/") && APP_ORIGINS.has(request.headers.get("origin") || "")) {
       return withAppCors(request, new Response(null, { status: 204 }));
     }

@@ -94,7 +94,7 @@ Docker Compose 会同时启动 PostgreSQL、Redis、API、Celery Worker 与 Cele
 
 ## Cloudflare Sites 与 APK
 
-Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定。`npm run deploy:cloudflare` 会先显式执行 `wrangler d1 migrations apply alpha-trader-ai-db --remote`，成功后才发布 Worker，避免代码先于数据库结构上线。`OWNER_API_TOKEN` 和 `BACKEND_SIGNING_PRIVATE_KEY` 必须作为 Worker 运行时 secret 配置；后者只保存在 Cloudflare，用于向后端发送带时间戳和请求体摘要的签名。若需真实钱包、成交与 AI 复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。完整后端休眠或不可用时，Worker 可直接读取 Hyperliquid、Binance 与 OKX 公共行情和 K 线，并在边缘计算 EMA、RSI、MACD、ATR、成交量及资金费率准入规则，继续生成规则决策和执行模拟交易；真实账户、真实成交核验与 AI 复盘不会由边缘端伪造。
+Sites 使用 `.openai/hosting.json` 的逻辑 `DB` 绑定。`npm run deploy:cloudflare` 会先显式执行 `wrangler d1 migrations apply alpha-trader-ai-db --remote`，成功后才发布 Worker，避免代码先于数据库结构上线。模拟交易由每分钟 Cron 触发，并以 SQLite Durable Object Alarm 作为免费备用调度；D1 租约会阻止两条通道重复处理同一钱包。`OWNER_API_TOKEN` 和 `BACKEND_SIGNING_PRIVATE_KEY` 必须作为 Worker 运行时 secret 配置；后者只保存在 Cloudflare，用于向后端发送带时间戳和请求体摘要的签名。若需真实钱包、成交与 AI 复盘能力，还要把 `BACKEND_API_URL` 指向已部署的 HTTPS Python API。完整后端休眠或不可用时，Worker 可直接读取 Hyperliquid、Binance 与 OKX 公共行情和 K 线，并在边缘计算 EMA、RSI、MACD、ATR、成交量及资金费率准入规则，继续生成规则决策和执行模拟交易；真实账户、真实成交核验与 AI 复盘不会由边缘端伪造。
 
 可在 `mobile-app` 目录运行 `node scripts/ensure-owner-token.mjs` 生成或保留本机 `.env.local` 中的所有者令牌；脚本不会打印令牌，且该文件不会提交到 Git。
 
