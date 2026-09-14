@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import simulation_wallet
 from app.database import Base
-from app.schemas import AnalysisRequest, MarketSnapshot, SimulatedActiveTradePayload, SimulatedCompletedTradePayload, SimulationWalletUpdate
+from app.schemas import AnalysisRequest, MarketSnapshot, SimulatedActiveTradePayload, SimulatedCompletedTradePayload, SimulationWalletUpdate, TechnicalIndicators
 from app.services import analyze_market
 
 
@@ -24,7 +24,10 @@ def _analysis():
         source="live",
         platform="hyperliquid",
     )
-    return analyze_market(AnalysisRequest(symbol="TEST", timeframe="4h"), market, 1_000)
+    return analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 1_000,
+        TechnicalIndicators(ema20=110, ema50=100, ema200=90),
+    )
 
 
 def test_simulation_wallet_read_returns_default_without_creating_a_row(monkeypatch, tmp_path):

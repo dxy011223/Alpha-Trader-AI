@@ -1,10 +1,15 @@
-import type { AnalysisResponse, CompletedTradeRecord, MarketInterval, MarketPlatform } from "./alphaApi";
+import type { AnalysisResponse, Candle, CompletedTradeRecord, MarketInterval, MarketPlatform } from "./alphaApi";
 
 export const DEFAULT_SIMULATION_BALANCE = 1_000;
 export const MAX_ACTIVE_DECISIONS = 3;
 export const SIMULATION_CLIENT_ID_KEY = "alpha-simulation-client-id";
 export const SIMULATION_WALLETS_KEY = "alpha-simulation-wallets";
 export const simulationPlatforms: MarketPlatform[] = ["hyperliquid", "binance", "okx"];
+// 统一使用保守模拟假设，不冒充用户在各交易所的真实费率等级。
+export const SIMULATION_TAKER_FEE_RATE = 0.0005;
+export const SIMULATION_SLIPPAGE_RATE = 0.0002;
+export const SIMULATION_FUNDING_PERIOD_MS = 8 * 60 * 60 * 1_000;
+export const SIMULATION_FIRST_TARGET_CLOSE_RATE = 0.5;
 
 export type SimulatedExitReason = "take_profit" | "stop_loss";
 
@@ -13,16 +18,42 @@ export interface SimulatedTrade {
   analysis: AnalysisResponse;
   timeframe: MarketInterval;
   entryPrice: number;
+  plannedEntryPrice?: number;
+  triggerPrice?: number;
   size: number;
+  initialSize?: number;
   allocatedAmount: number;
   latestPrice: number;
   unrealizedPnl: number;
+  entryFee?: number;
+  realizedGrossPnl?: number;
+  realizedExitFee?: number;
+  firstTargetHit?: boolean;
+  effectiveStopLoss?: number;
+  fundingRatePercent?: number;
+  fundingAccrued?: number;
+  lastFundingAt?: number;
+  lastProcessedCandleCloseTime?: number;
+  maxFavorableExcursionPercent?: number;
+  maxAdverseExcursionPercent?: number;
   startedAt: number;
 }
 
 export interface SimulatedCompletedTrade extends CompletedTradeRecord {
   is_simulated: true;
   exit_reason: SimulatedExitReason;
+  max_favorable_excursion_percent?: number;
+  max_adverse_excursion_percent?: number;
+  funding_fee?: number;
+  slippage_rate?: number;
+  first_target_hit?: boolean;
+  planned_entry_price?: number;
+  trigger_price?: number;
+}
+
+export interface SimulatedTradeProcessResult {
+  activeTrade: SimulatedTrade | null;
+  completedTrade: SimulatedCompletedTrade | null;
 }
 
 export interface SimulationWalletState {
@@ -30,6 +61,7 @@ export interface SimulationWalletState {
   balance: number;
   activeTrades: SimulatedTrade[];
   history: SimulatedCompletedTrade[];
+  autoTimeframe: MarketInterval;
 }
 
 type LegacySimulationWalletState = Partial<SimulationWalletState> & {
@@ -52,6 +84,7 @@ export function createDefaultSimulationWallet(enabled = false): SimulationWallet
     balance: DEFAULT_SIMULATION_BALANCE,
     activeTrades: [],
     history: [],
+    autoTimeframe: "4h",
   };
 }
 
@@ -76,6 +109,19 @@ export function restoreSimulationWallet(raw: string | null, platform: MarketPlat
       .slice(0, MAX_ACTIVE_DECISIONS)
       .map((trade) => ({
           ...trade,
+          initialSize: Number.isFinite(trade.initialSize) ? trade.initialSize : trade.size,
+          entryFee: Number.isFinite(trade.entryFee) ? trade.entryFee : 0,
+          realizedGrossPnl: Number.isFinite(trade.realizedGrossPnl) ? trade.realizedGrossPnl : 0,
+          realizedExitFee: Number.isFinite(trade.realizedExitFee) ? trade.realizedExitFee : 0,
+          firstTargetHit: trade.firstTargetHit === true,
+          effectiveStopLoss: Number.isFinite(trade.effectiveStopLoss)
+            ? trade.effectiveStopLoss : trade.analysis.stop_loss,
+          fundingRatePercent: Number.isFinite(trade.fundingRatePercent)
+            ? trade.fundingRatePercent : normalizeFundingRate(trade.analysis.funding_rate),
+          fundingAccrued: Number.isFinite(trade.fundingAccrued) ? trade.fundingAccrued : 0,
+          lastFundingAt: Number.isFinite(trade.lastFundingAt) ? trade.lastFundingAt : trade.startedAt,
+          lastProcessedCandleCloseTime: Number.isFinite(trade.lastProcessedCandleCloseTime)
+            ? trade.lastProcessedCandleCloseTime : trade.startedAt,
           analysis: {
             ...trade.analysis,
             platform,
@@ -98,6 +144,10 @@ export function restoreSimulationWallet(raw: string | null, platform: MarketPlat
         : DEFAULT_SIMULATION_BALANCE,
       activeTrades,
       history,
+      autoTimeframe: typeof stored.autoTimeframe === "string"
+        && ["1m", "5m", "15m", "1h", "4h", "1d"].includes(stored.autoTimeframe)
+        ? stored.autoTimeframe as MarketInterval
+        : "4h",
     };
   } catch {
     return createDefaultSimulationWallet();
@@ -153,6 +203,48 @@ export function calculateSimulatedPnl(trade: Pick<SimulatedTrade, "analysis" | "
   return (price - trade.entryPrice) * trade.size * multiplier;
 }
 
+function stablePrice(value: number) {
+  return Number.isFinite(value) ? value.toPrecision(12) : "invalid";
+}
+
+export function buildSimulationSignalKey(
+  analysis: AnalysisResponse,
+  timeframe: MarketInterval,
+  platform: MarketPlatform = analysis.platform,
+) {
+  const planIdentity = analysis.plan_id?.trim() || [
+    analysis.generated_at || "legacy",
+    analysis.symbol,
+    analysis.direction,
+    analysis.entry_range.map(stablePrice).join("-"),
+    stablePrice(analysis.stop_loss),
+    analysis.take_profit.map(stablePrice).join("-"),
+  ].join(":");
+  return `${platform}:${timeframe}:${planIdentity}:v${analysis.decision_revision ?? 1}`;
+}
+
+function applyEntrySlippage(price: number, direction: AnalysisResponse["direction"]) {
+  return price * (direction === "SHORT" ? 1 - SIMULATION_SLIPPAGE_RATE : 1 + SIMULATION_SLIPPAGE_RATE);
+}
+
+function applyExitSlippage(price: number, direction: AnalysisResponse["direction"]) {
+  return price * (direction === "SHORT" ? 1 + SIMULATION_SLIPPAGE_RATE : 1 - SIMULATION_SLIPPAGE_RATE);
+}
+
+function normalizeFundingRate(value: unknown) {
+  const rate = Number(value);
+  return Number.isFinite(rate) ? rate : 0;
+}
+
+function fundingPaymentAt(trade: SimulatedTrade, now: number) {
+  const elapsed = Math.max(0, now - (trade.lastFundingAt ?? trade.startedAt));
+  const rate = normalizeFundingRate(trade.fundingRatePercent ?? trade.analysis.funding_rate) / 100;
+  const directionSign = trade.analysis.direction === "SHORT" ? -1 : 1;
+  const increment = trade.entryPrice * trade.size * rate
+    * (elapsed / SIMULATION_FUNDING_PERIOD_MS) * directionSign;
+  return (trade.fundingAccrued ?? 0) + increment;
+}
+
 export function openSimulatedTrade(
   analysis: AnalysisResponse,
   timeframe: MarketInterval,
@@ -162,52 +254,92 @@ export function openSimulatedTrade(
   if (analysis.direction === "WAIT") throw new Error("等待信号不能开启模拟交易");
   const validEntries = analysis.entry_range.filter((price) => Number.isFinite(price) && price > 0);
   if (validEntries.length === 0) throw new Error("决策缺少有效入场价格");
-  const entryPrice = validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
+  const plannedEntry = validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
+  const entryLow = Math.min(...validEntries);
+  const entryHigh = Math.max(...validEntries);
+  const currentPrice = Number(analysis.current_price);
+  const hasCurrentPrice = Number.isFinite(currentPrice) && currentPrice > 0;
+  if (hasCurrentPrice && (currentPrice < entryLow || currentPrice > entryHigh)) {
+    throw new Error("当前价格尚未进入决策入场区间");
+  }
+  const triggerPrice = hasCurrentPrice ? currentPrice : plannedEntry;
+  const entryPrice = applyEntrySlippage(triggerPrice, analysis.direction);
   // 模拟账户仅统计盈亏，不用余额限制决策样本的计划保证金。
   const requestedMargin = analysis.position_sizing?.margin_amount || Math.max(referenceBalance, DEFAULT_SIMULATION_BALANCE) * 0.1;
   const allocatedAmount = Math.max(requestedMargin, 0);
   if (allocatedAmount <= 0) throw new Error("决策缺少有效模拟保证金");
   const size = allocatedAmount * Math.max(analysis.leverage, 1) / entryPrice;
+  const entryFee = entryPrice * size * SIMULATION_TAKER_FEE_RATE;
 
   return {
     id: -Math.max(1, now),
     analysis,
     timeframe,
     entryPrice,
+    plannedEntryPrice: plannedEntry,
+    triggerPrice,
     size,
+    initialSize: size,
     allocatedAmount,
     latestPrice: entryPrice,
-    unrealizedPnl: 0,
+    unrealizedPnl: -entryFee,
+    entryFee,
+    realizedGrossPnl: 0,
+    realizedExitFee: 0,
+    firstTargetHit: false,
+    effectiveStopLoss: analysis.stop_loss,
+    fundingRatePercent: normalizeFundingRate(analysis.funding_rate),
+    fundingAccrued: 0,
+    lastFundingAt: now,
+    lastProcessedCandleCloseTime: now,
+    maxFavorableExcursionPercent: 0,
+    maxAdverseExcursionPercent: 0,
     startedAt: now,
   };
 }
 
-export function updateSimulatedTrade(trade: SimulatedTrade, currentPrice: number): SimulatedTrade {
+export function updateSimulatedTrade(trade: SimulatedTrade, currentPrice: number, now = Date.now()): SimulatedTrade {
+  const unrealizedPnl = (trade.realizedGrossPnl ?? 0)
+    + calculateSimulatedPnl(trade, currentPrice)
+    - (trade.entryFee ?? 0)
+    - (trade.realizedExitFee ?? 0)
+    - fundingPaymentAt(trade, now);
+  const excursionPercent = trade.allocatedAmount > 0
+    ? unrealizedPnl / trade.allocatedAmount * 100
+    : 0;
   return {
     ...trade,
     latestPrice: currentPrice,
-    unrealizedPnl: calculateSimulatedPnl(trade, currentPrice),
+    unrealizedPnl,
+    fundingAccrued: fundingPaymentAt(trade, now),
+    lastFundingAt: now,
+    maxFavorableExcursionPercent: Math.max(
+      trade.maxFavorableExcursionPercent ?? 0,
+      excursionPercent,
+    ),
+    maxAdverseExcursionPercent: Math.min(
+      trade.maxAdverseExcursionPercent ?? 0,
+      excursionPercent,
+    ),
   };
 }
 
-export function closeSimulatedTradeIfTriggered(
+function completeSimulatedTrade(
   trade: SimulatedTrade,
-  currentPrice: number,
-  now = Date.now(),
-): SimulatedCompletedTrade | null {
+  plannedExitPrice: number,
+  exitReason: SimulatedExitReason,
+  now: number,
+): SimulatedCompletedTrade {
   const direction = trade.analysis.direction;
-  if (direction === "WAIT") return null;
-  const target = trade.analysis.take_profit[0];
-  const stop = trade.analysis.stop_loss;
-  const isLong = direction === "LONG";
-  const exitReason: SimulatedExitReason | null = isLong
-    ? currentPrice <= stop ? "stop_loss" : currentPrice >= target ? "take_profit" : null
-    : currentPrice >= stop ? "stop_loss" : currentPrice <= target ? "take_profit" : null;
-  if (!exitReason) return null;
-
-  // 触发后按计划价结算，避免轮询间隔造成不确定滑点。
-  const exitPrice = exitReason === "stop_loss" ? stop : target;
-  const grossPnl = calculateSimulatedPnl(trade, exitPrice);
+  if (direction === "WAIT") throw new Error("等待信号不能完成模拟交易");
+  const exitPrice = applyExitSlippage(plannedExitPrice, direction);
+  const remainingGrossPnl = calculateSimulatedPnl(trade, exitPrice);
+  const grossPnl = (trade.realizedGrossPnl ?? 0) + remainingGrossPnl;
+  const exitFee = exitPrice * trade.size * SIMULATION_TAKER_FEE_RATE;
+  const fee = (trade.entryFee ?? 0) + (trade.realizedExitFee ?? 0) + exitFee;
+  const fundingFee = fundingPaymentAt(trade, now);
+  const netPnl = grossPnl - fee - fundingFee;
+  const exitPnlPercent = netPnl / trade.allocatedAmount * 100;
   return {
     id: trade.id,
     decision_id: trade.id,
@@ -216,13 +348,15 @@ export function closeSimulatedTradeIfTriggered(
     symbol: trade.analysis.symbol,
     direction,
     entry_price: trade.entryPrice,
+    planned_entry_price: trade.plannedEntryPrice,
+    trigger_price: trade.triggerPrice,
     exit_price: exitPrice,
-    size: trade.size,
-    fee: 0,
+    size: trade.initialSize ?? trade.size,
+    fee,
     gross_pnl: grossPnl,
-    net_pnl: grossPnl,
-    pnl_percent: grossPnl / trade.allocatedAmount * 100,
-    entry_source: "plan",
+    net_pnl: netPnl,
+    pnl_percent: exitPnlPercent,
+    entry_source: trade.analysis.platform,
     exit_source: trade.analysis.platform,
     closed_at: new Date(now).toISOString(),
     analysis: trade.analysis,
@@ -232,5 +366,119 @@ export function closeSimulatedTradeIfTriggered(
     platform: trade.analysis.platform,
     is_simulated: true,
     exit_reason: exitReason,
+    funding_fee: fundingFee,
+    slippage_rate: SIMULATION_SLIPPAGE_RATE,
+    first_target_hit: trade.firstTargetHit === true,
+    max_favorable_excursion_percent: Math.max(
+      trade.maxFavorableExcursionPercent ?? 0,
+      exitPnlPercent,
+    ),
+    max_adverse_excursion_percent: Math.min(
+      trade.maxAdverseExcursionPercent ?? 0,
+      exitPnlPercent,
+    ),
   };
+}
+
+export function processSimulatedPriceRange(
+  trade: SimulatedTrade,
+  lowPrice: number,
+  highPrice: number,
+  closePrice: number,
+  now = Date.now(),
+): SimulatedTradeProcessResult {
+  const direction = trade.analysis.direction;
+  if (direction === "WAIT") return { activeTrade: trade, completedTrade: null };
+  const isLong = direction === "LONG";
+  const firstTarget = trade.analysis.take_profit[0];
+  const secondTarget = trade.analysis.take_profit[1] ?? firstTarget;
+  const effectiveStop = trade.effectiveStopLoss ?? trade.analysis.stop_loss;
+  // 轮询无法还原两个价位在间隔内的先后顺序，同时越界时按保守止损结算。
+  const stopReached = isLong ? lowPrice <= effectiveStop : highPrice >= effectiveStop;
+  if (stopReached) {
+    return {
+      activeTrade: null,
+      completedTrade: completeSimulatedTrade(trade, effectiveStop, "stop_loss", now),
+    };
+  }
+
+  let activeTrade = trade;
+  const firstTargetReached = isLong ? highPrice >= firstTarget : lowPrice <= firstTarget;
+  if (!trade.firstTargetHit && firstTargetReached) {
+    const closedSize = trade.size * SIMULATION_FIRST_TARGET_CLOSE_RATE;
+    const firstExitPrice = applyExitSlippage(firstTarget, direction);
+    const partialTrade = { ...trade, size: closedSize };
+    const partialGrossPnl = calculateSimulatedPnl(partialTrade, firstExitPrice);
+    const partialExitFee = firstExitPrice * closedSize * SIMULATION_TAKER_FEE_RATE;
+    activeTrade = {
+      ...trade,
+      size: trade.size - closedSize,
+      realizedGrossPnl: (trade.realizedGrossPnl ?? 0) + partialGrossPnl,
+      realizedExitFee: (trade.realizedExitFee ?? 0) + partialExitFee,
+      firstTargetHit: true,
+      effectiveStopLoss: trade.entryPrice,
+      fundingAccrued: fundingPaymentAt(trade, now),
+      lastFundingAt: now,
+    };
+  }
+
+  const secondTargetReached = activeTrade.firstTargetHit
+    && (isLong ? highPrice >= secondTarget : lowPrice <= secondTarget);
+  if (secondTargetReached) {
+    return {
+      activeTrade: null,
+      completedTrade: completeSimulatedTrade(activeTrade, secondTarget, "take_profit", now),
+    };
+  }
+  return {
+    activeTrade: updateSimulatedTrade(activeTrade, closePrice, now),
+    completedTrade: null,
+  };
+}
+
+export function processSimulatedTrade(
+  trade: SimulatedTrade,
+  currentPrice: number,
+  now = Date.now(),
+): SimulatedTradeProcessResult {
+  return processSimulatedPriceRange(trade, currentPrice, currentPrice, currentPrice, now);
+}
+
+export function processSimulatedCandles(
+  trade: SimulatedTrade,
+  candles: Candle[],
+  currentPrice: number,
+  now = Date.now(),
+): SimulatedTradeProcessResult {
+  let activeTrade = trade;
+  const lastProcessed = trade.lastProcessedCandleCloseTime ?? trade.startedAt;
+  const completedCandles = candles
+    .filter((candle) => (
+      candle.open_time >= trade.startedAt
+      && candle.close_time > lastProcessed
+      && candle.close_time <= now
+      && [candle.low, candle.high, candle.close].every((price) => Number.isFinite(price) && price > 0)
+    ))
+    .sort((left, right) => left.close_time - right.close_time);
+
+  for (const candle of completedCandles) {
+    const result = processSimulatedPriceRange(
+      activeTrade, candle.low, candle.high, candle.close, candle.close_time,
+    );
+    if (result.completedTrade) return result;
+    activeTrade = {
+      ...result.activeTrade!,
+      lastProcessedCandleCloseTime: candle.close_time,
+    };
+  }
+
+  return processSimulatedTrade(activeTrade, currentPrice, now);
+}
+
+export function closeSimulatedTradeIfTriggered(
+  trade: SimulatedTrade,
+  currentPrice: number,
+  now = Date.now(),
+): SimulatedCompletedTrade | null {
+  return processSimulatedTrade(trade, currentPrice, now).completedTrade;
 }

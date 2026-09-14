@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import trade_records
 from app.database import Base
-from app.schemas import AnalysisRequest, ExecutionCreate, MarketSnapshot
+from app.schemas import AnalysisRequest, ExecutionCreate, MarketSnapshot, TechnicalIndicators
 from app.services import analyze_market
 
 
@@ -23,7 +23,8 @@ def _execution_payload(platform: str = "hyperliquid", symbol: str = "TEST") -> E
         platform=platform,
     )
     analysis = analyze_market(
-        AnalysisRequest(symbol=symbol, timeframe="4h", platform=platform), market, 10_000
+        AnalysisRequest(symbol=symbol, timeframe="4h", platform=platform), market, 10_000,
+        TechnicalIndicators(ema20=110, ema50=100, ema200=90),
     )
     return ExecutionCreate(analysis=analysis, timeframe="4h", total_amount=10_000)
 

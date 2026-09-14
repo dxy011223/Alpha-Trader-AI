@@ -2,9 +2,93 @@ import assert from "node:assert/strict";
 import { access, readFile, stat } from "node:fs/promises";
 import test from "node:test";
 import worker from "../worker/app.js";
+import {
+  findSimulationCandleGap,
+  openServerSimulatedTrade,
+  processServerSimulatedCandles,
+  processServerSimulatedPriceRange,
+  SIMULATION_FUNDING_PERIOD_MS,
+} from "../worker/simulation-engine.js";
 
 const OWNER_TOKEN = "test-owner-token-abcdefghijklmnopqrstuvwxyz";
 const authHeaders = { authorization: `Bearer ${OWNER_TOKEN}` };
+const CORE_TEST_SYMBOLS = ["BTC", "ETH", "SOL", "HYPE"];
+
+function executableAnalysis(overrides = {}) {
+  return {
+    symbol: "BTC",
+    direction: "LONG",
+    entry_range: [99, 101],
+    current_price: 100,
+    stop_loss: 95,
+    take_profit: [105, 110],
+    leverage: 2,
+    funding_rate: 0.01,
+    position_sizing: { margin_amount: 100 },
+    platform: "hyperliquid",
+    is_executable: true,
+    ...overrides,
+  };
+}
+
+test("server simulation engine rejects stale entries and applies execution costs", () => {
+  assert.throws(
+    () => openServerSimulatedTrade(executableAnalysis({ current_price: 102 }), "4h", 1_000, 1_000),
+    /入场区间/,
+  );
+  const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, 1_000);
+  assert.equal(trade.triggerPrice, 100);
+  assert.equal(trade.entryPrice, 100.02);
+  assert.ok(trade.entryFee > 0);
+  assert.ok(trade.unrealizedPnl < 0);
+});
+
+test("server simulation engine replays candles conservatively and closes at the second target", () => {
+  const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, 1_000);
+  const ambiguous = processServerSimulatedPriceRange(trade, 94, 111, 100, 2_000);
+  assert.equal(ambiguous.completedTrade.exit_reason, "stop_loss");
+
+  const firstTarget = processServerSimulatedPriceRange(trade, 99, 106, 104, 2_000);
+  assert.equal(firstTarget.activeTrade.firstTargetHit, true);
+  assert.equal(firstTarget.activeTrade.size, trade.size / 2);
+  assert.equal(firstTarget.activeTrade.effectiveStopLoss, trade.entryPrice);
+
+  const completed = processServerSimulatedCandles(firstTarget.activeTrade, [{
+    open_time: 2_000,
+    close_time: 3_000,
+    open: 104,
+    high: 111,
+    low: 103,
+    close: 110,
+    volume: 10,
+  }], 110, 3_000);
+  assert.equal(completed.completedTrade.exit_reason, "take_profit");
+  assert.equal(completed.completedTrade.first_target_hit, true);
+  assert.ok(completed.completedTrade.net_pnl > 0);
+});
+
+test("server simulation engine accrues funding by elapsed time", () => {
+  const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, 1_000);
+  const updated = processServerSimulatedPriceRange(
+    trade, 100, 100, 100, 1_000 + SIMULATION_FUNDING_PERIOD_MS,
+  );
+  assert.ok(updated.activeTrade.fundingAccrued > 0);
+  assert.ok(updated.activeTrade.unrealizedPnl < -trade.entryFee);
+});
+
+test("server simulation engine pauses when historical candles contain a gap", () => {
+  const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, 1_000);
+  const gap = findSimulationCandleGap(trade, [{
+    open_time: 600_000,
+    close_time: 660_000,
+    open: 100,
+    high: 110,
+    low: 90,
+    close: 100,
+    volume: 10,
+  }], 720_000);
+  assert.equal(gap.reason, "历史 K 线不足，无法可靠还原止盈止损触发顺序");
+});
 
 test("allows Capacitor API requests without authenticating the CORS preflight", async () => {
   const response = await worker.fetch(new Request("https://example.test/api/v1/ai/analyze", {
@@ -44,10 +128,31 @@ function createSimulationDatabase() {
   const passwordCredentials = new Map();
   const loginRateLimits = new Map();
   const decisionPlans = new Map();
+  const executorStates = new Map();
+  const simulationEvents = new Map();
   let writes = 0;
   return {
     get writes() { return writes; },
     get passwordCredentials() { return passwordCredentials; },
+    get simulationEvents() { return simulationEvents; },
+    get simulationWallets() { return wallets; },
+    async batch(statements) {
+      const snapshots = {
+        wallets: new Map([...wallets].map(([key, value]) => [key, structuredClone(value)])),
+        events: new Map([...simulationEvents].map(([key, value]) => [key, structuredClone(value)])),
+      };
+      try {
+        const results = [];
+        for (const statement of statements) results.push(await statement.run());
+        return results;
+      } catch (error) {
+        wallets.clear();
+        simulationEvents.clear();
+        for (const [key, value] of snapshots.wallets) wallets.set(key, value);
+        for (const [key, value] of snapshots.events) simulationEvents.set(key, value);
+        throw error;
+      }
+    },
     prepare(sql) {
       let params = [];
       return {
@@ -96,11 +201,105 @@ function createSimulationDatabase() {
             });
           } else if (sql.includes("owner_capital_settings")) {
             capital.set(params[0], { total_amount: params[1], currency: "USDT", updated_at: params[2] });
+          } else if (sql.includes("UPDATE owner_simulation_wallets")) {
+            const isSettingsUpdate = sql.includes("SET enabled = ?, auto_timeframe");
+            const [ownerId, clientId, platform, expectedRevision] = isSettingsUpdate
+              ? [params[8], params[9], params[10], params[11]]
+              : [params[7], params[8], params[9], params[10]];
+            const key = `${ownerId}:${clientId}:${platform}`;
+            const record = wallets.get(key);
+            if (!record || Number(record.revision ?? 0) !== expectedRevision || (!isSettingsUpdate && !record.enabled)) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            if (isSettingsUpdate) {
+              const reset = params[2] === 1;
+              wallets.set(key, {
+                ...record,
+                enabled: params[0],
+                auto_timeframe: params[1],
+                balance: reset ? 1_000 : record.balance,
+                active_trade: reset ? null : record.active_trade,
+                history: reset ? "[]" : record.history,
+                integrity_status: reset ? "ok" : record.integrity_status,
+                integrity_error: reset ? null : record.integrity_error,
+                updated_at: params[7],
+                revision: Number(record.revision ?? 0) + 1,
+              });
+            } else {
+              wallets.set(key, {
+                ...record,
+                balance: params[0],
+                active_trade: params[1],
+                history: params[2],
+                integrity_status: params[3],
+                integrity_error: params[4],
+                last_executor_run_id: params[5],
+                updated_at: params[6],
+                revision: Number(record.revision ?? 0) + 1,
+              });
+            }
+          } else if (sql.includes("UPDATE simulation_executor_state")) {
+            const key = `${params[4]}:${params[5]}:${params[6]}`;
+            const existing = executorStates.get(key);
+            if (!existing || existing.lease_id !== params[7]) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            executorStates.set(key, {
+              ...existing,
+              last_run_at: params[0],
+              last_success_at: params[1],
+              last_error: params[2],
+              updated_at: params[3],
+              lease_id: null,
+              lease_until: null,
+            });
+          } else if (sql.includes("INSERT INTO simulation_executor_state")) {
+            const [ownerId, clientId, platform] = params;
+            const key = `${ownerId}:${clientId}:${platform}`;
+            if (sql.includes("lease_id = excluded.lease_id")) {
+              const existing = executorStates.get(key);
+              if (Number(existing?.lease_until || 0) > params[7]) {
+                return { success: true, meta: { changes: 0 } };
+              }
+              executorStates.set(key, {
+                ...existing,
+                last_run_at: params[3],
+                updated_at: params[4],
+                lease_id: params[5],
+                lease_until: params[6],
+              });
+            }
+          } else if (sql.includes("INSERT OR IGNORE INTO simulation_trade_events")) {
+            const wallet = wallets.get(`${params[8]}:${params[9]}:${params[10]}`);
+            if (params.length > 8 && wallet?.last_executor_run_id !== params[11]) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            simulationEvents.set(params[0], {
+              event_id: params[0],
+              owner_id: params[1],
+              client_id: params[2],
+              platform: params[3],
+              trade_id: params[4],
+              event_type: params[5],
+              occurred_at: params[6],
+              payload_json: params[7],
+            });
           } else if (sql.includes("owner_simulation_wallets")) {
             const key = `${params[0]}:${params[1]}:${params[2]}`;
-            wallets.set(key, { enabled: params[3], balance: params[4], active_trade: params[5], history: params[6], updated_at: params[7] });
+            wallets.set(key, {
+              platform: params[2],
+              enabled: params[3],
+              balance: 1_000,
+              active_trade: null,
+              history: "[]",
+              auto_timeframe: params[4],
+              updated_at: params[5],
+              revision: 0,
+              integrity_status: "ok",
+              integrity_error: null,
+            });
           } else if (sql.includes("owner_decision_plan_scans")) {
-            decisionPlans.set(`${params[0]}:${params[1]}`, { scan_json: params[2], updated_at: params[3] });
+            decisionPlans.set(`${params[0]}:${params[1]}:${params[2]}`, { scan_json: params[3], updated_at: params[4] });
           }
           return { success: true, meta: { changes: 1 } };
         },
@@ -111,8 +310,45 @@ function createSimulationDatabase() {
           }
           if (sql.includes("FROM auth_login_rate_limits")) return loginRateLimits.get(params[0]) ?? null;
           if (sql.includes("owner_capital_settings")) return capital.get(params[0]) ?? null;
-          if (sql.includes("owner_decision_plan_scans")) return decisionPlans.get(`${params[0]}:${params[1]}`) ?? null;
+          if (sql.includes("owner_decision_plan_scans")) return decisionPlans.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
+          if (sql.includes("FROM simulation_executor_state")) return executorStates.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
           return wallets.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
+        },
+        async all() {
+          if (sql.includes("FROM simulation_trade_events")) {
+            const ownerId = params[0];
+            const clientId = sql.includes("client_id = ?") ? params[1] : null;
+            const platform = clientId ? params[2] : null;
+            const requestedLimit = Number(params.at(-1));
+            const limit = Number.isFinite(requestedLimit) ? requestedLimit : 6000;
+            return {
+              results: [...simulationEvents.values()]
+                .filter((event) => event.owner_id === ownerId
+                  && (!clientId || event.client_id === clientId)
+                  && (!platform || event.platform === platform)
+                  && (!sql.includes("event_type = 'closed'") || event.event_type === "closed"))
+                .sort((left, right) => right.occurred_at.localeCompare(left.occurred_at))
+                .slice(0, limit),
+            };
+          }
+          if (sql.includes("WHERE enabled = 1") || sql.includes("WHERE w.enabled = 1")) {
+            return {
+              results: [...wallets.entries()]
+                .filter(([, value]) => Boolean(value.enabled))
+                .slice(0, Number(params[0]))
+                .map(([key, value]) => {
+                  const [owner_id, client_id, platform] = key.split(":");
+                  return { owner_id, client_id, platform, ...value };
+                }),
+            };
+          }
+          if (!sql.includes("owner_simulation_wallets")) return { results: [] };
+          const ownerPrefix = `${params[0]}:`;
+          return {
+            results: [...wallets.entries()]
+              .filter(([key]) => key.startsWith(ownerPrefix))
+              .map(([, value]) => ({ platform: value.platform, history: value.history })),
+          };
         },
       };
     },
@@ -134,22 +370,33 @@ test("persists simulation wallet state through the D1 binding", async () => {
     activeTrades: [],
     activeTrade: null,
     history: [],
+    autoTimeframe: "4h",
+    revision: 0,
+    integrity: { status: "ok", detail: null },
+    executor: {
+      mode: "server",
+      healthy: false,
+      last_run_at: null,
+      last_success_at: null,
+      last_error: null,
+    },
   });
 
-  const activeTrades = [{ id: 1 }, { id: 2 }, { id: 3 }];
+  const activeTrades = [{ id: 1, analysis: { platform: "okx" } }, { id: 2 }, { id: 3 }];
   const saved = await worker.fetch(new Request(url, {
     method: "PUT",
     headers: { "content-type": "application/json", ...authHeaders },
-    body: JSON.stringify({ enabled: true, balance: -125.5, activeTrades, history: [] }),
+    body: JSON.stringify({ enabled: true, balance: -125.5, activeTrades, history: [{ net_pnl: 999 }], autoTimeframe: "1h" }),
   }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
   const payload = await saved.json();
   assert.equal(payload.enabled, true);
-  assert.equal(payload.balance, -125.5);
-  assert.deepEqual(payload.activeTrades, activeTrades);
-  assert.deepEqual(payload.activeTrade, activeTrades[0], "旧版客户端仍可读取首笔执行状态");
+  assert.equal(payload.balance, 1_000, "客户端上传的余额必须被忽略");
+  assert.deepEqual(payload.activeTrades, [], "客户端上传的持仓必须被忽略");
+  assert.deepEqual(payload.history, [], "客户端上传的历史必须被忽略");
+  assert.equal(payload.autoTimeframe, "1h");
 
   const reloaded = await worker.fetch(new Request(url, { headers: authHeaders }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
-  assert.deepEqual((await reloaded.json()).activeTrades, activeTrades);
+  assert.deepEqual((await reloaded.json()).activeTrades, []);
 
   const hyperliquid = await worker.fetch(new Request(
     "https://example.test/api/v1/simulation/wallet/device_test_12345678?platform=hyperliquid",
@@ -164,10 +411,275 @@ test("persists simulation wallet state through the D1 binding", async () => {
   const rejected = await worker.fetch(new Request(url, {
     method: "PUT",
     headers: { "content-type": "application/json", ...authHeaders },
-    body: JSON.stringify({ enabled: true, balance: 1_000, activeTrades: [{}, {}, {}, {}], history: [] }),
+    body: JSON.stringify({ enabled: true, autoTimeframe: "2h" }),
   }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
   assert.equal(rejected.status, 422);
-  assert.equal(DB.writes, 1, "超过三笔的模拟交易不得写入数据库");
+  assert.equal(DB.writes, 1, "非法自动周期不得写入数据库");
+});
+
+test("rejects stale simulation wallet revisions instead of overwriting newer data", async () => {
+  const DB = createSimulationDatabase();
+  const url = "https://example.test/api/v1/simulation/wallet/device_revision_12345678?platform=okx";
+  const save = (autoTimeframe, revision) => worker.fetch(new Request(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ enabled: true, autoTimeframe, revision }),
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+
+  const created = await save("4h", 0);
+  assert.equal((await created.json()).revision, 0);
+  const updated = await save("1h", 0);
+  assert.equal((await updated.json()).revision, 1);
+  const stale = await save("1d", 0);
+  assert.equal(stale.status, 409);
+  const reloaded = await worker.fetch(new Request(url, { headers: authHeaders }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal((await reloaded.json()).autoTimeframe, "1h");
+});
+
+test("server validates manual simulation execution and exposes audit events", async () => {
+  const DB = createSimulationDatabase();
+  const url = "https://example.test/api/v1/simulation/wallet/device_execute_12345678?platform=hyperliquid";
+  const created = await worker.fetch(new Request(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ enabled: true, autoTimeframe: "1h", revision: 0 }),
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(created.status, 200);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (request) => {
+    const target = new URL(request.url);
+    if (target.pathname.endsWith("/ai/opportunities")) {
+      return Response.json({ opportunities: [executableAnalysis({ plan_id: "verified-plan" })] });
+    }
+    return Response.json({});
+  };
+  try {
+    const executed = await worker.fetch(new Request(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({
+        action: "execute",
+        plan_id: "verified-plan",
+        symbol: "BTC",
+        timeframe: "1h",
+        revision: 0,
+        analysis: executableAnalysis({ direction: "SHORT" }),
+      }),
+    }), { DB, OWNER_API_TOKEN: OWNER_TOKEN, BACKEND_API_URL: "https://backend.example.test" }, {});
+    const wallet = await executed.json();
+    assert.equal(executed.status, 200);
+    assert.equal(wallet.activeTrades.length, 1);
+    assert.equal(wallet.activeTrades[0].analysis.direction, "LONG", "客户端伪造的决策内容必须被忽略");
+
+    const events = await worker.fetch(new Request(
+      "https://example.test/api/v1/simulation/wallet/device_execute_12345678/events?platform=hyperliquid&limit=20",
+      { headers: authHeaders },
+    ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+    const eventPayload = await events.json();
+    assert.equal(eventPayload.items.length, 1);
+    assert.equal(eventPayload.items[0].event_type, "opened");
+    assert.equal(eventPayload.items[0].payload.trade.analysis.direction, "LONG");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("scheduled simulation closes positions and persists heartbeat and audit events", async () => {
+  const DB = createSimulationDatabase();
+  const now = Date.now();
+  const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, now - 2 * 60 * 60 * 1_000);
+  const walletUrl = "https://example.test/api/v1/simulation/wallet/device_cron_12345678?platform=hyperliquid";
+  const saved = await worker.fetch(new Request(walletUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ enabled: true, balance: 1_000, activeTrades: [trade], history: [] }),
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(saved.status, 200);
+  const secondWalletUrl = "https://example.test/api/v1/simulation/wallet/device_cron_87654321?platform=hyperliquid";
+  const secondSaved = await worker.fetch(new Request(secondWalletUrl, {
+    method: "PUT",
+    headers: { "content-type": "application/json", ...authHeaders },
+    body: JSON.stringify({ enabled: true, balance: 1_000, activeTrades: [trade], history: [] }),
+  }), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal(secondSaved.status, 200);
+  for (const record of DB.simulationWallets.values()) record.active_trade = JSON.stringify([trade]);
+
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  const upstreamUrls = [];
+  globalThis.fetch = async (request) => {
+    upstreamCalls += 1;
+    const url = new URL(request.url);
+    upstreamUrls.push(url.toString());
+    if (url.pathname.endsWith("/candles")) {
+      const start = trade.lastProcessedCandleCloseTime;
+      return Response.json(Array.from({ length: 119 }, (_, index) => ({
+        open_time: start + index * 60_000,
+        close_time: start + (index + 1) * 60_000,
+        open: 100,
+        high: index === 118 ? 111 : 101,
+        low: 99,
+        close: index === 118 ? 110 : 100,
+        volume: 10,
+      })));
+    }
+    if (url.pathname.endsWith("/ai/opportunities")) {
+      return Response.json({ opportunities: [] });
+    }
+    return Response.json({ price: 110 });
+  };
+  try {
+    const env = {
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+      BACKEND_API_URL: "https://backend.example.test",
+    };
+    await Promise.all([worker.scheduled({}, env, {}), worker.scheduled({}, env, {})]);
+    const response = await worker.fetch(new Request(walletUrl, { headers: authHeaders }), env);
+    const wallet = await response.json();
+    assert.equal(wallet.activeTrades.length, 0);
+    assert.equal(wallet.history.length, 1);
+    assert.equal(wallet.history[0].exit_reason, "take_profit");
+    assert.ok(wallet.balance > 1_000);
+    assert.equal(wallet.executor.healthy, true);
+    assert.equal(wallet.executor.last_error, null);
+    const secondResponse = await worker.fetch(new Request(secondWalletUrl, { headers: authHeaders }), env);
+    assert.equal((await secondResponse.json()).history.length, 1);
+    assert.equal(DB.simulationEvents.size, 2);
+    assert.equal([...DB.simulationEvents.values()][0].event_type, "closed");
+    assert.equal(upstreamCalls, 3, "同一轮相同行情应跨设备复用，重叠定时任务不得重复执行");
+    assert.ok(upstreamUrls.some((url) => url.includes("interval=1m&limit=180")), "中断后应扩大 K 线回放窗口");
+    assert.ok(upstreamUrls.some((url) => url.includes("/ai/opportunities") && url.includes("limit=20")), "后台应扫描足够候选以填补去重后的空位");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("deduplicates simulation history and proxies only anonymous decision policy", async () => {
+  const DB = createSimulationDatabase();
+  const history = Array.from({ length: 12 }, (_, index) => ({
+    id: -(index + 1),
+    symbol: "BTC",
+    direction: "LONG",
+    started_at: `2026-09-14T00:${String(index).padStart(2, "0")}:00.000Z`,
+    closed_at: `2026-09-14T01:${String(index).padStart(2, "0")}:00.000Z`,
+    net_pnl: index < 8 ? 20 : -10,
+    timeframe: "4h",
+    analysis: { position_sizing: { max_loss_amount: 10 } },
+  }));
+  const save = (clientId, platform = "hyperliquid") => worker.fetch(new Request(
+    `https://example.test/api/v1/simulation/wallet/${clientId}?platform=${platform}`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json", ...authHeaders },
+      body: JSON.stringify({ enabled: true, autoTimeframe: "4h" }),
+    },
+  ), { DB, OWNER_API_TOKEN: OWNER_TOKEN });
+  assert.equal((await save("device_history_12345678")).status, 200);
+  assert.equal((await save("device_history_87654321")).status, 200);
+  const otherTimeframeHistory = history.map((trade, index) => ({
+    ...trade,
+    id: -(index + 101),
+    timeframe: "1h",
+    net_pnl: -20,
+  }));
+  assert.equal((await save("device_history_1h")).status, 200);
+  const improvingHistory = history.map((trade, index) => ({
+    ...trade,
+    symbol: "ETH",
+    net_pnl: index >= 4 ? 20 : -10,
+  }));
+  assert.equal((await save("device_history_binance", "binance")).status, 200);
+  const ownerId = DB.simulationWallets.keys().next().value.split(":")[0];
+  const addEvents = (clientId, records, platform = "hyperliquid") => {
+    for (const trade of records) {
+      const eventId = `${ownerId}:${clientId}:${platform}:${trade.id}:closed:${trade.closed_at}`;
+      DB.simulationEvents.set(eventId, {
+        event_id: eventId,
+        owner_id: ownerId,
+        client_id: clientId,
+        platform,
+        trade_id: String(trade.id),
+        event_type: "closed",
+        occurred_at: trade.closed_at,
+        payload_json: JSON.stringify({ trade }),
+      });
+    }
+  };
+  addEvents("device_history_12345678", history);
+  addEvents("device_history_87654321", [history[0]]);
+  addEvents("device_history_1h", otherTimeframeHistory);
+  addEvents("device_history_binance", improvingHistory, "binance");
+
+  const originalFetch = globalThis.fetch;
+  let policyHeader = "";
+  let proxiedBody = "";
+  globalThis.fetch = async (input, init) => {
+    const upstream = new Request(input, init);
+    policyHeader = upstream.headers.get("x-alpha-history-policy") || "";
+    proxiedBody = await upstream.clone().text();
+    return Response.json({ proxied: true });
+  };
+  try {
+    const response = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: authHeaders },
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+    assert.equal(response.status, 200);
+    const policies = JSON.parse(policyHeader).platforms;
+    const policy = policies.hyperliquid;
+    assert.equal(policy.timeframe, "4h");
+    assert.equal(policy.sample_count, 12, "跨设备重复交易只能计入一次");
+    assert.equal(policy.wins, 8);
+    assert.equal(policy.losses, 4);
+    assert.equal(policy.consecutive_losses, 4);
+    assert.equal(policy.threshold_adjustment, 4);
+    assert.equal(policy.risk_multiplier, 0.5);
+    assert.equal(policy.direction_performance.LONG.threshold_adjustment, -1);
+    assert.equal(policies.binance.consecutive_losses, 0);
+    assert.equal(policies.binance.threshold_adjustment, -2);
+    assert.equal(policies.binance.risk_multiplier, 1.05);
+    assert.equal(policyHeader.includes("BTC"), false, "不得发送币种等原始交易字段");
+    assert.equal(policyHeader.includes("started_at"), false);
+
+    const oneHourResponse = await worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=1h&limit=4",
+      { headers: authHeaders },
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+    assert.equal(oneHourResponse.status, 200);
+    const oneHourPolicy = JSON.parse(policyHeader).platforms.hyperliquid;
+    assert.equal(oneHourPolicy.timeframe, "1h");
+    assert.equal(oneHourPolicy.sample_count, 12);
+    assert.equal(oneHourPolicy.losses, 12);
+
+    const executionBody = { analysis: { symbol: "BTC" }, timeframe: "1h", total_amount: 1_000 };
+    const executionResponse = await worker.fetch(new Request(
+      "https://example.test/api/v1/executions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify(executionBody),
+      },
+    ), {
+      BACKEND_API_URL: "https://backend.example.test",
+      DB,
+      OWNER_API_TOKEN: OWNER_TOKEN,
+    });
+    assert.equal(executionResponse.status, 200);
+    assert.equal(JSON.parse(policyHeader).platforms.hyperliquid.timeframe, "1h");
+    assert.deepEqual(JSON.parse(proxiedBody), executionBody, "读取周期不得消耗原始请求体");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("protects owner state and persists capital in D1", async () => {
@@ -391,6 +903,9 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
     assert.ok(payload.opportunities.every((item) => item.analysis_engine === "rules"));
     assert.ok(payload.opportunities.every((item) => item.reference_price > 0));
     assert.ok(payload.opportunities.every((item) => item.is_executable === false));
+    assert.ok(payload.opportunities.every((item) => item.direction === "WAIT"));
+    assert.ok(payload.opportunities.every((item) => item.position_sizing.margin_amount === 0));
+    assert.ok(payload.opportunities.every((item) => item.status_reason.includes("均线方向不明确")));
 
     const firstPlan = payload.opportunities[0];
     await worker.fetch(new Request("https://example.test/api/v1/settings/capital", {
@@ -405,7 +920,8 @@ test("falls back to the edge rule engine when the backend rejects the Worker tok
     const updatedPlan = (await rescanned.json()).opportunities.find((item) => item.symbol === firstPlan.symbol);
     assert.deepEqual(updatedPlan.entry_range, firstPlan.entry_range);
     assert.deepEqual(updatedPlan.take_profit, firstPlan.take_profit);
-    assert.equal(updatedPlan.position_sizing.margin_amount, firstPlan.position_sizing.margin_amount * 2);
+    assert.equal(firstPlan.position_sizing.margin_amount, 0);
+    assert.equal(updatedPlan.position_sizing.margin_amount, 0);
   } finally {
     globalThis.fetch = originalFetch;
     console.error = originalError;
@@ -563,6 +1079,106 @@ test("serves public market data and keeps a rule fallback when the Python backen
     const edgePayload = await edgeRules.json();
     assert.equal(edgePayload.opportunities.length, 4);
     assert.ok(edgePayload.opportunities.every((item) => item.analysis_engine === "rules"));
+    assert.ok(edgePayload.opportunities.every((item) => item.direction === "WAIT"));
+    assert.ok(edgePayload.opportunities.every((item) => item.position_sizing.margin_amount === 0));
+    assert.ok(edgePayload.opportunities.every((item) => item.status_reason.includes("均线方向不明确")));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("calculates complete edge gates and safely revises a missed entry without the Python backend", async () => {
+  const originalFetch = globalThis.fetch;
+  const now = Date.now();
+  const candles = Array.from({ length: 205 }, (_, index) => {
+    const close = 80 + index * 0.1 + Math.sin(index) * 0.5;
+    return {
+      t: now - (205 - index) * 14_400_000,
+      T: now - (204 - index) * 14_400_000 - 1,
+      o: String(close - 0.05),
+      h: String(close + 1),
+      l: String(close - 1),
+      c: String(close),
+      v: "1000",
+    };
+  });
+  const lastPrice = candles.at(-1).c;
+  let marketScanCount = 0;
+  globalThis.fetch = async (_url, init) => {
+    const payload = JSON.parse(init.body);
+    if (payload.type === "metaAndAssetCtxs") {
+      const currentPrice = Number(lastPrice) + (marketScanCount > 0 ? 0.3 : 0);
+      marketScanCount += 1;
+      return Response.json([
+        { universe: CORE_TEST_SYMBOLS.map((name) => ({ name })) },
+        CORE_TEST_SYMBOLS.map(() => ({
+          markPx: String(currentPrice),
+          prevDayPx: String(currentPrice - 4),
+          dayNtlVlm: "1000000",
+          funding: "0.0001",
+          openInterest: "10000",
+        })),
+      ]);
+    }
+    return Response.json(candles);
+  };
+  try {
+    const DB = createSimulationDatabase();
+    const env = { DB, OWNER_API_TOKEN: OWNER_TOKEN };
+    const scan = () => worker.fetch(new Request(
+      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
+      { headers: authHeaders },
+    ), env, {});
+    const response = await scan();
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.scan_source, "edge_live_scan");
+    assert.equal(payload.opportunities.length, 4);
+    assert.ok(payload.opportunities.every((item) => Number.isFinite(item.indicators.ema200)));
+    assert.ok(payload.opportunities.every((item) => !item.status_reason.includes("数据不足")));
+    assert.ok(payload.opportunities.every((item) => item.direction === "LONG"));
+    assert.ok(payload.opportunities.every((item) => item.decision_revision === 1));
+
+    const confirmingMiss = await (await scan()).json();
+    assert.ok(
+      confirmingMiss.opportunities.every((item) => item.decision_status === "missed_entry"),
+      JSON.stringify(confirmingMiss.opportunities.map((item) => ({
+        symbol: item.symbol, status: item.decision_status, reason: item.status_reason,
+      }))),
+    );
+    assert.ok(confirmingMiss.opportunities.every((item) => item.missed_entry_count === 1));
+
+    const revised = await (await scan()).json();
+    assert.ok(revised.opportunities.every((item) => item.decision_revision === 2));
+    assert.ok(revised.opportunities.every((item) => item.revision_history.length === 1));
+    assert.ok(revised.opportunities.every((item, index) => (
+      item.plan_id === payload.opportunities[index].plan_id
+    )));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("reads Binance public market data directly when the full backend is absent", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const target = new URL(url);
+    if (target.pathname.endsWith("/ticker/24hr")) {
+      return Response.json({ lastPrice: "100", priceChangePercent: "2", quoteVolume: "1000000" });
+    }
+    if (target.pathname.endsWith("/premiumIndex")) return Response.json({ lastFundingRate: "0.0001" });
+    if (target.pathname.endsWith("/openInterest")) return Response.json({ openInterest: "10000" });
+    throw new Error(`未处理的测试地址：${target}`);
+  };
+  try {
+    const response = await worker.fetch(new Request(
+      "https://example.test/api/v1/market/BTC?platform=binance",
+    ), {}, {});
+    const market = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(market.platform, "binance");
+    assert.equal(market.source, "live");
+    assert.equal(market.price, 100);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -579,14 +1195,21 @@ test("emits the files required by Sites packaging", async () => {
 
 test("keeps the Cloudflare deployment contract at the repository root", async () => {
   const config = JSON.parse(await readFile(new URL("../../wrangler.jsonc", import.meta.url), "utf8"));
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
 
   assert.equal(config.main, "./mobile-app/worker/app.js");
   assert.equal(config.assets.directory, "./mobile-app/dist/client");
   assert.equal(config.d1_databases[0].migrations_dir, "./mobile-app/migrations");
+  assert.deepEqual(config.triggers.crons, ["* * * * *"]);
   assert.deepEqual(config.secrets.required, [
     "OWNER_API_TOKEN",
     "DEVICE_SESSION_SECRET",
   ]);
+  assert.match(packageJson.scripts["migrate:cloudflare"], /d1 migrations apply alpha-trader-ai-db --remote/);
+  assert.match(
+    packageJson.scripts["deploy:cloudflare"],
+    /build:cloudflare && npm run migrate:cloudflare && npx wrangler[^&]+ deploy/,
+  );
 });
 
 test("provides installable PWA metadata and icons", async () => {

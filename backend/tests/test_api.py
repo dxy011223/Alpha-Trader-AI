@@ -9,7 +9,7 @@ os.environ["OWNER_API_TOKEN"] = "test-owner-token-abcdefghijklmnopqrstuvwxyz"
 get_settings.cache_clear()
 
 from app.main import app
-from app.schemas import AnalysisRequest, MarketSnapshot, OpportunityScanResponse
+from app.schemas import AnalysisRequest, Candle, MarketSnapshot, OpportunityScanResponse, TechnicalIndicators
 from app.services import analyze_market, calculate_position_sizing
 
 
@@ -128,6 +128,10 @@ def test_rule_analysis_uses_verified_owner_capital_header(monkeypatch):
     monkeypatch.setattr("app.api.get_live_market", fake_market)
     monkeypatch.setattr("app.api.get_candles", lambda *_args: asyncio.sleep(0, result=[]))
     monkeypatch.setattr(
+        "app.api.calculate_technical_indicators",
+        lambda _candles: TechnicalIndicators(ema20=110, ema50=100, ema200=90),
+    )
+    monkeypatch.setattr(
         "app.api.read_capital_settings",
         lambda: (_ for _ in ()).throw(AssertionError("不应读取后端旧资金")),
     )
@@ -221,7 +225,10 @@ def test_rule_short_plan_has_correct_price_boundaries():
         source="live",
     )
 
-    decision = analyze_market(AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000)
+    decision = analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        TechnicalIndicators(ema20=90, ema50=100, ema200=110),
+    )
 
     assert decision.direction == "SHORT"
     assert decision.stop_loss > decision.entry_range[1]
@@ -240,10 +247,27 @@ def test_ai_opportunities_are_ranked(monkeypatch):
         assert platform == "hyperliquid"
         return markets
 
-    async def fake_get_candles(_symbol: str, _interval: str, _limit: int, _platform: str):
-        return []
+    async def fake_get_candles(symbol: str, _interval: str, _limit: int, _platform: str):
+        market_price = next(market.price for market in markets if market.symbol == symbol)
+        def relative_price(index: int) -> float:
+            pullback = 0.003 if index % 2 == 0 else -0.003
+            return 0.85 + index / 239 * 0.15 + pullback
+
+        return [
+            Candle(
+                open_time=index * 60_000,
+                close_time=(index + 1) * 60_000,
+                open=market_price * relative_price(index),
+                high=market_price * (relative_price(index) + 0.002),
+                low=market_price * (relative_price(index) - 0.002),
+                close=market_price * relative_price(index),
+                volume=1_000,
+            )
+            for index in range(240)
+        ]
 
     monkeypatch.setattr("app.market_scanner.read_scan_cache", lambda *_args: None)
+    monkeypatch.setattr("app.market_scanner.read_decision_plan_cache", lambda *_args: None)
     monkeypatch.setattr("app.market_scanner.write_timeframe_scan_cache", lambda *_args: None)
     monkeypatch.setattr("app.market_scanner.get_live_markets", fake_get_live_markets)
     monkeypatch.setattr("app.market_scanner.get_candles", fake_get_candles)
@@ -270,7 +294,10 @@ def test_ai_opportunities_are_ranked(monkeypatch):
 def test_ai_opportunities_can_force_refresh(monkeypatch):
     calls: list[tuple[str, int, str, float | None, bool]] = []
 
-    async def fake_scan(timeframe, limit, platform, total_amount, force_refresh):
+    async def fake_scan(
+        timeframe, limit, platform, total_amount, force_refresh, history_policy
+    ):
+        assert history_policy is None
         calls.append((timeframe, limit, platform, total_amount, force_refresh))
         return OpportunityScanResponse(
             scanned_markets=0,

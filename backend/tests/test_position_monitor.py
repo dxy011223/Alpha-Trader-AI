@@ -5,7 +5,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import position_monitor, trade_records
 from app.database import Base
-from app.schemas import AnalysisRequest, ExecutionCreate, MarketSnapshot
+from app.schemas import AnalysisRequest, ExecutionCreate, MarketSnapshot, TechnicalIndicators
 from app.services import analyze_market
 
 
@@ -19,7 +19,10 @@ def test_monitor_persists_take_profit_action(monkeypatch, tmp_path):
         symbol="TEST", price=100, change_24h=4, volume=2_000_000,
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
-    analysis = analyze_market(AnalysisRequest(symbol="TEST"), market, 10_000)
+    analysis = analyze_market(
+        AnalysisRequest(symbol="TEST"), market, 10_000,
+        TechnicalIndicators(ema20=110, ema50=100, ema200=90),
+    )
     created = trade_records.create_execution(
         ExecutionCreate(analysis=analysis, timeframe="4h", total_amount=10_000)
     )
@@ -47,7 +50,10 @@ def test_monitor_rule_exits_at_hard_boundary(monkeypatch, tmp_path):
         symbol="TEST", price=100, change_24h=4, volume=2_000_000,
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
-    analysis = analyze_market(AnalysisRequest(symbol="TEST"), market, 10_000)
+    analysis = analyze_market(
+        AnalysisRequest(symbol="TEST"), market, 10_000,
+        TechnicalIndicators(ema20=110, ema50=100, ema200=90),
+    )
     state = trade_records.create_execution(
         ExecutionCreate(analysis=analysis, timeframe="4h", total_amount=10_000)
     )

@@ -8,11 +8,11 @@ from app.database import SessionLocal
 from app.models import MarketScanRecord
 from app.config import get_settings
 from app.scan_cache import acquire_scan_lock, read_decision_plan_cache, read_scan_cache, release_scan_lock, write_decision_plan_cache, write_timeframe_scan_cache
-from app.schemas import AnalysisRequest, OpportunityScanResponse
+from app.schemas import AnalysisRequest, DecisionHistoryPolicy, OpportunityScanResponse
 from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_markets, refresh_decision_plan
 
 
-_scan_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_scan_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
 
 
 class MarketScanBusy(RuntimeError):
@@ -24,6 +24,7 @@ async def compute_market_scan(
     limit: int = 8,
     platform: MarketPlatform = "hyperliquid",
     total_amount: float | None = None,
+    history_policy: DecisionHistoryPolicy | None = None,
 ) -> OpportunityScanResponse:
     markets = await get_live_markets(platform)
     total_amount = total_amount or read_capital_settings().total_amount
@@ -51,6 +52,7 @@ async def compute_market_scan(
                 if indicators.atr_percent is not None else market,
                 total_amount,
                 indicators,
+                history_policy=history_policy,
             )
             for market, candles in zip(indicator_candidates, candle_sets, strict=True)
             for indicators in [calculate_technical_indicators(candles)]
@@ -58,7 +60,11 @@ async def compute_market_scan(
         key=lambda item: item.score,
         reverse=True,
     )
-    previous_scan = await asyncio.to_thread(read_decision_plan_cache, timeframe, platform)
+    history_key = history_policy.fingerprint if history_policy else "baseline"
+    history_scope_key = history_policy.scope_key if history_policy else "baseline"
+    previous_scan = await asyncio.to_thread(
+        read_decision_plan_cache, timeframe, platform, history_scope_key
+    )
     previous_by_symbol = {
         item.symbol: item for item in previous_scan.opportunities
     } if previous_scan else {}
@@ -92,7 +98,9 @@ async def compute_market_scan(
         platform=platform,
         total_amount=total_amount,
     )
-    await asyncio.to_thread(write_decision_plan_cache, timeframe, scan)
+    await asyncio.to_thread(
+        write_decision_plan_cache, timeframe, scan, history_scope_key
+    )
     return scan
 
 
@@ -102,40 +110,59 @@ async def get_cached_or_compute_market_scan(
     platform: MarketPlatform,
     total_amount: float | None = None,
     force_refresh: bool = False,
+    history_policy: DecisionHistoryPolicy | None = None,
 ) -> OpportunityScanResponse:
     """合并相同扫描的并发缓存未命中，并把成功结果写回缓存。"""
     total_amount = total_amount or read_capital_settings().total_amount
+    history_key = history_policy.fingerprint if history_policy else "baseline"
     if not force_refresh:
-        cached = await asyncio.to_thread(read_scan_cache, timeframe, limit, platform, total_amount)
+        cached = await asyncio.to_thread(
+            read_scan_cache, timeframe, limit, platform, total_amount, history_key
+        )
         if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
             return cached
-    key = (platform, timeframe)
+    key = (platform, timeframe, history_key)
     lock = _scan_locks.setdefault(key, asyncio.Lock())
     async with lock:
         if not force_refresh:
-            cached = await asyncio.to_thread(read_scan_cache, timeframe, limit, platform, total_amount)
+            cached = await asyncio.to_thread(
+                read_scan_cache, timeframe, limit, platform, total_amount, history_key
+            )
             if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
                 return cached
-        lease = await asyncio.to_thread(acquire_scan_lock, timeframe, platform, total_amount)
+        lease = await asyncio.to_thread(
+            acquire_scan_lock, timeframe, platform, total_amount, history_key
+        )
         if lease == "":
             if force_refresh:
                 raise MarketScanBusy("市场扫描正在刷新，请稍后重试")
             for _ in range(20):
                 await asyncio.sleep(0.25)
-                cached = await asyncio.to_thread(read_scan_cache, timeframe, limit, platform, total_amount)
+                cached = await asyncio.to_thread(
+                    read_scan_cache, timeframe, limit, platform, total_amount, history_key
+                )
                 if cached is not None and all(item.analysis_engine == "rules" for item in cached.opportunities):
                     return cached
             raise MarketScanBusy("相同市场扫描正在其他实例中运行，请稍后重试")
         if lease is None and get_settings().environment.lower() == "production":
             raise MarketScanBusy("市场扫描协调服务暂时不可用")
         try:
-            scan = await compute_market_scan(timeframe, limit, platform, total_amount)
-            await asyncio.to_thread(write_timeframe_scan_cache, timeframe, scan)
+            scan = await compute_market_scan(
+                timeframe, limit, platform, total_amount, history_policy
+            )
+            await asyncio.to_thread(
+                write_timeframe_scan_cache, timeframe, scan, history_key
+            )
             return scan
         finally:
             if lease:
                 await asyncio.to_thread(
-                    release_scan_lock, timeframe, platform, lease, total_amount
+                    release_scan_lock,
+                    timeframe,
+                    platform,
+                    lease,
+                    total_amount,
+                    history_key,
                 )
 
 

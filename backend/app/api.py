@@ -21,7 +21,7 @@ from app.strategy_versions import (
     list_strategy_versions,
     record_daily_performance,
 )
-from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time, refresh_decision_plan
+from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time, parse_history_policy, refresh_decision_plan
 from app.trade_records import attach_wallet_to_active_position, cancel_execution, create_execution, finalize_position, generate_daily_review, list_completed_trades, list_review_records, read_active_execution, read_active_executions, read_open_position, update_review_content
 from app.wallet_settings import read_wallet_settings, write_wallet_settings
 
@@ -172,6 +172,9 @@ async def start_execution(
     owner_capital: float | None = Header(
         default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
     ),
+    history_policy_header: str | None = Header(
+        default=None, alias="X-Alpha-History-Policy"
+    ),
 ) -> ExecutionStateResponse:
     try:
         platform = payload.analysis.platform
@@ -194,6 +197,9 @@ async def start_execution(
             market,
             total_amount,
             indicators,
+            history_policy=parse_history_policy(
+                history_policy_header, platform
+            ),
         )
         verified_analysis = refresh_decision_plan(
             payload.analysis,
@@ -320,6 +326,9 @@ async def ai_analyze(
     owner_capital: float | None = Header(
         default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
     ),
+    history_policy_header: str | None = Header(
+        default=None, alias="X-Alpha-History-Policy"
+    ),
 ) -> AnalysisResponse:
     market, candles = await asyncio.gather(
         get_live_market(payload.symbol, payload.platform),
@@ -336,6 +345,9 @@ async def ai_analyze(
         market,
         total_amount,
         indicators,
+        history_policy=parse_history_policy(
+            history_policy_header, payload.platform
+        ),
     )
 
 
@@ -348,10 +360,18 @@ async def ai_opportunities(
     owner_capital: float | None = Header(
         default=None, alias="X-Alpha-Owner-Capital", gt=0, le=1_000_000_000
     ),
+    history_policy_header: str | None = Header(
+        default=None, alias="X-Alpha-History-Policy"
+    ),
 ) -> OpportunityScanResponse:
     try:
         return await get_cached_or_compute_market_scan(
-            timeframe, limit, platform, owner_capital, force_refresh
+            timeframe,
+            limit,
+            platform,
+            owner_capital,
+            force_refresh,
+            parse_history_policy(history_policy_header, platform),
         )
     except MarketScanBusy as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

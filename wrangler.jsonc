@@ -4,6 +4,9 @@
   "main": "./mobile-app/worker/app.js",
   "compatibility_date": "2026-09-11",
   "compatibility_flags": ["nodejs_compat"],
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "secrets": {
     "required": ["OWNER_API_TOKEN", "DEVICE_SESSION_SECRET"]
   },

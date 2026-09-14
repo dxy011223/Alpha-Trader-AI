@@ -21,13 +21,23 @@ def _key(
     timeframe: str,
     platform: str = "hyperliquid",
     total_amount: float | None = None,
+    history_key: str = "baseline",
 ) -> str:
     capital_key = "default" if total_amount is None else format(total_amount, ".12g")
-    return f"alpha-trader:opportunities:{platform}:{timeframe}:{capital_key}"
+    history_key = _safe_history_key(history_key)
+    return f"alpha-trader:opportunities:{platform}:{timeframe}:{capital_key}:{history_key}"
 
 
-def _plan_key(timeframe: str, platform: str = "hyperliquid") -> str:
-    return f"alpha-trader:decision-plans:{platform}:{timeframe}"
+def _safe_history_key(value: str) -> str:
+    return value if value and value.replace("-", "").replace("_", "").isalnum() else "baseline"
+
+
+def _plan_key(
+    timeframe: str,
+    platform: str = "hyperliquid",
+    history_key: str = "baseline",
+) -> str:
+    return f"alpha-trader:decision-plans:{platform}:{timeframe}:{_safe_history_key(history_key)}"
 
 
 def clear_market_scan_cache() -> None:
@@ -51,7 +61,12 @@ def clear_market_scan_cache() -> None:
             client.close()
 
 
-def acquire_scan_lock(timeframe: str, platform: str, total_amount: float | None = None) -> str | None:
+def acquire_scan_lock(
+    timeframe: str,
+    platform: str,
+    total_amount: float | None = None,
+    history_key: str = "baseline",
+) -> str | None:
     """返回租约令牌；空字符串表示其他进程持有，None 表示 Redis 不可用。"""
     settings = get_settings()
     client = None
@@ -64,7 +79,7 @@ def acquire_scan_lock(timeframe: str, platform: str, total_amount: float | None 
             socket_timeout=1,
         )
         acquired = client.set(
-            f"{_key(timeframe, platform, total_amount)}:lock", token, nx=True, ex=90
+            f"{_key(timeframe, platform, total_amount, history_key)}:lock", token, nx=True, ex=90
         )
         return token if acquired else ""
     except (RedisError, ValueError) as exc:
@@ -76,7 +91,11 @@ def acquire_scan_lock(timeframe: str, platform: str, total_amount: float | None 
 
 
 def release_scan_lock(
-    timeframe: str, platform: str, token: str, total_amount: float | None = None
+    timeframe: str,
+    platform: str,
+    token: str,
+    total_amount: float | None = None,
+    history_key: str = "baseline",
 ) -> None:
     if not token:
         return
@@ -92,7 +111,7 @@ def release_scan_lock(
         client.eval(
             _RELEASE_LOCK_SCRIPT,
             1,
-            f"{_key(timeframe, platform, total_amount)}:lock",
+            f"{_key(timeframe, platform, total_amount, history_key)}:lock",
             token,
         )
     except (RedisError, ValueError) as exc:
@@ -102,7 +121,11 @@ def release_scan_lock(
             client.close()
 
 
-def write_timeframe_scan_cache(timeframe: str, scan: OpportunityScanResponse) -> None:
+def write_timeframe_scan_cache(
+    timeframe: str,
+    scan: OpportunityScanResponse,
+    history_key: str = "baseline",
+) -> None:
     settings = get_settings()
     client = None
     try:
@@ -113,7 +136,7 @@ def write_timeframe_scan_cache(timeframe: str, scan: OpportunityScanResponse) ->
             socket_timeout=1,
         )
         client.setex(
-            _key(timeframe, scan.platform, scan.total_amount),
+            _key(timeframe, scan.platform, scan.total_amount, history_key),
             settings.market_scan_cache_seconds,
             scan.model_dump_json(),
         )
@@ -124,7 +147,11 @@ def write_timeframe_scan_cache(timeframe: str, scan: OpportunityScanResponse) ->
             client.close()
 
 
-def write_decision_plan_cache(timeframe: str, scan: OpportunityScanResponse) -> None:
+def write_decision_plan_cache(
+    timeframe: str,
+    scan: OpportunityScanResponse,
+    history_key: str = "baseline",
+) -> None:
     """保存跨扫描周期的固定计划；具体过期仍由每条计划的生成时间判定。"""
     settings = get_settings()
     client = None
@@ -135,7 +162,11 @@ def write_decision_plan_cache(timeframe: str, scan: OpportunityScanResponse) -> 
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        client.setex(_plan_key(timeframe, scan.platform), 172_800, scan.model_dump_json())
+        client.setex(
+            _plan_key(timeframe, scan.platform, history_key),
+            172_800,
+            scan.model_dump_json(),
+        )
     except (RedisError, ValueError) as exc:
         logger.warning("Redis 决策计划缓存写入失败：%s", exc)
     finally:
@@ -148,6 +179,7 @@ def read_scan_cache(
     limit: int,
     platform: str = "hyperliquid",
     total_amount: float | None = None,
+    history_key: str = "baseline",
 ) -> OpportunityScanResponse | None:
     settings = get_settings()
     client = None
@@ -158,7 +190,7 @@ def read_scan_cache(
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        value = client.get(_key(timeframe, platform, total_amount))
+        value = client.get(_key(timeframe, platform, total_amount, history_key))
         if not value:
             return None
         scan = OpportunityScanResponse.model_validate_json(value)
@@ -175,7 +207,9 @@ def read_scan_cache(
 
 
 def read_decision_plan_cache(
-    timeframe: str, platform: str = "hyperliquid"
+    timeframe: str,
+    platform: str = "hyperliquid",
+    history_key: str = "baseline",
 ) -> OpportunityScanResponse | None:
     settings = get_settings()
     client = None
@@ -186,7 +220,7 @@ def read_decision_plan_cache(
             socket_connect_timeout=1,
             socket_timeout=1,
         )
-        value = client.get(_plan_key(timeframe, platform))
+        value = client.get(_plan_key(timeframe, platform, history_key))
         return OpportunityScanResponse.model_validate_json(value) if value else None
     except (RedisError, ValueError, TypeError) as exc:
         logger.warning("Redis 决策计划缓存读取失败：%s", exc)

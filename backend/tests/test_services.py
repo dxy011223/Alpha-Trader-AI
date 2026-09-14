@@ -4,7 +4,25 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app import services
-from app.schemas import AnalysisRequest, Candle, MarketSnapshot, NewsItem, TechnicalIndicators
+from app.schemas import (
+    AnalysisRequest,
+    Candle,
+    DecisionHistoryPolicy,
+    HistoryDirectionPerformance,
+    MarketSnapshot,
+    NewsItem,
+    TechnicalIndicators,
+)
+
+
+def _aligned_indicators(direction: str = "LONG", **updates) -> TechnicalIndicators:
+    values = {
+        "ema20": 110 if direction == "LONG" else 90,
+        "ema50": 98 if direction == "LONG" else 102,
+        "ema200": 90 if direction == "LONG" else 110,
+    }
+    values.update(updates)
+    return TechnicalIndicators(**values)
 
 
 def test_user_fills_by_time_paginates_and_deduplicates(monkeypatch):
@@ -157,7 +175,7 @@ def test_okx_market_converts_base_volume_to_quote_value(monkeypatch):
     assert market.platform == "okx"
 
 
-def test_technical_indicators_use_candle_history():
+def test_technical_indicators_use_only_completed_candle_history():
     candles = [
         Candle(
             open_time=index * 60_000,
@@ -170,13 +188,25 @@ def test_technical_indicators_use_candle_history():
         )
         for index in range(220)
     ]
+    candles.append(Candle(
+        open_time=int(services.time.time() * 1000),
+        close_time=int(services.time.time() * 1000) + 60_000,
+        open=10_000,
+        high=10_001,
+        low=1,
+        close=10_000,
+        volume=1,
+    ))
 
     indicators = services.calculate_technical_indicators(candles)
 
     assert indicators.ema20 > indicators.ema50 > indicators.ema200
+    assert indicators.ema20_slope_percent > 0
+    assert indicators.ema50_slope_percent > 0
     assert indicators.rsi14 == 100
     assert indicators.atr14 > 0
     assert indicators.atr_percent > 0
+    assert indicators.volume_ratio == 1
 
 
 def test_score_below_seventy_is_observation_only():
@@ -198,6 +228,85 @@ def test_score_below_seventy_is_observation_only():
     assert decision.position_sizing.margin_amount == 0
 
 
+def test_moving_average_direction_is_a_hard_execution_gate():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=4, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+
+    long_decision = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market, indicators=_aligned_indicators("LONG")
+    )
+    short_decision = services.analyze_market(
+        AnalysisRequest(symbol="TEST"),
+        market.model_copy(update={"change_24h": -4}),
+        indicators=_aligned_indicators("SHORT"),
+    )
+    mixed_decision = services.analyze_market(
+        AnalysisRequest(symbol="TEST"),
+        market,
+        indicators=TechnicalIndicators(ema20=101, ema50=99, ema200=100),
+    )
+    missing_decision = services.analyze_market(AnalysisRequest(symbol="TEST"), market)
+
+    assert long_decision.direction == "LONG"
+    assert short_decision.direction == "SHORT"
+    for decision in (mixed_decision, missing_decision):
+        assert decision.direction == "WAIT"
+        assert decision.position_sizing.margin_amount == 0
+        assert "均线方向" in decision.status_reason
+        assert "不生成可执行决策" in decision.status_reason
+
+
+def test_technical_confluence_rejects_weak_conflicted_or_overextended_entries():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=4, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    scenarios = [
+        TechnicalIndicators(ema20=100.08, ema50=100.04, ema200=100),
+        _aligned_indicators(rsi14=45, macd_histogram=-0.5),
+        _aligned_indicators(rsi14=75),
+        _aligned_indicators(ema20_slope_percent=-0.1, ema50_slope_percent=0.1),
+        _aligned_indicators(volume_ratio=0.4),
+    ]
+    decisions = [
+        services.analyze_market(AnalysisRequest(symbol="TEST"), market, indicators=indicators)
+        for indicators in scenarios
+    ]
+    decisions.extend([
+        services.analyze_market(
+            AnalysisRequest(symbol="TEST"),
+            market.model_copy(update={"price": 95}),
+            indicators=_aligned_indicators(),
+        ),
+        services.analyze_market(
+            AnalysisRequest(symbol="TEST"),
+            market.model_copy(update={"price": 105}),
+            indicators=TechnicalIndicators(
+                ema20=101, ema50=100, ema200=99, atr14=1, atr_percent=0.95,
+            ),
+        ),
+        services.analyze_market(
+            AnalysisRequest(symbol="TEST"),
+            market.model_copy(update={"funding_rate": 0.06}),
+            indicators=_aligned_indicators(),
+        ),
+    ])
+
+    assert all(decision.direction == "WAIT" for decision in decisions)
+    assert all(decision.position_sizing.margin_amount == 0 for decision in decisions)
+    assert all("技术准入未通过" in decision.status_reason for decision in decisions)
+    assert any("均线总间距" in decision.status_reason for decision in decisions)
+    assert any("价格结构未确认" in decision.status_reason for decision in decisions)
+    assert any("短期动量" in decision.status_reason for decision in decisions)
+    assert any("过热区" in decision.status_reason for decision in decisions)
+    assert any("斜率" in decision.status_reason for decision in decisions)
+    assert any("量能不足" in decision.status_reason for decision in decisions)
+    assert any("过度拥挤" in decision.status_reason for decision in decisions)
+    assert any("不宜追价" in decision.status_reason for decision in decisions)
+
+
 def test_relevant_news_changes_rule_score_in_expected_direction():
     market = MarketSnapshot(
         symbol="TEST", price=100, change_24h=2, volume=2_000_000,
@@ -210,16 +319,62 @@ def test_relevant_news_changes_rule_score_in_expected_direction():
     bearish = bullish.model_copy(update={"id": 2, "title": "利空事件", "direction": "bearish"})
 
     supported = services.analyze_market(
-        AnalysisRequest(symbol="TEST"), market, 10_000, news_items=[bullish]
+        AnalysisRequest(symbol="TEST"), market, 10_000,
+        indicators=_aligned_indicators(), news_items=[bullish]
     )
     opposed = services.analyze_market(
-        AnalysisRequest(symbol="TEST"), market, 10_000, news_items=[bearish]
+        AnalysisRequest(symbol="TEST"), market, 10_000,
+        indicators=_aligned_indicators(), news_items=[bearish]
     )
 
     assert supported.score_breakdown.news == 10
     assert opposed.score_breakdown.news == 4
     assert supported.score > opposed.score
     assert any("参考 1 条相关事件" in reason for reason in supported.reasons)
+
+
+def test_atr_execution_levels_use_pullback_entries_and_fixed_reward_risk():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=4, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    indicators = _aligned_indicators(atr14=2, atr_percent=2)
+
+    long_entry, long_stop, long_targets = services.build_execution_levels(
+        market, "LONG", "low", indicators
+    )
+    short_entry, short_stop, short_targets = services.build_execution_levels(
+        market, "SHORT", "low", _aligned_indicators("SHORT", atr14=2, atr_percent=2)
+    )
+    wait_entry, wait_stop, wait_targets = services.build_execution_levels(
+        market, "WAIT", "low", indicators
+    )
+
+    long_mid = sum(long_entry) / 2
+    short_mid = sum(short_entry) / 2
+    assert long_entry == [98.5, 99.5]
+    assert long_stop < long_entry[0] < long_entry[1] < long_targets[0] < long_targets[1]
+    assert (long_targets[0] - long_mid) / (long_mid - long_stop) == pytest.approx(2)
+    assert (long_targets[1] - long_mid) / (long_mid - long_stop) == pytest.approx(3)
+    assert short_entry == [100.5, 101.5]
+    assert short_targets[1] < short_targets[0] < short_entry[0] < short_entry[1] < short_stop
+    assert (short_mid - short_targets[0]) / (short_stop - short_mid) == pytest.approx(2)
+    assert (short_mid - short_targets[1]) / (short_stop - short_mid) == pytest.approx(3)
+    assert wait_entry == wait_targets == [100, 100]
+    assert wait_stop == 100
+
+
+def test_execution_levels_keep_percentage_fallback_without_atr():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=4, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+
+    entry, stop, targets = services.build_execution_levels(market, "LONG", "low")
+
+    assert entry == [99.2, 99.7]
+    assert stop == 98
+    assert targets == [103.5, 107.2]
 
 
 def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_range():
@@ -229,11 +384,13 @@ def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_rang
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), original_market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), original_market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     refreshed_market = original_market.model_copy(update={"price": 99.5, "change_24h": 2.2})
     refreshed = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000,
+        _aligned_indicators(),
     )
 
     baseline = services.refresh_decision_plan(
@@ -266,11 +423,13 @@ def test_decision_plan_marks_original_target_as_reached_instead_of_chasing_price
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     refreshed_market = market.model_copy(update={"price": original.take_profit[0], "change_24h": 4})
     refreshed = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000,
+        _aligned_indicators(),
     )
 
     decision = services.refresh_decision_plan(
@@ -291,7 +450,8 @@ def test_decision_plan_invalidates_when_latest_signal_no_longer_meets_threshold(
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     weak_market = market.model_copy(update={"price": 99.5, "change_24h": 0, "volatility": 8, "funding_rate": 0.05})
     refreshed = services.analyze_market(
@@ -321,10 +481,11 @@ def test_missed_entry_creates_a_versioned_reprice_after_two_reviews():
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     refreshed_market = market.model_copy(update={"price": 100.2, "change_24h": 2.2})
-    indicators = TechnicalIndicators(atr14=1.5, atr_percent=1.5)
+    indicators = _aligned_indicators(atr14=1.5, atr_percent=1.5)
     refreshed = services.analyze_market(
         AnalysisRequest(symbol="TEST", timeframe="4h"), refreshed_market, 10_000, indicators
     ).model_copy(update={
@@ -362,7 +523,8 @@ def test_missed_entry_does_not_create_more_than_two_reprices():
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={
         "generated_at": generated_at.isoformat(),
         "decision_revision": 3,
@@ -373,7 +535,7 @@ def test_missed_entry_does_not_create_more_than_two_reprices():
         AnalysisRequest(symbol="TEST", timeframe="4h"),
         refreshed_market,
         10_000,
-        TechnicalIndicators(atr14=1.5, atr_percent=1.5),
+        _aligned_indicators(atr14=1.5, atr_percent=1.5),
     ).model_copy(update={
         "direction": original.direction,
         "score": max(original.score, 75),
@@ -397,10 +559,12 @@ def test_post_decision_candle_uses_stop_first_when_target_and_stop_both_touched(
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     refreshed = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market, 10_000,
+        _aligned_indicators(),
     )
     candle = Candle(
         open_time=int(generated_at.timestamp() * 1000) + 1,
@@ -429,11 +593,13 @@ def test_expired_decision_plan_allows_a_new_plan():
         volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
     )
     original = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="1h"), market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="1h"), market, 10_000,
+        _aligned_indicators(),
     ).model_copy(update={"generated_at": generated_at.isoformat()})
     refreshed_market = market.model_copy(update={"price": 110})
     refreshed = services.analyze_market(
-        AnalysisRequest(symbol="TEST", timeframe="1h"), refreshed_market, 10_000
+        AnalysisRequest(symbol="TEST", timeframe="1h"), refreshed_market, 10_000,
+        _aligned_indicators(),
     )
 
     decision = services.refresh_decision_plan(
@@ -443,3 +609,159 @@ def test_expired_decision_plan_allows_a_new_plan():
 
     assert decision.entry_range == refreshed.entry_range
     assert decision.reference_price == 110
+
+
+def test_history_policy_changes_decision_threshold_without_rewriting_score():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=1, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    policy = DecisionHistoryPolicy(
+        sample_count=20,
+        wins=14,
+        losses=6,
+        win_rate=70,
+        average_r=0.8,
+        recent_win_rate=66.67,
+        threshold_adjustment=-2,
+        risk_multiplier=1.05,
+        direction_performance={
+            "LONG": HistoryDirectionPerformance(
+                sample_count=10,
+                wins=8,
+                win_rate=80,
+                threshold_adjustment=-1,
+                risk_multiplier=1.05,
+            )
+        },
+        fingerprint="history-v1",
+        scope_key="owner-v1",
+    )
+
+    baseline = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market, indicators=_aligned_indicators(),
+        strategy_parameters={"min_trade_score": 80},
+    )
+    optimized = services.analyze_market(
+        AnalysisRequest(symbol="TEST"),
+        market,
+        indicators=_aligned_indicators(),
+        strategy_parameters={"min_trade_score": 80},
+        history_policy=policy,
+    )
+
+    assert baseline.score == optimized.score == 78
+    assert baseline.direction == "WAIT"
+    assert optimized.direction == "LONG"
+    assert optimized.history_policy is not None
+    assert optimized.history_policy.applied_threshold == 77
+    assert optimized.history_policy.applied_risk_multiplier == 1.05
+
+
+def test_history_policy_threshold_is_reused_during_execution_review():
+    generated_at = datetime(2026, 9, 14, 8, tzinfo=UTC)
+    policy = DecisionHistoryPolicy(
+        sample_count=20,
+        wins=14,
+        losses=6,
+        win_rate=70,
+        average_r=0.8,
+        recent_win_rate=66.67,
+        threshold_adjustment=-2,
+        risk_multiplier=1.05,
+        fingerprint="history-v1",
+        scope_key="owner-v1",
+    )
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=1, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    original = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"), market,
+        indicators=_aligned_indicators(),
+        strategy_parameters={"min_trade_score": 80}, history_policy=policy
+    ).model_copy(update={"generated_at": generated_at.isoformat()})
+    refreshed_market = market.model_copy(update={"price": 99.5, "change_24h": 2.5})
+    refreshed = services.analyze_market(
+        AnalysisRequest(symbol="TEST", timeframe="4h"),
+        refreshed_market,
+        indicators=_aligned_indicators(),
+        strategy_parameters={"min_trade_score": 80},
+        history_policy=policy,
+    )
+
+    reviewed = services.refresh_decision_plan(
+        original,
+        refreshed,
+        refreshed_market.price,
+        "4h",
+        10_000,
+        generated_at + timedelta(minutes=1),
+    )
+
+    assert refreshed.score == 80
+    assert reviewed.decision_status == "executable"
+    assert reviewed.is_executable is True
+
+
+def test_history_policy_reduces_risk_budget_after_weak_results():
+    market = MarketSnapshot(
+        symbol="TEST", price=100, change_24h=4, volume=2_000_000,
+        volatility=2, funding_rate=0, open_interest=1_000_000, source="live",
+    )
+    policy = DecisionHistoryPolicy(
+        sample_count=20,
+        wins=7,
+        losses=13,
+        win_rate=35,
+        average_r=-0.2,
+        recent_win_rate=16.67,
+        consecutive_losses=3,
+        threshold_adjustment=3,
+        risk_multiplier=0.65,
+        fingerprint="weak-history",
+        scope_key="owner-v1",
+    )
+
+    baseline = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market, indicators=_aligned_indicators()
+    )
+    optimized = services.analyze_market(
+        AnalysisRequest(symbol="TEST"), market,
+        indicators=_aligned_indicators(), history_policy=policy
+    )
+
+    assert optimized.score == baseline.score
+    assert optimized.direction == baseline.direction == "LONG"
+    assert optimized.history_policy is not None
+    assert optimized.history_policy.applied_threshold == 73
+    assert optimized.position_sizing.risk_budget_amount < baseline.position_sizing.risk_budget_amount
+
+
+def test_history_policy_ignores_insufficient_or_invalid_aggregates():
+    insufficient = DecisionHistoryPolicy(
+        sample_count=11,
+        wins=11,
+        win_rate=100,
+        average_r=2,
+        recent_win_rate=100,
+        threshold_adjustment=-2,
+        risk_multiplier=1.05,
+        fingerprint="small-sample",
+    )
+
+    assert services.apply_history_policy(70, "LONG", insufficient) == (70, 1, None)
+    assert services.parse_history_policy(
+        '{"platforms":{"hyperliquid":{"sample_count":12,"wins":13,"losses":0,'
+        '"win_rate":100,"average_r":1,"recent_win_rate":100,'
+        '"threshold_adjustment":-2,"risk_multiplier":1.05,'
+        '"direction_performance":{},"fingerprint":"invalid"}}}',
+        "hyperliquid",
+    ) is None
+    assert services.parse_history_policy(
+        '{"platforms":{"binance":{"sample_count":12,"wins":8,"losses":4,'
+        '"win_rate":66.67,"average_r":0.5,"recent_win_rate":66.67,'
+        '"threshold_adjustment":-1,"risk_multiplier":1,'
+        '"direction_performance":{},"fingerprint":"binance-v1"}}}',
+        "hyperliquid",
+    ) is None

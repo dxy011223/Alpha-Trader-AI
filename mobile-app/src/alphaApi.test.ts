@@ -75,7 +75,7 @@ describe("Alpha Trader API 适配器", () => {
   });
 
   it("按匿名设备 ID 读写模拟交易数据库", async () => {
-    const state = { enabled: true, balance: 1_025, activeTrades: [], history: [] };
+    const state = { enabled: true, balance: 1_025, activeTrades: [], history: [], autoTimeframe: "4h" as const };
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
       new Response(JSON.stringify(state), { status: 200 }),
     ));
@@ -92,7 +92,10 @@ describe("Alpha Trader API 适配器", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       `${apiBase}/simulation/wallet/device_test_12345678?platform=binance`,
-      expect.objectContaining({ method: "PUT", body: JSON.stringify(state) }),
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ action: "configure", enabled: true, autoTimeframe: "4h", revision: 0 }),
+      }),
     );
   });
 

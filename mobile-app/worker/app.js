@@ -1,4 +1,9 @@
 import baseWorker from "./index.js";
+import {
+  findSimulationCandleGap,
+  openServerSimulatedTrade,
+  processServerSimulatedCandles,
+} from "./simulation-engine.js";
 
 const APP_ORIGINS = new Set(["https://localhost", "http://localhost"]);
 const MAX_ACTIVE_DECISIONS = 3;
@@ -11,6 +16,14 @@ const LOGIN_WINDOW_SECONDS = 15 * 60;
 const LOGIN_LOCK_SECONDS = 15 * 60;
 const ACCOUNT_MAX_FAILURES = 5;
 const CLIENT_MAX_FAILURES = 10;
+const HISTORY_MIN_SAMPLES = 12;
+const HISTORY_DIRECTION_MIN_SAMPLES = 8;
+const HISTORY_MAX_SAMPLES = 200;
+const SUPPORTED_TIMEFRAMES = new Set(["1m", "5m", "15m", "1h", "4h", "1d"]);
+const SIMULATION_EXECUTOR_HEALTHY_MS = 3 * 60 * 1_000;
+const SIMULATION_EXECUTOR_WALLET_LIMIT = 30;
+const SIMULATION_MARKET_TIMEOUT_MS = 12_000;
+const SIMULATION_OPPORTUNITY_TIMEOUT_MS = 30_000;
 
 function appendVary(headers, value) {
   const values = (headers.get("vary") || "").split(",").map((item) => item.trim().toLowerCase());
@@ -68,6 +81,10 @@ async function digest(value) {
   const bytes = new TextEncoder().encode(value);
   const result = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(result), (item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
 function encodeBase64Url(bytes) {
@@ -454,6 +471,148 @@ async function readCapital(env, ownerId) {
   };
 }
 
+function buildDecisionHistoryPolicy(trades) {
+  const directions = { LONG: [], SHORT: [] };
+  for (const trade of trades) directions[trade.direction].push(trade);
+  const wins = trades.filter((trade) => trade.netPnl > 0).length;
+  const losses = trades.filter((trade) => trade.netPnl < 0).length;
+  const winRate = trades.length > 0 ? wins / trades.length * 100 : 0;
+  const averageR = trades.length > 0
+    ? trades.reduce((sum, trade) => sum + trade.rMultiple, 0) / trades.length
+    : 0;
+  const recentTrades = trades.slice(0, 6);
+  const recentWins = recentTrades.filter((trade) => trade.netPnl > 0).length;
+  const recentWinRate = recentTrades.length > 0 ? recentWins / recentTrades.length * 100 : 0;
+  let consecutiveLosses = 0;
+  for (const trade of trades) {
+    if (trade.netPnl >= 0) break;
+    consecutiveLosses += 1;
+  }
+  const smoothedWinRate = (wins + 6) / (trades.length + 12);
+  let thresholdAdjustment = 0;
+  let riskMultiplier = 1;
+  if (trades.length >= HISTORY_MIN_SAMPLES) {
+    if (smoothedWinRate >= 0.56 && averageR >= 0.25) {
+      thresholdAdjustment = -2;
+      riskMultiplier = 1.05;
+    } else if (smoothedWinRate >= 0.52 && averageR >= 0.1) {
+      thresholdAdjustment = -1;
+    } else if (smoothedWinRate < 0.46 || averageR < 0) {
+      thresholdAdjustment = 2;
+      riskMultiplier = 0.75;
+    } else {
+      riskMultiplier = 0.9;
+    }
+    if (recentTrades.length >= 6 && recentWinRate <= 33.34) {
+      thresholdAdjustment += 1;
+      riskMultiplier = Math.min(riskMultiplier, 0.75);
+    }
+    if (consecutiveLosses >= 4) {
+      thresholdAdjustment = Math.max(thresholdAdjustment, 4);
+      riskMultiplier = Math.min(riskMultiplier, 0.5);
+    } else if (consecutiveLosses >= 3) {
+      thresholdAdjustment = Math.max(thresholdAdjustment, 3);
+      riskMultiplier = Math.min(riskMultiplier, 0.65);
+    }
+  }
+  thresholdAdjustment = clamp(thresholdAdjustment, -2, 4);
+  const directionPerformance = Object.fromEntries(Object.entries(directions).map(([direction, items]) => {
+    const directionWins = items.filter((trade) => trade.netPnl > 0).length;
+    const directionWinRate = items.length > 0 ? directionWins / items.length * 100 : 0;
+    const smoothedDirectionWinRate = (directionWins + 4) / (items.length + 8);
+    const thresholdAdjustmentByDirection = items.length < HISTORY_DIRECTION_MIN_SAMPLES
+      ? 0
+      : smoothedDirectionWinRate < 0.45 ? 2
+        : smoothedDirectionWinRate > 0.56 ? -1 : 0;
+    const riskMultiplierByDirection = items.length < HISTORY_DIRECTION_MIN_SAMPLES
+      ? 1
+      : smoothedDirectionWinRate < 0.45 ? 0.8
+        : smoothedDirectionWinRate > 0.56 ? 1.05 : 1;
+    return [direction, {
+      sample_count: items.length,
+      wins: directionWins,
+      win_rate: Number(directionWinRate.toFixed(2)),
+      threshold_adjustment: thresholdAdjustmentByDirection,
+      risk_multiplier: riskMultiplierByDirection,
+    }];
+  }));
+  return {
+    sample_count: trades.length,
+    wins,
+    losses,
+    win_rate: Number(winRate.toFixed(2)),
+    average_r: Number(clamp(averageR, -2, 2).toFixed(4)),
+    recent_win_rate: Number(recentWinRate.toFixed(2)),
+    consecutive_losses: consecutiveLosses,
+    threshold_adjustment: thresholdAdjustment,
+    risk_multiplier: riskMultiplier,
+    direction_performance: directionPerformance,
+  };
+}
+
+async function readRequestTimeframe(request, url) {
+  let timeframe = url.searchParams.get("timeframe");
+  if (!timeframe && request.method === "POST") {
+    const payload = await request.clone().json().catch(() => ({}));
+    timeframe = payload?.timeframe;
+  }
+  return SUPPORTED_TIMEFRAMES.has(timeframe) ? timeframe : "4h";
+}
+
+async function readHistoryPolicy(env, ownerId, timeframe) {
+  if (!env.DB) return null;
+  const normalizedTimeframe = SUPPORTED_TIMEFRAMES.has(timeframe) ? timeframe : "4h";
+  try {
+    const result = await env.DB.prepare(
+      `SELECT platform, trade_id, occurred_at, payload_json
+       FROM simulation_trade_events
+       WHERE owner_id = ? AND event_type = 'closed'
+       ORDER BY occurred_at DESC LIMIT 6000`,
+    ).bind(ownerId).all();
+    const grouped = new Map();
+    for (const row of result.results || []) {
+      const platform = String(row.platform || "").toLowerCase();
+      if (!["hyperliquid", "binance", "okx"].includes(platform)) continue;
+      const seen = grouped.get(platform) || new Map();
+      const trade = parseJson(row.payload_json, null)?.trade;
+      if (!trade || typeof trade !== "object") continue;
+      const direction = String(trade.direction || "").toUpperCase();
+      const netPnl = Number(trade.net_pnl);
+      const tradeTimeframe = SUPPORTED_TIMEFRAMES.has(trade.timeframe) ? trade.timeframe : "4h";
+      if (tradeTimeframe !== normalizedTimeframe) continue;
+      if (!["LONG", "SHORT"].includes(direction) || !Number.isFinite(netPnl)) continue;
+      const identity = String(row.trade_id || trade.id);
+      if (seen.has(identity)) continue;
+      const plannedLoss = Number(trade?.analysis?.position_sizing?.max_loss_amount);
+      const rMultiple = plannedLoss > 0
+        ? clamp(netPnl / plannedLoss, -2, 2)
+        : netPnl > 0 ? 1 : netPnl < 0 ? -1 : 0;
+      const closedAt = Date.parse(trade.closed_at || row.occurred_at || "") || 0;
+      seen.set(identity, { direction, netPnl, rMultiple, closedAt });
+      grouped.set(platform, seen);
+    }
+    const platforms = {};
+    const scopeValue = await digest(`${getSessionSecret(env)}:${ownerId}:history-cache`);
+    for (const [platform, items] of grouped) {
+      const recentItems = [...items.values()]
+        .sort((left, right) => right.closedAt - left.closedAt)
+        .slice(0, HISTORY_MAX_SAMPLES);
+      const summary = buildDecisionHistoryPolicy(recentItems);
+      const fingerprintValue = await digest(JSON.stringify({ platform, timeframe: normalizedTimeframe, ...summary }));
+      platforms[platform] = {
+        ...summary,
+        timeframe: normalizedTimeframe,
+        fingerprint: fingerprintValue.slice(0, 16),
+        scope_key: scopeValue.slice(0, 16),
+      };
+    }
+    return { version: 2, timeframe: normalizedTimeframe, platforms };
+  } catch (error) {
+    console.error("模拟决策历史聚合失败，已回退到基础评分", error);
+    return null;
+  }
+}
+
 async function handleCapital(request, env, ownerId) {
   if (!env.DB) return json({ detail: "资金设置数据库尚未配置" }, 503);
   if (request.method === "GET") return json(await readCapital(env, ownerId));
@@ -475,7 +634,44 @@ async function handleCapital(request, env, ownerId) {
   return json({ total_amount: amount, currency: "USDT", updated_at: now });
 }
 
-function walletResponse(row, clientId, platform) {
+function executorStatus(row) {
+  const lastSuccessAt = row?.last_success_at ?? null;
+  const lastSuccessTime = Date.parse(lastSuccessAt || "");
+  return {
+    mode: "server",
+    healthy: Number.isFinite(lastSuccessTime) && Date.now() - lastSuccessTime <= SIMULATION_EXECUTOR_HEALTHY_MS,
+    last_run_at: row?.last_run_at ?? null,
+    last_success_at: lastSuccessAt,
+    last_error: row?.last_error ?? null,
+  };
+}
+
+async function readExecutorStatus(env, ownerId, clientId, platform) {
+  try {
+    return await env.DB.prepare(
+      `SELECT last_run_at, last_success_at, last_error
+       FROM simulation_executor_state
+       WHERE owner_id = ? AND client_id = ? AND platform = ?`,
+    ).bind(ownerId, clientId, platform).first();
+  } catch {
+    // 数据库迁移完成前保持旧客户端执行方式，不让钱包接口整体不可用。
+    return null;
+  }
+}
+
+const SIMULATION_WALLET_COLUMNS = `
+  enabled, balance, active_trade, history, auto_timeframe, updated_at, revision,
+  integrity_status, integrity_error
+`;
+
+async function readSimulationWalletRow(env, ownerId, clientId, platform) {
+  return env.DB.prepare(
+    `SELECT ${SIMULATION_WALLET_COLUMNS}
+     FROM owner_simulation_wallets WHERE owner_id = ? AND client_id = ? AND platform = ?`,
+  ).bind(ownerId, clientId, platform).first();
+}
+
+function walletResponse(row, clientId, platform, executorRow = null) {
   const storedActiveTrades = parseJson(row?.active_trade, []);
   const activeTrades = (Array.isArray(storedActiveTrades)
     ? storedActiveTrades
@@ -490,60 +686,173 @@ function walletResponse(row, clientId, platform) {
     // 保留旧字段，避免尚未升级的 APK 读取数据库后丢失首笔执行状态。
     activeTrade: activeTrades[0] ?? null,
     history: parseJson(row?.history, []),
+    autoTimeframe: SUPPORTED_TIMEFRAMES.has(row?.auto_timeframe) ? row.auto_timeframe : "4h",
     updated_at: row?.updated_at ?? new Date().toISOString(),
+    revision: Number(row?.revision ?? 0),
+    integrity: {
+      status: ["ok", "gap", "error"].includes(row?.integrity_status) ? row.integrity_status : "ok",
+      detail: row?.integrity_error ?? null,
+    },
+    executor: executorStatus(executorRow),
   };
 }
 
-async function handleSimulationWallet(request, env, ownerId, clientId, platform) {
+async function handleSimulationWallet(request, env, ctx, ownerId, clientId, platform) {
   if (!env.DB) return json({ detail: "模拟交易数据库尚未配置" }, 503);
   try {
     if (request.method === "GET") {
-      const row = await env.DB.prepare(
-        "SELECT enabled, balance, active_trade, history, updated_at FROM owner_simulation_wallets WHERE owner_id = ? AND client_id = ? AND platform = ?",
-      ).bind(ownerId, clientId, platform).first();
-      return json(walletResponse(row, clientId, platform));
+      const row = await readSimulationWalletRow(env, ownerId, clientId, platform);
+      const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+      return json(walletResponse(row, clientId, platform, executorRow));
+    }
+    if (request.method === "POST") {
+      const payload = await request.json().catch(() => ({}));
+      if (!["execute", "cancel"].includes(payload.action)) {
+        return json({ detail: "不支持的模拟交易命令" }, 422);
+      }
+      const current = await readSimulationWalletRow(env, ownerId, clientId, platform);
+      if (!current?.enabled) return json({ detail: "请先开启当前平台的模拟交易" }, 409);
+      const scopedRow = { ...current, owner_id: ownerId, client_id: clientId, platform };
+      const expectedRevision = Number.isInteger(payload.revision) ? payload.revision : Number(current.revision ?? 0);
+      if (expectedRevision !== Number(current.revision ?? 0)) {
+        const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+        return json({
+          detail: "模拟钱包已由服务端更新，请使用最新状态重试",
+          wallet: walletResponse(current, clientId, platform, executorRow),
+        }, 409);
+      }
+      const storedActiveTrades = parseJson(current.active_trade, []);
+      const activeTrades = (Array.isArray(storedActiveTrades)
+        ? storedActiveTrades
+        : storedActiveTrades && typeof storedActiveTrades === "object" ? [storedActiveTrades] : []
+      ).slice(0, MAX_ACTIVE_DECISIONS);
+      const storedHistory = parseJson(current.history, []);
+      const history = Array.isArray(storedHistory) ? storedHistory : [];
+      const now = Date.now();
+      let nextActiveTrades = activeTrades;
+      let events = [];
+      if (payload.action === "cancel") {
+        const tradeId = String(payload.trade_id ?? "");
+        const cancelled = activeTrades.find((trade) => String(trade?.id) === tradeId);
+        if (!cancelled) return json({ detail: "未找到需要取消的模拟交易" }, 404);
+        nextActiveTrades = activeTrades.filter((trade) => String(trade?.id) !== tradeId);
+        events = [simulationEvent(scopedRow, cancelled, "closed", new Date(now).toISOString(), {
+          action: "manual_cancel",
+          symbol: cancelled?.analysis?.symbol,
+        })];
+      } else {
+        if (activeTrades.length >= MAX_ACTIVE_DECISIONS) {
+          return json({ detail: `最多同时执行 ${MAX_ACTIVE_DECISIONS} 个决策` }, 409);
+        }
+        const timeframe = SUPPORTED_TIMEFRAMES.has(payload.timeframe) ? payload.timeframe : null;
+        const symbol = String(payload.symbol || "").toUpperCase();
+        if (!timeframe || !/^[A-Z0-9]{2,15}$/.test(symbol)) {
+          return json({ detail: "模拟执行参数格式不正确" }, 422);
+        }
+        const opportunities = await loadSimulationOpportunities(
+          env, ctx, ownerId, platform, timeframe, { market: new Map(), opportunities: new Map() },
+        );
+        const candidate = opportunities.find((item) => item?.symbol === symbol
+          && item?.is_executable === true
+          && (!payload.plan_id || item?.plan_id === payload.plan_id));
+        if (!candidate) return json({ detail: "该决策已变化或不再满足执行条件，请刷新后重试" }, 409);
+        if (activeTrades.some((trade) => trade?.analysis?.symbol === symbol)) {
+          return json({ detail: "当前币种已有执行中的决策" }, 409);
+        }
+        const trade = openServerSimulatedTrade(candidate, timeframe, Number(current.balance), now);
+        nextActiveTrades = [trade, ...activeTrades];
+        events = [simulationEvent(scopedRow, trade, "opened", new Date(now).toISOString(), { trade })];
+      }
+      const committed = await commitSimulationWallet(env, scopedRow, {
+        balance: Number(current.balance),
+        activeJson: nextActiveTrades.length > 0 ? JSON.stringify(nextActiveTrades) : null,
+        historyJson: JSON.stringify(history.slice(0, 500)),
+        integrityStatus: current.integrity_status || "ok",
+        integrityError: current.integrity_error || null,
+        updatedAt: new Date(now).toISOString(),
+      }, events);
+      if (!committed) return json({ detail: "模拟钱包已由服务端更新，请刷新后重试" }, 409);
+      const latest = await readSimulationWalletRow(env, ownerId, clientId, platform);
+      const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+      return json(walletResponse(latest, clientId, platform, executorRow));
     }
     if (request.method === "PUT") {
       const payload = await request.json();
-      const balance = Number(payload.balance);
-      const history = Array.isArray(payload.history) ? payload.history.slice(0, 500) : null;
-      const activeTrades = Array.isArray(payload.activeTrades)
-        ? payload.activeTrades
-        : payload.activeTrade === null ? []
-          : payload.activeTrade && typeof payload.activeTrade === "object" ? [payload.activeTrade] : undefined;
-      const activeTradesValid = Array.isArray(activeTrades)
-        && activeTrades.length <= MAX_ACTIVE_DECISIONS
-        && activeTrades.every((trade) => trade && typeof trade === "object" && !Array.isArray(trade));
-      if (typeof payload.enabled !== "boolean" || !Number.isFinite(balance) || Math.abs(balance) > 1_000_000_000 || history === null || !activeTradesValid) {
-        return json({ detail: "模拟钱包数据格式不正确" }, 422);
+      // 旧版客户端没有自动周期字段时按原有 4h 行为兼容，但不再接收其余额和交易历史。
+      const requestedTimeframe = payload.autoTimeframe ?? "4h";
+      const autoTimeframe = SUPPORTED_TIMEFRAMES.has(requestedTimeframe) ? requestedTimeframe : null;
+      const reset = payload.action === "reset";
+      if (typeof payload.enabled !== "boolean" || !autoTimeframe
+        || (payload.action !== undefined && !["configure", "reset"].includes(payload.action))) {
+        return json({ detail: "模拟钱包设置格式不正确" }, 422);
+      }
+      const current = await readSimulationWalletRow(env, ownerId, clientId, platform);
+      const expectedRevision = Number.isInteger(payload.revision) ? payload.revision : Number(current?.revision ?? 0);
+      if (current && expectedRevision !== Number(current.revision ?? 0)) {
+        const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+        return json({
+          detail: "模拟钱包已由服务端更新，请使用最新状态重试",
+          wallet: walletResponse(current, clientId, platform, executorRow),
+        }, 409);
+      }
+      const currentActiveTrades = parseJson(current?.active_trade, []);
+      const hasActiveTrades = Array.isArray(currentActiveTrades)
+        ? currentActiveTrades.length > 0
+        : Boolean(currentActiveTrades);
+      if (hasActiveTrades && (!payload.enabled || reset)) {
+        return json({ detail: "仍有模拟交易执行中，暂不可关闭或重置" }, 409);
       }
       const now = new Date().toISOString();
-      await env.DB.prepare(`
-        INSERT INTO owner_simulation_wallets (owner_id, client_id, platform, enabled, balance, active_trade, history, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(owner_id, client_id, platform) DO UPDATE SET
-          enabled = excluded.enabled,
-          balance = excluded.balance,
-          active_trade = excluded.active_trade,
-          history = excluded.history,
-          updated_at = excluded.updated_at
-      `).bind(
-        ownerId,
-        clientId,
-        platform,
-        payload.enabled ? 1 : 0,
-        balance,
-        activeTrades.length > 0 ? JSON.stringify(activeTrades) : null,
-        JSON.stringify(history),
-        now,
-      ).run();
-      return json(walletResponse({
-        enabled: payload.enabled,
-        balance,
-        active_trade: activeTrades.length > 0 ? JSON.stringify(activeTrades) : null,
-        history: JSON.stringify(history),
-        updated_at: now,
-      }, clientId, platform));
+      const nextRevision = current ? expectedRevision + 1 : 0;
+      const result = current
+        ? await env.DB.prepare(`
+          UPDATE owner_simulation_wallets
+          SET enabled = ?, auto_timeframe = ?,
+              balance = CASE WHEN ? = 1 THEN 1000 ELSE balance END,
+              active_trade = CASE WHEN ? = 1 THEN NULL ELSE active_trade END,
+              history = CASE WHEN ? = 1 THEN '[]' ELSE history END,
+              integrity_status = CASE WHEN ? = 1 THEN 'ok' ELSE integrity_status END,
+              integrity_error = CASE WHEN ? = 1 THEN NULL ELSE integrity_error END,
+              updated_at = ?, revision = revision + 1
+          WHERE owner_id = ? AND client_id = ? AND platform = ? AND revision = ?
+        `).bind(
+          payload.enabled ? 1 : 0,
+          autoTimeframe,
+          reset ? 1 : 0,
+          reset ? 1 : 0,
+          reset ? 1 : 0,
+          reset ? 1 : 0,
+          reset ? 1 : 0,
+          now,
+          ownerId,
+          clientId,
+          platform,
+          expectedRevision,
+        ).run()
+        : await env.DB.prepare(`
+          INSERT INTO owner_simulation_wallets (
+            owner_id, client_id, platform, enabled, balance, active_trade, history,
+            auto_timeframe, updated_at, revision, integrity_status, integrity_error
+          ) VALUES (?, ?, ?, ?, 1000, NULL, '[]', ?, ?, 0, 'ok', NULL)
+        `).bind(
+          ownerId,
+          clientId,
+          platform,
+          payload.enabled ? 1 : 0,
+          autoTimeframe,
+          now,
+        ).run();
+      if (Number(result?.meta?.changes ?? 0) === 0) {
+        const latest = await readSimulationWalletRow(env, ownerId, clientId, platform);
+        const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+        return json({
+          detail: "模拟钱包已由服务端更新，请使用最新状态重试",
+          wallet: walletResponse(latest, clientId, platform, executorRow),
+        }, 409);
+      }
+      const stored = await readSimulationWalletRow(env, ownerId, clientId, platform);
+      const executorRow = await readExecutorStatus(env, ownerId, clientId, platform);
+      return json(walletResponse({ ...stored, revision: nextRevision }, clientId, platform, executorRow));
     }
   } catch (error) {
     console.error("模拟交易数据库操作失败", error);
@@ -552,7 +861,385 @@ async function handleSimulationWallet(request, env, ownerId, clientId, platform)
   return json({ detail: "不支持的请求方法" }, 405);
 }
 
-async function proxyBackend(request, env, authenticated = false, totalAmount = null) {
+async function handleSimulationEvents(request, env, ownerId, clientId, platform, url) {
+  if (request.method !== "GET") return json({ detail: "不支持的请求方法" }, 405);
+  if (!env.DB) return json({ detail: "模拟交易数据库尚未配置" }, 503);
+  const limit = clamp(Number(url.searchParams.get("limit") || 50), 1, 100);
+  const cursor = String(url.searchParams.get("cursor") || "").trim();
+  if (cursor && !Number.isFinite(Date.parse(cursor))) return json({ detail: "分页游标格式不正确" }, 422);
+  const result = await env.DB.prepare(`
+    SELECT event_id, trade_id, event_type, occurred_at, payload_json
+    FROM simulation_trade_events
+    WHERE owner_id = ? AND client_id = ? AND platform = ?
+      AND (? = '' OR occurred_at < ?)
+    ORDER BY occurred_at DESC, event_id DESC LIMIT ?
+  `).bind(ownerId, clientId, platform, cursor, cursor, limit + 1).all();
+  const rows = result.results || [];
+  const hasMore = rows.length > limit;
+  const visibleRows = rows.slice(0, limit);
+  return json({
+    items: visibleRows.map((row) => ({
+      event_id: row.event_id,
+      trade_id: row.trade_id,
+      event_type: row.event_type,
+      occurred_at: row.occurred_at,
+      payload: parseJson(row.payload_json, {}),
+    })),
+    next_cursor: hasMore ? visibleRows.at(-1)?.occurred_at ?? null : null,
+  });
+}
+
+function stableSimulationPrice(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toPrecision(12) : "invalid";
+}
+
+function simulationSignalKey(analysis, timeframe, platform) {
+  const planIdentity = String(analysis?.plan_id || "").trim() || [
+    analysis?.generated_at || "legacy",
+    analysis?.symbol,
+    analysis?.direction,
+    (analysis?.entry_range || []).map(stableSimulationPrice).join("-"),
+    stableSimulationPrice(analysis?.stop_loss),
+    (analysis?.take_profit || []).map(stableSimulationPrice).join("-"),
+  ].join(":");
+  return `${platform}:${timeframe}:${planIdentity}:v${analysis?.decision_revision ?? 1}`;
+}
+
+function simulationCandleLimit(trade, now) {
+  const lastProcessed = Number(trade?.lastProcessedCandleCloseTime ?? trade?.startedAt ?? now);
+  const required = Math.max(5, Math.ceil(Math.max(0, now - lastProcessed) / 60_000) + 2);
+  return [5, 15, 60, 180, 300, 500].find((limit) => limit >= required) ?? 500;
+}
+
+function cachedSimulationRequest(cache, key, loader) {
+  if (!cache.has(key)) cache.set(key, loader());
+  return cache.get(key);
+}
+
+async function fetchSimulationMarketData(env, ctx, pathname, platform, cache) {
+  return cachedSimulationRequest(cache.market, `${platform}:${pathname}`, async () => {
+    const url = `https://simulation-executor.invalid${pathname}`;
+    const request = new Request(url, { signal: AbortSignal.timeout(SIMULATION_MARKET_TIMEOUT_MS) });
+    const proxied = await proxyBackend(request, env).catch(() => null);
+    if (proxied?.ok) return proxied.json();
+    if (platform !== "hyperliquid") throw new Error("完整后端行情暂时不可用");
+    const edgeRequest = new Request(url, { signal: AbortSignal.timeout(SIMULATION_MARKET_TIMEOUT_MS) });
+    const edgeResponse = await baseWorker.fetch(edgeRequest, env, ctx);
+    if (!edgeResponse.ok) throw new Error("边缘行情暂时不可用");
+    return edgeResponse.json();
+  });
+}
+
+async function loadSimulationOpportunities(env, ctx, ownerId, platform, timeframe, cache) {
+  return cachedSimulationRequest(cache.opportunities, `${ownerId}:${platform}:${timeframe}`, async () => {
+    const request = new Request(
+      `https://simulation-executor.invalid/api/v1/ai/opportunities?timeframe=${timeframe}&limit=20&platform=${platform}`,
+      { signal: AbortSignal.timeout(SIMULATION_OPPORTUNITY_TIMEOUT_MS) },
+    );
+    const capital = await readCapital(env, ownerId);
+    const historyPolicy = await readHistoryPolicy(env, ownerId, timeframe);
+    const response = await proxyBackend(
+      request, env, true, capital?.total_amount, historyPolicy,
+    ).catch(() => null);
+    let selectedResponse = response?.ok ? response : null;
+    if (!selectedResponse) {
+      const headers = new Headers(request.headers);
+      headers.set("x-alpha-owner-capital", String(capital?.total_amount || 10_000));
+      headers.set("x-alpha-owner-id", ownerId);
+      if (historyPolicy) headers.set("x-alpha-history-policy", JSON.stringify(historyPolicy));
+      selectedResponse = await baseWorker.fetch(new Request(request, { headers }), env, ctx).catch(() => null);
+    }
+    if (!selectedResponse?.ok) return [];
+    const payload = await selectedResponse.json();
+    return Array.isArray(payload?.opportunities) ? payload.opportunities : [];
+  });
+}
+
+function simulationEvent(row, trade, eventType, occurredAt, payload) {
+  return {
+    eventId: [row.owner_id, row.client_id, row.platform, trade.id, eventType, occurredAt].join(":"),
+    tradeId: String(trade.id),
+    eventType,
+    occurredAt,
+    payload: JSON.stringify(payload),
+  };
+}
+
+function simulationEventStatement(env, row, event, runId) {
+  return env.DB.prepare(`
+    INSERT OR IGNORE INTO simulation_trade_events (
+      event_id, owner_id, client_id, platform, trade_id, event_type, occurred_at, payload_json
+    )
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?
+    WHERE EXISTS (
+      SELECT 1 FROM owner_simulation_wallets
+      WHERE owner_id = ? AND client_id = ? AND platform = ? AND last_executor_run_id = ?
+    )
+  `).bind(
+    event.eventId,
+    row.owner_id,
+    row.client_id,
+    row.platform,
+    event.tradeId,
+    event.eventType,
+    event.occurredAt,
+    event.payload,
+    row.owner_id,
+    row.client_id,
+    row.platform,
+    runId,
+  );
+}
+
+async function commitSimulationWallet(env, row, state, events) {
+  const runId = crypto.randomUUID();
+  const update = env.DB.prepare(`
+    UPDATE owner_simulation_wallets
+    SET balance = ?, active_trade = ?, history = ?, integrity_status = ?, integrity_error = ?,
+        last_executor_run_id = ?, updated_at = ?, revision = revision + 1
+    WHERE owner_id = ? AND client_id = ? AND platform = ? AND revision = ? AND enabled = 1
+  `).bind(
+    state.balance,
+    state.activeJson,
+    state.historyJson,
+    state.integrityStatus,
+    state.integrityError,
+    runId,
+    state.updatedAt,
+    row.owner_id,
+    row.client_id,
+    row.platform,
+    Number(row.revision ?? 0),
+  );
+  const results = await env.DB.batch([
+    update,
+    ...events.map((event) => simulationEventStatement(env, row, event, runId)),
+  ]);
+  return Number(results[0]?.meta?.changes ?? 0) > 0;
+}
+
+async function saveExecutorHeartbeat(env, row, leaseId, lastRunAt, lastSuccessAt, lastError) {
+  // 只允许当前租约持有者释放租约，避免超时旧任务覆盖新一轮执行状态。
+  await env.DB.prepare(`
+    UPDATE simulation_executor_state
+    SET last_run_at = ?, last_success_at = ?, last_error = ?, updated_at = ?,
+        lease_id = NULL, lease_until = NULL
+    WHERE owner_id = ? AND client_id = ? AND platform = ? AND lease_id = ?
+  `).bind(
+    lastRunAt,
+    lastSuccessAt,
+    lastError,
+    new Date().toISOString(),
+    row.owner_id,
+    row.client_id,
+    row.platform,
+    leaseId,
+  ).run();
+}
+
+async function claimSimulationWallet(env, row, now) {
+  const leaseId = crypto.randomUUID();
+  const leaseUntil = Math.floor(now / 1000) + 90;
+  const result = await env.DB.prepare(`
+    INSERT INTO simulation_executor_state (
+      owner_id, client_id, platform, last_run_at, last_success_at, last_error, updated_at,
+      lease_id, lease_until
+    ) VALUES (?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+    ON CONFLICT(owner_id, client_id, platform) DO UPDATE SET
+      last_run_at = excluded.last_run_at,
+      updated_at = excluded.updated_at,
+      lease_id = excluded.lease_id,
+      lease_until = excluded.lease_until
+    WHERE simulation_executor_state.lease_until IS NULL
+       OR simulation_executor_state.lease_until <= ?
+  `).bind(
+    row.owner_id,
+    row.client_id,
+    row.platform,
+    new Date(now).toISOString(),
+    new Date(now).toISOString(),
+    leaseId,
+    leaseUntil,
+    Math.floor(now / 1000),
+  ).run();
+  return Number(result?.meta?.changes ?? 0) > 0 ? leaseId : null;
+}
+
+async function executeSimulationWallet(env, ctx, row, now, cache) {
+  const autoTimeframe = SUPPORTED_TIMEFRAMES.has(row.auto_timeframe) ? row.auto_timeframe : "4h";
+  const originalActiveTrades = parseJson(row.active_trade, []);
+  let activeTrades = (Array.isArray(originalActiveTrades)
+    ? originalActiveTrades
+    : originalActiveTrades && typeof originalActiveTrades === "object" ? [originalActiveTrades] : []
+  ).slice(0, MAX_ACTIVE_DECISIONS);
+  const originalHistory = parseJson(row.history, []);
+  let history = Array.isArray(originalHistory) ? originalHistory.slice(0, 500) : [];
+  let balance = Number(row.balance);
+  const events = [];
+  const nextActiveTrades = [];
+  const integrityWarnings = [];
+
+  for (const storedTrade of activeTrades) {
+    const trade = storedTrade?.analysis && typeof storedTrade.analysis === "object"
+      ? { ...storedTrade, analysis: { ...storedTrade.analysis, platform: row.platform } }
+      : storedTrade;
+    try {
+      const symbol = String(trade?.analysis?.symbol || "").toUpperCase();
+      if (!/^[A-Z0-9]{2,15}$/.test(symbol)) throw new Error("模拟持仓币种格式无效");
+      const query = `platform=${row.platform}`;
+      const candleLimit = simulationCandleLimit(trade, now);
+      const [snapshot, candles] = await Promise.all([
+        fetchSimulationMarketData(env, ctx, `/api/v1/market/${symbol}?${query}`, row.platform, cache),
+        fetchSimulationMarketData(
+          env, ctx, `/api/v1/market/${symbol}/candles?interval=1m&limit=${candleLimit}&${query}`, row.platform, cache,
+        ),
+      ]);
+      const gap = findSimulationCandleGap(trade, candles, now);
+      if (gap) {
+        integrityWarnings.push(`${symbol}：${gap.reason}`);
+        nextActiveTrades.push(trade);
+        continue;
+      }
+      const processed = processServerSimulatedCandles(trade, candles, Number(snapshot?.price), now);
+      if (processed.completedTrade) {
+        const completed = processed.completedTrade;
+        balance += Number(completed.net_pnl) || 0;
+        history = [completed, ...history.filter((item) => item?.id !== completed.id)].slice(0, 500);
+        events.push(simulationEvent(row, completed, "closed", completed.closed_at, {
+          trade: completed,
+        }));
+      } else if (processed.activeTrade) {
+        if (!trade.firstTargetHit && processed.activeTrade.firstTargetHit) {
+          events.push(simulationEvent(row, processed.activeTrade, "first_target", new Date(now).toISOString(), {
+            symbol,
+            price: processed.activeTrade.analysis.take_profit?.[0],
+          }));
+        }
+        nextActiveTrades.push(processed.activeTrade);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "未知错误";
+      console.error(`模拟持仓 ${String(trade?.id || "未知")} 更新失败，已保留原状态`, error);
+      integrityWarnings.push(`${String(trade?.analysis?.symbol || "未知币种")}：${detail}`);
+      nextActiveTrades.push(trade);
+    }
+  }
+  activeTrades = nextActiveTrades;
+
+  const opportunities = await loadSimulationOpportunities(
+    env, ctx, row.owner_id, row.platform, autoTimeframe, cache,
+  );
+  const activeSymbols = new Set(activeTrades.map((trade) => trade?.analysis?.symbol));
+  const executedSignals = new Set([
+    ...activeTrades.map((trade) => simulationSignalKey(trade.analysis, trade.timeframe || "4h", row.platform)),
+    ...history.map((trade) => simulationSignalKey(trade.analysis, trade.timeframe || "4h", row.platform)),
+  ]);
+  for (const candidate of opportunities) {
+    if (activeTrades.length >= MAX_ACTIVE_DECISIONS) break;
+    const signalKey = simulationSignalKey(candidate, autoTimeframe, row.platform);
+    if (candidate?.is_executable !== true
+      || candidate.platform !== row.platform
+      || activeSymbols.has(candidate.symbol)
+      || executedSignals.has(signalKey)) continue;
+    try {
+      const trade = openServerSimulatedTrade(candidate, autoTimeframe, balance, now + activeTrades.length);
+      activeTrades.push(trade);
+      activeSymbols.add(candidate.symbol);
+      executedSignals.add(signalKey);
+      events.push(simulationEvent(row, trade, "opened", new Date(trade.startedAt).toISOString(), {
+        symbol: candidate.symbol,
+        direction: candidate.direction,
+        entry_price: trade.entryPrice,
+      }));
+    } catch {
+      // 价格离开入场区间或决策字段不完整时安全跳过，等待下一次重新扫描。
+    }
+  }
+
+  const activeJson = activeTrades.length > 0 ? JSON.stringify(activeTrades) : null;
+  const historyJson = JSON.stringify(history);
+  const integrityStatus = integrityWarnings.length > 0
+    ? integrityWarnings.some((item) => item.includes("K 线")) ? "gap" : "error"
+    : "ok";
+  const integrityError = integrityWarnings.length > 0 ? integrityWarnings.join("；").slice(0, 1000) : null;
+  const changed = activeJson !== (row.active_trade || null)
+    || historyJson !== row.history
+    || balance !== Number(row.balance)
+    || integrityStatus !== (row.integrity_status || "ok")
+    || integrityError !== (row.integrity_error || null);
+  if (!changed) return integrityWarnings;
+
+  const updatedAt = new Date(now).toISOString();
+  const committed = await commitSimulationWallet(env, row, {
+    balance,
+    activeJson,
+    historyJson,
+    integrityStatus,
+    integrityError,
+    updatedAt,
+  }, events);
+  if (!committed) {
+    console.log(`模拟钱包 ${row.client_id}/${row.platform} 已被其他请求更新，本轮跳过写回`);
+    return ["钱包状态已并发更新，本轮结果未写入"];
+  }
+  return integrityWarnings;
+}
+
+async function runScheduledSimulation(env, ctx) {
+  if (!env.DB) {
+    console.error("模拟交易定时执行失败：D1 数据库未配置");
+    return;
+  }
+  let rows;
+  try {
+    const result = await env.DB.prepare(`
+      SELECT w.owner_id, w.client_id, w.platform, w.balance, w.active_trade, w.history,
+             w.auto_timeframe, w.updated_at, w.revision, w.integrity_status, w.integrity_error
+      FROM owner_simulation_wallets AS w
+      LEFT JOIN simulation_executor_state AS s
+        ON s.owner_id = w.owner_id AND s.client_id = w.client_id AND s.platform = w.platform
+      WHERE w.enabled = 1
+      ORDER BY COALESCE(s.last_run_at, '') ASC, w.updated_at ASC
+      LIMIT ?
+    `).bind(SIMULATION_EXECUTOR_WALLET_LIMIT).all();
+    rows = result.results || [];
+  } catch (error) {
+    console.error("模拟交易定时执行失败：请先应用数据库迁移", error);
+    return;
+  }
+
+  const cache = { market: new Map(), opportunities: new Map() };
+  const executeClaimedWallet = async (row) => {
+    const startedAt = Date.now();
+    const leaseId = await claimSimulationWallet(env, row, startedAt);
+    if (!leaseId) return;
+    const lastRunAt = new Date(startedAt).toISOString();
+    try {
+      const warnings = await executeSimulationWallet(env, ctx, row, Date.now(), cache);
+      const warningDetail = warnings?.length ? warnings.join("；").slice(0, 1000) : null;
+      await saveExecutorHeartbeat(
+        env, row, leaseId, lastRunAt, warningDetail ? null : new Date().toISOString(), warningDetail,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "未知错误";
+      console.error(`模拟钱包 ${row.client_id}/${row.platform} 定时执行失败`, error);
+      await saveExecutorHeartbeat(env, row, leaseId, lastRunAt, null, detail).catch((heartbeatError) => {
+        console.error("模拟交易执行状态保存失败", heartbeatError);
+      });
+    }
+  };
+  for (let index = 0; index < rows.length; index += 5) {
+    await Promise.all(rows.slice(index, index + 5).map(executeClaimedWallet));
+  }
+}
+
+async function proxyBackend(
+  request,
+  env,
+  authenticated = false,
+  totalAmount = null,
+  historyPolicy = null,
+) {
   const base = String(env.BACKEND_API_URL || "").trim();
   if (!base) return null;
   const source = new URL(request.url);
@@ -573,6 +1260,9 @@ async function proxyBackend(request, env, authenticated = false, totalAmount = n
   if (Number.isFinite(totalAmount) && totalAmount > 0) {
     headers.set("x-alpha-owner-capital", String(totalAmount));
   }
+  if (historyPolicy) {
+    headers.set("x-alpha-history-policy", JSON.stringify(historyPolicy));
+  }
   headers.delete("cookie");
   const response = await fetch(new Request(upstream, { headers }));
   if (response.status === 401 || response.status === 403) {
@@ -587,7 +1277,8 @@ async function handleRequest(request, env, ctx) {
     const authRoute = url.pathname.startsWith("/api/v1/auth/");
     if (authRoute) return handleAuth(request, env, url);
     const simulationMatch = url.pathname.match(/^\/api\/v1\/simulation\/wallet\/([A-Za-z0-9_-]{8,64})$/);
-    const protectedLocally = simulationMatch || url.pathname === "/api/v1/settings/capital";
+    const simulationEventsMatch = url.pathname.match(/^\/api\/v1\/simulation\/wallet\/([A-Za-z0-9_-]{8,64})\/events$/);
+    const protectedLocally = simulationMatch || simulationEventsMatch || url.pathname === "/api/v1/settings/capital";
     const aiRoute = url.pathname === "/api/v1/ai/analyze" || url.pathname === "/api/v1/ai/opportunities";
     const publicBackendRoute = Boolean(url.pathname.match(/^\/api\/v1\/(market\/|news(?:\/|$))/));
     const fullBackendRoute = url.pathname.startsWith("/api/v1/")
@@ -598,15 +1289,21 @@ async function handleRequest(request, env, ctx) {
       && url.searchParams.get("platform") !== "hyperliquid";
 
     if (nonHyperliquid && publicBackendRoute) {
-      const proxied = await proxyBackend(request, env);
-      return proxied ?? json({ detail: "当前部署尚未配置完整后端服务" }, 503);
+      const proxied = await proxyBackend(request, env).catch(() => null);
+      if (proxied?.ok || (proxied && proxied.status < 500)) return proxied;
+      // 完整后端休眠时由边缘端直接读取交易所公开行情。
     }
 
     if (fullBackendRoute) {
       const auth = await authenticateOwner(request, env);
       if (auth.error) return auth.error;
       const capital = await readCapital(env, auth.ownerId);
-      const proxied = await proxyBackend(request, env, true, capital?.total_amount);
+      const historyPolicy = request.method === "POST" && url.pathname === "/api/v1/executions"
+        ? await readHistoryPolicy(env, auth.ownerId, await readRequestTimeframe(request, url))
+        : null;
+      const proxied = await proxyBackend(
+        request, env, true, capital?.total_amount, historyPolicy,
+      );
       return proxied ?? json({ detail: "当前部署尚未配置完整后端服务" }, 503);
     }
 
@@ -618,21 +1315,39 @@ async function handleRequest(request, env, ctx) {
         if (!["hyperliquid", "binance", "okx"].includes(platform)) {
           return json({ detail: "不支持的模拟交易平台" }, 422);
         }
-        return handleSimulationWallet(request, env, auth.ownerId, simulationMatch[1], platform);
+        return handleSimulationWallet(request, env, ctx, auth.ownerId, simulationMatch[1], platform);
+      }
+      if (simulationEventsMatch) {
+        const platform = url.searchParams.get("platform") || "hyperliquid";
+        if (!["hyperliquid", "binance", "okx"].includes(platform)) {
+          return json({ detail: "不支持的模拟交易平台" }, 422);
+        }
+        return handleSimulationEvents(
+          request, env, auth.ownerId, simulationEventsMatch[1], platform, url,
+        );
       }
       if (url.pathname === "/api/v1/settings/capital") {
         return handleCapital(request, env, auth.ownerId);
       }
       if (aiRoute) {
         const capital = await readCapital(env, auth.ownerId);
-        const proxied = await proxyBackend(request, env, true, capital?.total_amount);
+        const historyPolicy = await readHistoryPolicy(
+          env, auth.ownerId, await readRequestTimeframe(request, url),
+        );
+        const proxied = await proxyBackend(
+          request, env, true, capital?.total_amount, historyPolicy,
+        );
         if (proxied?.ok || (proxied && proxied.status < 500)) return proxied;
         if (proxied) console.error("完整后端决策暂时不可用，切换到边缘规则引擎");
         if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
         const headers = new Headers(request.headers);
         headers.set("x-alpha-owner-capital", String(capital.total_amount));
         headers.set("x-alpha-owner-id", auth.ownerId);
-        return baseWorker.fetch(new Request(request, { headers }), env, ctx);
+        if (historyPolicy) {
+          headers.set("x-alpha-history-policy", JSON.stringify(historyPolicy));
+        }
+        const edgeResponse = await baseWorker.fetch(new Request(request, { headers }), env, ctx);
+        return edgeResponse;
       }
     }
     return baseWorker.fetch(request, env, ctx);
@@ -646,5 +1361,8 @@ export default {
     }
     const response = await handleRequest(request, env, ctx);
     return withAppCors(request, withHtmlNoStore(request, response));
+  },
+  async scheduled(_controller, env, ctx) {
+    await runScheduledSimulation(env, ctx);
   },
 };

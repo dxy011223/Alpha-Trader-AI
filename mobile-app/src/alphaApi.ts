@@ -78,6 +78,8 @@ export interface AnalysisResponse {
     ema20: number | null;
     ema50: number | null;
     ema200: number | null;
+    ema20_slope_percent?: number | null;
+    ema50_slope_percent?: number | null;
     rsi14: number | null;
     macd: number | null;
     macd_signal: number | null;
@@ -85,16 +87,41 @@ export interface AnalysisResponse {
     atr14: number | null;
     atr_percent: number | null;
     realized_volatility: number | null;
+    volume_ratio?: number | null;
   } | null;
   reasons: string[];
   disclaimer: string;
   source: "live" | "demo";
+  funding_rate?: number | null;
   analysis_engine: "openai" | "rules";
   analysis_model: string | null;
   decision_schema_version?: "ai_full_v1" | null;
   platform: MarketPlatform;
   strategy_version?: string;
   strategy_parameters?: Record<string, number>;
+  history_policy?: {
+    timeframe?: MarketInterval | null;
+    sample_count: number;
+    wins: number;
+    losses: number;
+    win_rate: number;
+    average_r: number;
+    recent_win_rate: number;
+    consecutive_losses: number;
+    threshold_adjustment: number;
+    risk_multiplier: number;
+    direction_performance: Record<string, {
+      sample_count: number;
+      wins: number;
+      win_rate: number;
+      threshold_adjustment: number;
+      risk_multiplier: number;
+    }>;
+    fingerprint: string;
+    scope_key: string;
+    applied_threshold: number | null;
+    applied_risk_multiplier: number;
+  } | null;
   reference_price?: number | null;
   current_price?: number | null;
   generated_at?: string | null;
@@ -278,6 +305,18 @@ export interface SimulationWalletResponse extends SimulationWalletState {
   client_id: string;
   platform: MarketPlatform;
   updated_at: string;
+  revision: number;
+  integrity?: {
+    status: "ok" | "gap" | "error";
+    detail: string | null;
+  };
+  executor?: {
+    mode: "server";
+    healthy: boolean;
+    last_run_at: string | null;
+    last_success_at: string | null;
+    last_error: string | null;
+  };
 }
 
 const API_BASE = (import.meta.env.VITE_API_URL || "/api/v1").replace(/\/$/, "");
@@ -684,13 +723,73 @@ export function loadSimulationWallet(clientId: string, platform: MarketPlatform,
   return request<SimulationWalletResponse>(`/simulation/wallet/${encodeURIComponent(clientId)}?${query}`, { signal });
 }
 
-export function saveSimulationWallet(clientId: string, platform: MarketPlatform, state: SimulationWalletState, signal?: AbortSignal) {
+export function saveSimulationWallet(
+  clientId: string,
+  platform: MarketPlatform,
+  state: SimulationWalletState,
+  signal?: AbortSignal,
+  revision = 0,
+) {
   const query = new URLSearchParams({ platform });
   return request<SimulationWalletResponse>(`/simulation/wallet/${encodeURIComponent(clientId)}?${query}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(state),
+    body: JSON.stringify({
+      action: "configure",
+      enabled: state.enabled,
+      autoTimeframe: state.autoTimeframe,
+      revision,
+    }),
     signal,
+  });
+}
+
+export function resetSimulationWallet(
+  clientId: string,
+  platform: MarketPlatform,
+  state: Pick<SimulationWalletState, "enabled" | "autoTimeframe">,
+  revision: number,
+) {
+  const query = new URLSearchParams({ platform });
+  return request<SimulationWalletResponse>(`/simulation/wallet/${encodeURIComponent(clientId)}?${query}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...state, action: "reset", revision }),
+  });
+}
+
+export function executeSimulationDecision(
+  clientId: string,
+  platform: MarketPlatform,
+  analysis: AnalysisResponse,
+  timeframe: MarketInterval,
+  revision: number,
+) {
+  const query = new URLSearchParams({ platform });
+  return request<SimulationWalletResponse>(`/simulation/wallet/${encodeURIComponent(clientId)}?${query}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      action: "execute",
+      plan_id: analysis.plan_id || null,
+      symbol: analysis.symbol,
+      timeframe,
+      revision,
+    }),
+  });
+}
+
+export function cancelSimulationDecision(
+  clientId: string,
+  platform: MarketPlatform,
+  tradeId: number,
+  revision: number,
+) {
+  const query = new URLSearchParams({ platform });
+  return request<SimulationWalletResponse>(`/simulation/wallet/${encodeURIComponent(clientId)}?${query}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "cancel", trade_id: tradeId, revision }),
   });
 }
 

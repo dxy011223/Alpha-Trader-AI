@@ -105,7 +105,10 @@ test("keyboard and its attached footer dismiss on the same transition", async ({
 
   await input.click();
   await expect(keyboard).toHaveAttribute("data-visible", "true");
-  await drag(page, footer, 0, 120, 5);
+  await expect.poll(() => keyboard.evaluate((element) => (
+    Math.abs(new DOMMatrixReadOnly(getComputedStyle(element).transform).m42)
+  ))).toBeLessThan(1);
+  await drag(page, keyboard, 0, 120, 5);
   await expect(keyboard).toHaveAttribute("data-visible", "false");
 
   await page.waitForTimeout(100);

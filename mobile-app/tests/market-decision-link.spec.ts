@@ -57,22 +57,93 @@ test.beforeEach(async ({ page }) => {
       },
     };
   });
-  type SimulationState = { enabled: boolean; balance: number; activeTrades: object[]; activeTrade?: object | null; history: object[] };
+  type SimulationState = {
+    enabled: boolean;
+    balance: number;
+    activeTrades: object[];
+    activeTrade?: object | null;
+    history: object[];
+    autoTimeframe: string;
+    revision: number;
+  };
   const simulationStates = new Map<string, SimulationState>();
+  const autoSeededPlatforms = new Set<string>();
+  const defaultSimulationState = (): SimulationState => ({
+    enabled: false,
+    balance: 1_000,
+    activeTrades: [],
+    activeTrade: null,
+    history: [],
+    autoTimeframe: "4h",
+    revision: 0,
+  });
+  const serverTrade = (symbol: string, platform: string, index: number) => ({
+    id: 10_000 + index,
+    analysis: analysis(symbol, platform),
+    timeframe: "4h",
+    entryPrice: 99.5,
+    plannedEntryPrice: 99.5,
+    triggerPrice: 99.5,
+    size: 5.025,
+    initialSize: 5.025,
+    allocatedAmount: 500,
+    latestPrice: 99.5,
+    unrealizedPnl: 0,
+    startedAt: Date.parse("2026-09-13T01:00:00Z") + index,
+  });
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const url = new URL(request.url());
 
     if (url.pathname.includes("/simulation/wallet/")) {
       const platform = url.searchParams.get("platform") ?? "hyperliquid";
-      if (request.method() === "PUT") simulationStates.set(platform, request.postDataJSON() as SimulationState);
-      const simulationState = simulationStates.get(platform)
-        ?? { enabled: false, balance: 1_000, activeTrades: [], activeTrade: null, history: [] };
+      const current = simulationStates.get(platform) ?? defaultSimulationState();
+      if (request.method() === "PUT") {
+        const body = request.postDataJSON() as {
+          action: "configure" | "reset";
+          enabled: boolean;
+          autoTimeframe: string;
+        };
+        const reset = body.action === "reset";
+        const next = {
+          ...current,
+          enabled: body.enabled,
+          autoTimeframe: body.autoTimeframe,
+          balance: reset ? 1_000 : current.balance,
+          activeTrades: reset ? [] : current.activeTrades,
+          activeTrade: reset ? null : current.activeTrade,
+          history: reset ? [] : current.history,
+          revision: current.revision + 1,
+        };
+        if (!body.enabled || reset) autoSeededPlatforms.delete(platform);
+        simulationStates.set(platform, next);
+        await route.fulfill({ json: {
+          ...next,
+          client_id: url.pathname.split("/").at(-1),
+          platform,
+          updated_at: "2026-09-11T00:00:00Z",
+          executor: { mode: "server", healthy: true, last_run_at: null, last_success_at: null, last_error: null },
+        } });
+        return;
+      }
+      let simulationState = current;
+      if (request.method() === "GET" && current.enabled && !autoSeededPlatforms.has(platform)) {
+        const activeTrades = ["ETH", "SOL", "DOGE"].map((symbol, index) => serverTrade(symbol, platform, index));
+        simulationState = {
+          ...current,
+          activeTrades,
+          activeTrade: activeTrades[0],
+          revision: current.revision + 1,
+        };
+        simulationStates.set(platform, simulationState);
+        autoSeededPlatforms.add(platform);
+      }
       await route.fulfill({ json: {
         ...simulationState,
         client_id: url.pathname.split("/").at(-1),
         platform,
         updated_at: "2026-09-11T00:00:00Z",
+        executor: { mode: "server", healthy: true, last_run_at: null, last_success_at: null, last_error: null },
       } });
       return;
     }
@@ -343,7 +414,7 @@ test("平台切换会更新所有页面数据并持久化", async ({ page }) => 
 
   const navigation = page.locator(".bottom-nav button");
   await navigation.nth(1).click();
-  await expect(page.getByText("Binance 永续 · AI 决策引擎")).toBeVisible();
+  await expect(page.getByText("Binance 永续 · 策略决策引擎")).toBeVisible();
   await navigation.nth(2).click();
   await expect(page.getByText("Binance 永续 · 新闻雷达")).toBeVisible();
   await navigation.nth(3).click();
@@ -409,6 +480,7 @@ test("K 线失败时仍按成功的行情快照显示后端已连接", async ({ 
 
 test("模拟交易不读取真实钱包历史并在决策执行后自动开仓", async ({ page }) => {
   await page.getByRole("button", { name: "行情平台设置" }).click();
+  await expect(page.getByRole("switch", { name: "已关闭" })).toBeEnabled();
   const databaseSave = page.waitForRequest((request) => request.method() === "PUT" && request.url().includes("/simulation/wallet/"));
   await page.getByRole("switch", { name: "已关闭" }).click();
   await expect(page.getByText("1,000.00 USDC")).toBeVisible();
@@ -422,20 +494,26 @@ test("模拟交易不读取真实钱包历史并在决策执行后自动开仓",
   await page.getByLabel("主导航").getByRole("button", { name: "持仓", exact: true }).click();
 
   await expect(page.getByText("自动模拟中")).toBeVisible();
-  await expect(page.getByText("模拟入场价")).toBeVisible();
+  await expect(page.getByText("模拟成交价")).toBeVisible();
   await expect(page.getByRole("button", { name: "连接钱包", exact: true })).toHaveCount(0);
   expect(requestedUrls.some((raw) => /\/settings\/wallet$|\/wallet\/0x|\/trades\/completed|\/reviews|\/executions\/active/.test(new URL(raw).pathname))).toBe(false);
 });
 
 test("最多可同时执行三个决策，且只锁定对应币种", async ({ page }) => {
-  const savedStates: Array<{ activeTrades?: Array<{ allocatedAmount: number }> }> = [];
+  const configurationWrites: Array<Record<string, unknown>> = [];
   page.on("request", (request) => {
     if (request.method() === "PUT" && request.url().includes("/simulation/wallet/")) {
-      savedStates.push(request.postDataJSON() as { activeTrades?: Array<{ allocatedAmount: number }> });
+      configurationWrites.push(request.postDataJSON() as Record<string, unknown>);
     }
   });
   await page.getByRole("button", { name: "行情平台设置" }).click();
+  await expect(page.getByRole("switch", { name: "已关闭" })).toBeEnabled();
   await page.getByRole("switch", { name: "已关闭" }).click();
+  await expect.poll(() => configurationWrites.length).toBeGreaterThan(0);
+  expect(configurationWrites.every((state) => (
+    !("balance" in state) && !("activeTrades" in state) && !("history" in state)
+  ))).toBe(true);
+  await page.reload();
   await page.keyboard.press("Escape");
 
   await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();
@@ -445,10 +523,6 @@ test("最多可同时执行三个决策，且只锁定对应币种", async ({ pa
   await expect(ethDecision).toContainText("执行中 · 快照已锁定");
   await expect(solDecision).toContainText("执行中 · 快照已锁定");
   await expect(dogeDecision).toContainText("执行中 · 快照已锁定");
-  await expect.poll(() => savedStates.some((state) => state.activeTrades?.length === 3)).toBe(true);
-  const threeTradeState = [...savedStates].reverse().find((state) => state.activeTrades?.length === 3);
-  expect(threeTradeState?.activeTrades?.reduce((sum, trade) => sum + trade.allocatedAmount, 0)).toBe(1_500);
-
   const hypeDecision = page.getByRole("tab").filter({ hasText: "HYPE" });
   await hypeDecision.click();
   await expect(page.getByRole("button", { name: "已达 3 个执行上限" })).toBeDisabled();
@@ -466,7 +540,13 @@ test("最多可同时执行三个决策，且只锁定对应币种", async ({ pa
 
 test("切换平台时模拟余额与持仓互不串用", async ({ page }) => {
   await page.getByRole("button", { name: "行情平台设置" }).click();
+  await expect(page.getByRole("switch", { name: "已关闭" })).toBeEnabled();
+  const databaseSave = page.waitForRequest((request) => (
+    request.method() === "PUT" && request.url().includes("/simulation/wallet/")
+  ));
   await page.getByRole("switch", { name: "已关闭" }).click();
+  await databaseSave;
+  await page.reload();
   await page.keyboard.press("Escape");
 
   await page.getByLabel("主导航").getByRole("button", { name: "决策", exact: true }).click();

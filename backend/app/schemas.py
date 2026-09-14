@@ -76,6 +76,8 @@ class TechnicalIndicators(BaseModel):
     ema20: float | None = None
     ema50: float | None = None
     ema200: float | None = None
+    ema20_slope_percent: float | None = None
+    ema50_slope_percent: float | None = None
     rsi14: float | None = None
     macd: float | None = None
     macd_signal: float | None = None
@@ -83,6 +85,7 @@ class TechnicalIndicators(BaseModel):
     atr14: float | None = None
     atr_percent: float | None = None
     realized_volatility: float | None = None
+    volume_ratio: float | None = None
 
 
 class DecisionRevisionSnapshot(BaseModel):
@@ -99,6 +102,32 @@ class DecisionRevisionSnapshot(BaseModel):
     archived_at: str
     archive_reason: str
     revision_reason: str | None = None
+
+
+class HistoryDirectionPerformance(BaseModel):
+    sample_count: int = Field(default=0, ge=0, le=1500)
+    wins: int = Field(default=0, ge=0, le=1500)
+    win_rate: float = Field(default=0, ge=0, le=100)
+    threshold_adjustment: int = Field(default=0, ge=-1, le=2)
+    risk_multiplier: float = Field(default=1, ge=0.5, le=1.05)
+
+
+class DecisionHistoryPolicy(BaseModel):
+    timeframe: Literal["1m", "5m", "15m", "1h", "4h", "1d"] | None = None
+    sample_count: int = Field(default=0, ge=0, le=1500)
+    wins: int = Field(default=0, ge=0, le=1500)
+    losses: int = Field(default=0, ge=0, le=1500)
+    win_rate: float = Field(default=0, ge=0, le=100)
+    average_r: float = Field(default=0, ge=-2, le=2)
+    recent_win_rate: float = Field(default=0, ge=0, le=100)
+    consecutive_losses: int = Field(default=0, ge=0, le=200)
+    threshold_adjustment: int = Field(default=0, ge=-2, le=4)
+    risk_multiplier: float = Field(default=1, ge=0.5, le=1.05)
+    direction_performance: dict[str, HistoryDirectionPerformance] = Field(default_factory=dict)
+    fingerprint: str = Field(default="baseline", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    scope_key: str = Field(default="baseline", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    applied_threshold: int | None = Field(default=None, ge=68, le=78)
+    applied_risk_multiplier: float = Field(default=1, ge=0.5, le=1.05)
 
 
 class AnalysisResponse(BaseModel):
@@ -119,11 +148,13 @@ class AnalysisResponse(BaseModel):
     disclaimer: str
     source: Literal["live", "demo"] = "demo"
     platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
+    funding_rate: float | None = None
     analysis_engine: Literal["openai", "rules"] = "rules"
     analysis_model: str | None = None
     decision_schema_version: Literal["ai_full_v1"] | None = None
     strategy_version: str = "v1"
     strategy_parameters: dict = Field(default_factory=dict)
+    history_policy: DecisionHistoryPolicy | None = None
     reference_price: float | None = None
     current_price: float | None = None
     generated_at: str | None = None

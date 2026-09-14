@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import statistics
@@ -8,7 +9,7 @@ from typing import Literal
 import httpx
 
 from app.news_sources import fetch_live_news
-from app.schemas import AnalysisRequest, AnalysisResponse, Candle, DecisionRevisionSnapshot, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
+from app.schemas import AnalysisRequest, AnalysisResponse, Candle, DecisionHistoryPolicy, DecisionRevisionSnapshot, MarketSnapshot, NewsItem, PositionSizing, TechnicalIndicators, WalletSnapshot
 from app.strategy_scoring import apply_strategy_weights, normalize_strategy_parameters
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,24 @@ MISSED_ENTRY_CONFIRMATIONS = 2
 MAX_DECISION_REVISIONS = 3
 MAX_MISSED_ENTRY_ATR = 0.5
 MAX_TARGET_PROGRESS = 0.5
+HISTORY_POLICY_MIN_SAMPLES = 12
+HISTORY_DIRECTION_MIN_SAMPLES = 8
+MIN_EMA_SPREAD_PERCENT = 0.1
+MAX_EMA_SPREAD_ATR_FACTOR = 0.25
+MAX_EMA_SPREAD_THRESHOLD = 0.5
+MAX_ENTRY_STRETCH_ATR = 1.5
+LONG_RSI_EXHAUSTION = 75
+SHORT_RSI_EXHAUSTION = 25
+EMA_SLOPE_LOOKBACK = 3
+MIN_VOLUME_RATIO = 0.5
+MAX_CROWDED_FUNDING_RATE = 0.05
+MIN_ATR_PRICE_RATE = 0.0025
+MAX_ATR_PRICE_RATE = 0.03
+ENTRY_ATR_NEAR = 0.25
+ENTRY_ATR_FAR = 0.75
+STOP_ATR_DISTANCE = 1.25
+FIRST_TARGET_R = 2
+SECOND_TARGET_R = 3
 
 
 MARKETS = {
@@ -40,6 +59,50 @@ MARKETS = {
     "SOL": MarketSnapshot(symbol="SOL", price=179.42, change_24h=-0.74, volume=3_960_000_000, volatility=5.14, funding_rate=-0.0021, open_interest=2_180_000_000),
     "HYPE": MarketSnapshot(symbol="HYPE", price=39.28, change_24h=4.63, volume=642_000_000, volatility=6.42, funding_rate=0.0148, open_interest=782_000_000),
 }
+
+
+def parse_history_policy(
+    value: str | None,
+    platform: MarketPlatform,
+) -> DecisionHistoryPolicy | None:
+    """解析 Worker 生成的匿名历史聚合；异常数据直接回退到基础规则。"""
+    if not value:
+        return None
+    try:
+        payload = json.loads(value)
+        raw = payload.get("platforms", {}).get(platform)
+        policy = DecisionHistoryPolicy.model_validate(raw)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if policy.wins + policy.losses > policy.sample_count:
+        return None
+    for direction in ("LONG", "SHORT"):
+        performance = policy.direction_performance.get(direction)
+        if performance and performance.wins > performance.sample_count:
+            return None
+    return policy
+
+
+def apply_history_policy(
+    base_threshold: int,
+    direction: Literal["LONG", "SHORT", "WAIT"],
+    policy: DecisionHistoryPolicy | None,
+) -> tuple[int, float, DecisionHistoryPolicy | None]:
+    """历史只调整准入门槛与风险预算，不改写五维评分或技术方向。"""
+    if policy is None or policy.sample_count < HISTORY_POLICY_MIN_SAMPLES:
+        return base_threshold, 1, None
+    threshold_adjustment = policy.threshold_adjustment
+    risk_multiplier = policy.risk_multiplier
+    performance = policy.direction_performance.get(direction)
+    if performance and performance.sample_count >= HISTORY_DIRECTION_MIN_SAMPLES:
+        threshold_adjustment += performance.threshold_adjustment
+        risk_multiplier *= performance.risk_multiplier
+    effective_threshold = max(68, min(78, base_threshold + threshold_adjustment))
+    applied_risk_multiplier = max(0.5, min(1.05, risk_multiplier))
+    return effective_threshold, applied_risk_multiplier, policy.model_copy(update={
+        "applied_threshold": effective_threshold,
+        "applied_risk_multiplier": round(applied_risk_multiplier, 4),
+    })
 
 
 def get_market(symbol: str) -> MarketSnapshot | None:
@@ -308,10 +371,25 @@ def _ema(values: list[float], period: int) -> float | None:
 
 def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators:
     """只使用已完成 K 线生成企划要求的趋势、动量和波动指标。"""
-    closes = [item.close for item in candles]
+    now_ms = int(time.time() * 1000)
+    completed_candles = sorted(
+        (item for item in candles if item.close_time <= now_ms),
+        key=lambda item: item.open_time,
+    )
+    closes = [item.close for item in completed_candles]
     ema20 = _ema(closes, 20)
     ema50 = _ema(closes, 50)
     ema200 = _ema(closes, 200)
+    previous_ema20 = _ema(closes[:-EMA_SLOPE_LOOKBACK], 20)
+    previous_ema50 = _ema(closes[:-EMA_SLOPE_LOOKBACK], 50)
+
+    def slope_percent(current: float | None, previous: float | None) -> float | None:
+        if current is None or previous is None or previous == 0:
+            return None
+        return (current / previous - 1) * 100
+
+    ema20_slope_percent = slope_percent(ema20, previous_ema20)
+    ema50_slope_percent = slope_percent(ema50, previous_ema50)
 
     rsi14 = None
     if len(closes) >= 15:
@@ -333,9 +411,9 @@ def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators
     macd_signal = _ema(macd_series, 9)
 
     atr14 = None
-    if len(candles) >= 15:
+    if len(completed_candles) >= 15:
         true_ranges = []
-        for previous, current in zip(candles[-15:-1], candles[-14:]):
+        for previous, current in zip(completed_candles[-15:-1], completed_candles[-14:]):
             true_ranges.append(max(
                 current.high - current.low,
                 abs(current.high - previous.close),
@@ -349,11 +427,22 @@ def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators
         returns = [math.log(current / previous) for previous, current in zip(positive_closes, positive_closes[1:])]
         realized_volatility = statistics.pstdev(returns) * math.sqrt(len(returns)) * 100
 
+    volume_ratio = None
+    if len(completed_candles) >= 21:
+        previous_volumes = [max(0, item.volume) for item in completed_candles[-21:-1]]
+        average_volume = sum(previous_volumes) / len(previous_volumes)
+        if average_volume > 0:
+            volume_ratio = max(0, completed_candles[-1].volume) / average_volume
+
     last_close = closes[-1] if closes else 0
     return TechnicalIndicators(
         ema20=round_price(ema20) if ema20 is not None else None,
         ema50=round_price(ema50) if ema50 is not None else None,
         ema200=round_price(ema200) if ema200 is not None else None,
+        ema20_slope_percent=round(ema20_slope_percent, 4)
+        if ema20_slope_percent is not None else None,
+        ema50_slope_percent=round(ema50_slope_percent, 4)
+        if ema50_slope_percent is not None else None,
         rsi14=round(rsi14, 2) if rsi14 is not None else None,
         macd=round_price(macd) if macd is not None else None,
         macd_signal=round_price(macd_signal) if macd_signal is not None else None,
@@ -361,6 +450,7 @@ def calculate_technical_indicators(candles: list[Candle]) -> TechnicalIndicators
         atr14=round_price(atr14) if atr14 is not None else None,
         atr_percent=round(atr14 / last_close * 100, 4) if atr14 is not None and last_close > 0 else None,
         realized_volatility=round(realized_volatility, 4) if realized_volatility is not None else None,
+        volume_ratio=round(volume_ratio, 4) if volume_ratio is not None else None,
     )
 
 
@@ -412,9 +502,38 @@ def calculate_news_scores(
 
 
 def build_execution_levels(
-    market: MarketSnapshot, direction: str, risk: str
+    market: MarketSnapshot,
+    direction: str,
+    risk: str,
+    indicators: TechnicalIndicators | None = None,
 ) -> tuple[list[float], float, list[float]]:
-    """按方向生成价格边界，确保空头止损在上、止盈在下。"""
+    """优先按 ATR 与固定盈亏比生成价格边界，指标不足时兼容旧百分比模型。"""
+    if direction == "WAIT":
+        reference = round_price(market.price)
+        return [reference, reference], reference, [reference, reference]
+
+    if indicators and indicators.atr14 is not None and indicators.atr14 > 0:
+        atr_value = max(
+            market.price * MIN_ATR_PRICE_RATE,
+            min(market.price * MAX_ATR_PRICE_RATE, indicators.atr14),
+        )
+        direction_sign = 1 if direction == "LONG" else -1
+        entry_near = market.price - direction_sign * atr_value * ENTRY_ATR_NEAR
+        entry_far = market.price - direction_sign * atr_value * ENTRY_ATR_FAR
+        entry_range = sorted([round_price(entry_far), round_price(entry_near)])
+        entry_mid = sum(entry_range) / 2
+        risk_distance = atr_value * STOP_ATR_DISTANCE
+        stop_loss = entry_mid - direction_sign * risk_distance
+        take_profit = [
+            entry_mid + direction_sign * risk_distance * FIRST_TARGET_R,
+            entry_mid + direction_sign * risk_distance * SECOND_TARGET_R,
+        ]
+        return (
+            entry_range,
+            round_price(stop_loss),
+            [round_price(target) for target in take_profit],
+        )
+
     stop_distance = {"low": 0.020, "medium": 0.026, "high": 0.035}.get(risk, 0.035)
     if direction == "SHORT":
         return (
@@ -438,6 +557,7 @@ def calculate_position_sizing(
     entry_range: list[float],
     stop_loss: float,
     leverage: int,
+    risk_multiplier: float = 1,
 ) -> PositionSizing:
     """按账户风险预算和止损距离反推仓位，资金比例只作为保证金上限。"""
     margin_cap_rate = 0.30
@@ -471,7 +591,7 @@ def calculate_position_sizing(
     # 高风险机会使用更低账户风险预算；置信度用于缩放，而不是直接决定资金比例。
     base_risk_rate = {"low": 0.0100, "medium": 0.0075, "high": 0.0050}.get(risk, 0.0050)
     confidence_factor = max(0, min(confidence, 100)) / 100
-    risk_budget_rate = base_risk_rate * confidence_factor
+    risk_budget_rate = base_risk_rate * confidence_factor * max(0.5, min(1.05, risk_multiplier))
     risk_budget_amount = total_amount * risk_budget_rate
     uncapped_position_value = risk_budget_amount / stop_distance_rate
     uncapped_margin = uncapped_position_value / leverage
@@ -522,6 +642,8 @@ def refresh_decision_plan(
         entry_range=original.entry_range,
         stop_loss=original.stop_loss,
         leverage=original.leverage,
+        risk_multiplier=refreshed.history_policy.applied_risk_multiplier
+        if refreshed.history_policy else 1,
     )
 
     def keep_plan_with_review(
@@ -539,6 +661,7 @@ def refresh_decision_plan(
             "confidence": refreshed.confidence,
             "score": refreshed.score,
             "score_breakdown": refreshed.score_breakdown,
+            "history_policy": refreshed.history_policy,
             "indicators": refreshed.indicators,
             "source": refreshed.source,
             "current_price": current_price,
@@ -560,7 +683,12 @@ def refresh_decision_plan(
 
     entry_low, entry_high = sorted(original.entry_range[:2])
     first_target = original.take_profit[0]
-    min_trade_score = int(refreshed.strategy_parameters.get("min_trade_score", 70))
+    base_trade_score = int(refreshed.strategy_parameters.get("min_trade_score", 70))
+    min_trade_score = (
+        refreshed.history_policy.applied_threshold
+        if refreshed.history_policy and refreshed.history_policy.applied_threshold is not None
+        else base_trade_score
+    )
     status: Literal[
         "watching", "confirming", "missed_entry", "executable", "invalidated", "target_reached"
     ] = "watching"
@@ -592,16 +720,16 @@ def refresh_decision_plan(
         reason = "价格已达到原决策首个止盈目标，本轮预测完成，禁止追价入场"
         return keep_plan_with_review(decision_status=status, reason=reason)
     else:
-        opposite_direction = refreshed.direction in {"LONG", "SHORT"} and refreshed.direction != original.direction
+        direction_failure = refreshed.direction != original.direction
         severe_score_drop = refreshed.score < max(0, min_trade_score - DECISION_SCORE_HYSTERESIS)
-        if opposite_direction or severe_score_drop:
+        if direction_failure or severe_score_drop:
             soft_failure_count = min(original.soft_failure_count + 1, SOFT_FAILURE_CONFIRMATIONS)
             if soft_failure_count >= SOFT_FAILURE_CONFIRMATIONS:
                 status = "invalidated"
-                reason = "最新方向或综合评分已连续两次不满足原决策的可执行标准"
+                reason = "最新均线方向或综合评分已连续两次不满足原决策的可执行标准"
             else:
                 status = "confirming"
-                reason = "最新方向或评分首次异常，暂停执行并等待下一次复核确认"
+                reason = "最新均线方向或评分首次异常，暂停执行并等待下一次复核确认"
             return keep_plan_with_review(
                 decision_status=status,
                 reason=reason,
@@ -653,6 +781,8 @@ def refresh_decision_plan(
                     entry_range=refreshed.entry_range,
                     stop_loss=refreshed.stop_loss,
                     leverage=leverage,
+                    risk_multiplier=refreshed.history_policy.applied_risk_multiplier
+                    if refreshed.history_policy else 1,
                 )
                 archived = DecisionRevisionSnapshot(
                     revision=original.decision_revision,
@@ -674,6 +804,7 @@ def refresh_decision_plan(
                     "confidence": refreshed.confidence,
                     "score": refreshed.score,
                     "score_breakdown": refreshed.score_breakdown,
+                    "history_policy": refreshed.history_policy,
                     "entry_range": refreshed.entry_range,
                     "stop_loss": refreshed.stop_loss,
                     "take_profit": refreshed.take_profit,
@@ -750,27 +881,123 @@ def analyze_market(
     strategy_version: str = "v1",
     strategy_parameters: dict | None = None,
     news_items: list[NewsItem] | None = None,
+    history_policy: DecisionHistoryPolicy | None = None,
 ) -> AnalysisResponse:
     market = market or MARKETS[payload.symbol.upper()]
     symbol = market.symbol
-    # 五维权重与企划保持一致，总分用于判断机会质量，方向由价格动能单独判断。
+    # 五维权重与企划保持一致；均线方向是生成可执行决策前不可绕过的硬门槛。
     trend_score = max(0, min(30, round(18 + abs(market.change_24h) * 2)))
     structure_score = max(0, min(25, round(17 + abs(market.change_24h) - market.volatility * 0.8)))
     indicator_direction: Literal["LONG", "SHORT", "WAIT"] = "WAIT"
+    moving_average_reason = "EMA20/50/200 数据不足，均线方向无法确认"
+    technical_gate_reason = moving_average_reason
+    technical_gate_passed = False
     if indicators and all(value is not None for value in (indicators.ema20, indicators.ema50, indicators.ema200)):
         if indicators.ema20 > indicators.ema50 > indicators.ema200:
             indicator_direction = "LONG"
             trend_score = 30
+            moving_average_reason = "EMA20 > EMA50 > EMA200，均线形成明确多头排列"
         elif indicators.ema20 < indicators.ema50 < indicators.ema200:
             indicator_direction = "SHORT"
             trend_score = 30
+            moving_average_reason = "EMA20 < EMA50 < EMA200，均线形成明确空头排列"
         else:
             trend_score = min(trend_score, 20)
+            moving_average_reason = "EMA20/50/200 交叉、走平或排列混乱，均线方向不明确"
         if indicators.rsi14 is not None:
             structure_score = max(8, min(25, round(25 - abs(indicators.rsi14 - 50) * 0.25)))
+
+        if indicator_direction != "WAIT":
+            ema_spread_percent = abs(indicators.ema20 - indicators.ema200) / market.price * 100
+            atr_spread_threshold = (
+                indicators.atr_percent * MAX_EMA_SPREAD_ATR_FACTOR
+                if indicators.atr_percent is not None and indicators.atr_percent > 0 else 0
+            )
+            required_spread_percent = max(
+                MIN_EMA_SPREAD_PERCENT,
+                min(MAX_EMA_SPREAD_THRESHOLD, atr_spread_threshold),
+            )
+            gate_failures: list[str] = []
+            if ema_spread_percent < required_spread_percent:
+                gate_failures.append(
+                    f"均线总间距仅 {ema_spread_percent:.2f}%，低于 {required_spread_percent:.2f}%"
+                )
+            if indicator_direction == "LONG" and market.price < indicators.ema50:
+                gate_failures.append("当前价格跌破 EMA50，多头价格结构未确认")
+            elif indicator_direction == "SHORT" and market.price > indicators.ema50:
+                gate_failures.append("当前价格站上 EMA50，空头价格结构未确认")
+
+            if indicators.rsi14 is not None:
+                if indicator_direction == "LONG" and indicators.rsi14 >= LONG_RSI_EXHAUSTION:
+                    gate_failures.append(f"RSI14 为 {indicators.rsi14:.2f}，多头处于过热区")
+                elif indicator_direction == "SHORT" and indicators.rsi14 <= SHORT_RSI_EXHAUSTION:
+                    gate_failures.append(f"RSI14 为 {indicators.rsi14:.2f}，空头处于过冷区")
+
+            if indicators.ema20_slope_percent is not None and indicators.ema50_slope_percent is not None:
+                slope_conflict = (
+                    indicator_direction == "LONG"
+                    and (indicators.ema20_slope_percent <= 0 or indicators.ema50_slope_percent <= 0)
+                    or indicator_direction == "SHORT"
+                    and (indicators.ema20_slope_percent >= 0 or indicators.ema50_slope_percent >= 0)
+                )
+                if slope_conflict:
+                    gate_failures.append(
+                        "EMA20 与 EMA50 斜率未共同支持当前均线方向"
+                    )
+
+            if indicators.volume_ratio is not None and indicators.volume_ratio < MIN_VOLUME_RATIO:
+                gate_failures.append(
+                    f"最新成交量仅为近 20 根均量的 {indicators.volume_ratio:.2f} 倍，量能不足"
+                )
+
+            crowded_funding = (
+                indicator_direction == "LONG" and market.funding_rate >= MAX_CROWDED_FUNDING_RATE
+                or indicator_direction == "SHORT" and market.funding_rate <= -MAX_CROWDED_FUNDING_RATE
+            )
+            if crowded_funding:
+                gate_failures.append(
+                    f"资金费率 {market.funding_rate:.4f}% 与方向同侧过度拥挤"
+                )
+
+            momentum_conflict = (
+                indicators.macd_histogram is not None
+                and indicators.rsi14 is not None
+                and (
+                    indicator_direction == "LONG"
+                    and indicators.macd_histogram < 0
+                    and indicators.rsi14 < 50
+                    or indicator_direction == "SHORT"
+                    and indicators.macd_histogram > 0
+                    and indicators.rsi14 > 50
+                )
+            )
+            if momentum_conflict:
+                gate_failures.append("MACD 柱与 RSI 同时反向，短期动量不支持均线方向")
+
+            if indicators.atr14 is not None and indicators.atr14 > 0:
+                ema20_distance_atr = abs(market.price - indicators.ema20) / indicators.atr14
+                overextended = (
+                    indicator_direction == "LONG" and market.price > indicators.ema20
+                    or indicator_direction == "SHORT" and market.price < indicators.ema20
+                ) and ema20_distance_atr > MAX_ENTRY_STRETCH_ATR
+                if overextended:
+                    gate_failures.append(
+                        f"价格偏离 EMA20 达 {ema20_distance_atr:.2f} ATR，当前不宜追价"
+                    )
+
+            if gate_failures:
+                trend_score = min(trend_score, 20)
+                structure_score = min(structure_score, 15)
+                technical_gate_reason = "技术准入未通过：" + "；".join(gate_failures)
+            else:
+                technical_gate_passed = True
+                technical_gate_reason = (
+                    f"{moving_average_reason}；均线总间距 {ema_spread_percent:.2f}% "
+                    f"达到 {required_spread_percent:.2f}% 的趋势强度要求"
+                )
     direction = indicator_direction
-    if direction == "WAIT":
-        direction = "LONG" if market.change_24h >= 1 else "SHORT" if market.change_24h <= -1 else "WAIT"
+    if not technical_gate_passed:
+        direction = "WAIT"
     capital_score = max(0, min(20, round(15 - abs(market.funding_rate) * 100)))
     macro_score, news_score, news_reason = calculate_news_scores(
         symbol, direction, news_items
@@ -785,12 +1012,19 @@ def analyze_market(
     normalized_parameters = normalize_strategy_parameters(strategy_parameters)
     score_breakdown = apply_strategy_weights(raw_score_breakdown, normalized_parameters)
     score = sum(score_breakdown.values())
-    # 企划将 50–69 分定义为观察区，只有 70 分以上才生成可执行方向。
     min_trade_score = int(normalized_parameters["min_trade_score"])
-    if score < min_trade_score:
+    effective_threshold, history_risk_multiplier, applied_history_policy = apply_history_policy(
+        min_trade_score,
+        direction,
+        history_policy,
+    )
+    # 企划将 50–69 分定义为观察区，只有 70 分以上才生成可执行方向。
+    if score < effective_threshold:
         direction = "WAIT"
     risk = "high" if market.volatility > 6 else "medium" if market.volatility > 3 else "low"
-    entry_range, stop_loss, take_profit = build_execution_levels(market, direction, risk)
+    entry_range, stop_loss, take_profit = build_execution_levels(
+        market, direction, risk, indicators
+    )
     leverage = 3 if risk == "medium" else 2
     position_sizing = calculate_position_sizing(
         total_amount=total_amount,
@@ -800,13 +1034,15 @@ def analyze_market(
         entry_range=entry_range,
         stop_loss=stop_loss,
         leverage=leverage,
+        risk_multiplier=history_risk_multiplier,
     )
     generated_at = datetime.now(UTC).isoformat()
-    status_reason = (
-        "当前评分或方向尚未达到可执行标准"
-        if direction == "WAIT"
-        else "已生成固定交易计划，等待价格进入计划入场区间"
-    )
+    if not technical_gate_passed:
+        status_reason = f"{technical_gate_reason}，不生成可执行决策"
+    elif direction == "WAIT":
+        status_reason = "均线方向明确，但当前评分尚未达到可执行标准"
+    else:
+        status_reason = "已生成固定交易计划，等待价格进入计划入场区间"
     return AnalysisResponse(
         symbol=symbol,
         instrument=f"{symbol}-PERP",
@@ -830,21 +1066,38 @@ def analyze_market(
                 f"RSI14 为 {indicators.rsi14}，ATR 占比 {indicators.atr_percent}%"
                 if indicators else "K 线指标暂不可用，本次仅使用市场快照评分"
             ),
+            technical_gate_reason,
+            (
+                "入场、止损与止盈按 ATR 回踩区及 2R/3R 目标生成"
+                if direction != "WAIT" and indicators and indicators.atr14 is not None
+                else "当前使用固定百分比价格模型或处于观望状态"
+            ),
             news_reason,
             (
-                f"策略版本 {strategy_version}，当前可交易阈值 {min_trade_score} 分；"
+                f"策略版本 {strategy_version}，基础可交易阈值 {min_trade_score} 分；"
                 f"五维权重为趋势 {normalized_parameters['trend_weight']}、"
                 f"技术结构 {normalized_parameters['structure_weight']}、"
                 f"资金 {normalized_parameters['capital_weight']}、"
                 f"宏观 {normalized_parameters['macro_weight']}、"
                 f"新闻 {normalized_parameters['news_weight']}"
             ),
+            (
+                f"历史策略参考 {applied_history_policy.sample_count} 笔去重模拟决策，"
+                f"胜率 {applied_history_policy.win_rate:.1f}%，"
+                f"近 6 笔胜率 {applied_history_policy.recent_win_rate:.1f}%，"
+                f"当前准入阈值 {effective_threshold} 分，"
+                f"风险预算系数 {history_risk_multiplier:.2f}"
+                if applied_history_policy
+                else f"历史有效样本不足 {HISTORY_POLICY_MIN_SAMPLES} 笔，本次沿用基础决策策略"
+            ),
         ],
         disclaimer="仅供研究与辅助决策，不构成投资建议；系统不会自动下单。",
         source=market.source,
         platform=market.platform,
+        funding_rate=market.funding_rate,
         strategy_version=strategy_version,
         strategy_parameters=normalized_parameters,
+        history_policy=applied_history_policy,
         reference_price=market.price,
         current_price=market.price,
         generated_at=generated_at,
