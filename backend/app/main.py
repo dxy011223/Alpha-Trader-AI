@@ -4,6 +4,9 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from redis import Redis
+from sqlalchemy import text
 
 from app.api import router
 from app.config import get_settings
@@ -51,3 +54,36 @@ app.include_router(router)
 @app.get("/health", tags=["system"], summary="健康检查")
 def health_check() -> dict[str, str]:
     return {"status": "ok", "service": settings.app_name}
+
+
+@app.get("/ready", tags=["system"], summary="依赖就绪检查")
+def readiness_check() -> JSONResponse:
+    """同时验证持久化与扫描协调依赖，避免健康检查出现假阳性。"""
+    checks: dict[str, str] = {"database": "ok", "redis": "ok"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:  # pragma: no cover - 具体驱动异常由部署环境决定
+        logger.error("数据库就绪检查失败：%s", exc)
+        checks["database"] = "error"
+
+    client = None
+    try:
+        client = Redis.from_url(
+            settings.redis_url,
+            socket_connect_timeout=1,
+            socket_timeout=1,
+        )
+        client.ping()
+    except Exception as exc:  # pragma: no cover - 具体连接异常由部署环境决定
+        logger.error("Redis 就绪检查失败：%s", exc)
+        checks["redis"] = "error"
+    finally:
+        if client is not None:
+            client.close()
+
+    ready = all(value == "ok" for value in checks.values())
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={"status": "ok" if ready else "degraded", "checks": checks},
+    )

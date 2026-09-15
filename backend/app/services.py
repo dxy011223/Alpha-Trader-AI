@@ -525,13 +525,28 @@ def calculate_news_scores(
     return macro_score, news_score, summary
 
 
+def calculate_optimal_entry_price(
+    market: MarketSnapshot,
+    direction: str,
+    entry_range: list[float],
+    indicators: TechnicalIndicators | None = None,
+) -> float:
+    """优先选择 EMA20 回踩位，并把结果限制在内部 ATR 触发带内。"""
+    if direction == "WAIT" or len(entry_range) < 2:
+        return round_price(market.price)
+    entry_low, entry_high = sorted(entry_range[:2])
+    ema20 = indicators.ema20 if indicators else None
+    target = ema20 if ema20 is not None and math.isfinite(ema20) and ema20 > 0 else (entry_low + entry_high) / 2
+    return round_price(max(entry_low, min(entry_high, target)))
+
+
 def build_execution_levels(
     market: MarketSnapshot,
     direction: str,
     risk: str,
     indicators: TechnicalIndicators | None = None,
 ) -> tuple[list[float], float, list[float]]:
-    """优先按 ATR 与固定盈亏比生成价格边界，指标不足时兼容旧百分比模型。"""
+    """生成内部触发带，并以唯一最优入场价计算止损与止盈。"""
     if direction == "WAIT":
         reference = round_price(market.price)
         return [reference, reference], reference, [reference, reference]
@@ -545,12 +560,12 @@ def build_execution_levels(
         entry_near = market.price - direction_sign * atr_value * ENTRY_ATR_NEAR
         entry_far = market.price - direction_sign * atr_value * ENTRY_ATR_FAR
         entry_range = sorted([round_price(entry_far), round_price(entry_near)])
-        entry_mid = sum(entry_range) / 2
+        optimal_entry = calculate_optimal_entry_price(market, direction, entry_range, indicators)
         risk_distance = atr_value * STOP_ATR_DISTANCE
-        stop_loss = entry_mid - direction_sign * risk_distance
+        stop_loss = optimal_entry - direction_sign * risk_distance
         take_profit = [
-            entry_mid + direction_sign * risk_distance * FIRST_TARGET_R,
-            entry_mid + direction_sign * risk_distance * SECOND_TARGET_R,
+            optimal_entry + direction_sign * risk_distance * FIRST_TARGET_R,
+            optimal_entry + direction_sign * risk_distance * SECOND_TARGET_R,
         ]
         return (
             entry_range,
@@ -559,16 +574,21 @@ def build_execution_levels(
         )
 
     stop_distance = {"low": 0.020, "medium": 0.026, "high": 0.035}.get(risk, 0.035)
-    if direction == "SHORT":
-        return (
-            [round_price(market.price * 1.003), round_price(market.price * 1.008)],
-            round_price(market.price * (1 + stop_distance)),
-            [round_price(market.price * 0.965), round_price(market.price * 0.928)],
-        )
+    direction_sign = 1 if direction == "LONG" else -1
+    entry_range = (
+        [round_price(market.price * 0.992), round_price(market.price * 0.997)]
+        if direction == "LONG"
+        else [round_price(market.price * 1.003), round_price(market.price * 1.008)]
+    )
+    optimal_entry = calculate_optimal_entry_price(market, direction, entry_range, indicators)
+    risk_distance = optimal_entry * stop_distance
     return (
-        [round_price(market.price * 0.992), round_price(market.price * 0.997)],
-        round_price(market.price * (1 - stop_distance)),
-        [round_price(market.price * 1.035), round_price(market.price * 1.072)],
+        entry_range,
+        round_price(optimal_entry - direction_sign * risk_distance),
+        [
+            round_price(optimal_entry + direction_sign * risk_distance * FIRST_TARGET_R),
+            round_price(optimal_entry + direction_sign * risk_distance * SECOND_TARGET_R),
+        ],
     )
 
 
@@ -581,6 +601,7 @@ def calculate_position_sizing(
     entry_range: list[float],
     stop_loss: float,
     leverage: int,
+    optimal_entry_price: float | None = None,
     risk_multiplier: float = 1,
 ) -> PositionSizing:
     """按账户风险预算和止损距离反推仓位，资金比例只作为保证金上限。"""
@@ -598,8 +619,8 @@ def calculate_position_sizing(
             capped=False,
         )
 
-    entry_mid = sum(entry_range[:2]) / 2
-    stop_distance_rate = abs(entry_mid - stop_loss) / entry_mid if entry_mid > 0 else 0
+    entry_price = optimal_entry_price or sum(entry_range[:2]) / 2
+    stop_distance_rate = abs(entry_price - stop_loss) / entry_price if entry_price > 0 else 0
     if stop_distance_rate <= 0:
         return PositionSizing(
             risk_budget_rate=0,
@@ -666,6 +687,7 @@ def refresh_decision_plan(
         entry_range=original.entry_range,
         stop_loss=original.stop_loss,
         leverage=original.leverage,
+        optimal_entry_price=original.optimal_entry_price,
         risk_multiplier=refreshed.history_policy.applied_risk_multiplier
         if refreshed.history_policy else 1,
     )
@@ -779,9 +801,9 @@ def refresh_decision_plan(
             target_progress = missed_distance / target_distance if target_distance > 0 else 1.0
             atr14 = refreshed.indicators.atr14 if refreshed.indicators else None
             within_atr = atr14 is not None and atr14 > 0 and missed_distance <= atr14 * MAX_MISSED_ENTRY_ATR
-            new_entry_mid = sum(refreshed.entry_range[:2]) / 2
-            new_risk_distance = abs(new_entry_mid - refreshed.stop_loss)
-            new_reward_distance = abs(refreshed.take_profit[0] - new_entry_mid)
+            new_entry_price = refreshed.optimal_entry_price or sum(refreshed.entry_range[:2]) / 2
+            new_risk_distance = abs(new_entry_price - refreshed.stop_loss)
+            new_reward_distance = abs(refreshed.take_profit[0] - new_entry_price)
             new_reward_risk = new_reward_distance / new_risk_distance if new_risk_distance > 0 else 0
             can_reprice = (
                 missed_entry_count >= MISSED_ENTRY_CONFIRMATIONS
@@ -805,6 +827,7 @@ def refresh_decision_plan(
                     entry_range=refreshed.entry_range,
                     stop_loss=refreshed.stop_loss,
                     leverage=leverage,
+                    optimal_entry_price=refreshed.optimal_entry_price,
                     risk_multiplier=refreshed.history_policy.applied_risk_multiplier
                     if refreshed.history_policy else 1,
                 )
@@ -812,6 +835,7 @@ def refresh_decision_plan(
                     revision=original.decision_revision,
                     reference_price=original.reference_price,
                     entry_range=original.entry_range,
+                    optimal_entry_price=original.optimal_entry_price,
                     stop_loss=original.stop_loss,
                     take_profit=original.take_profit,
                     leverage=original.leverage,
@@ -823,13 +847,14 @@ def refresh_decision_plan(
                     archive_reason="missed_entry",
                     revision_reason=original.revision_reason,
                 )
-                reason = f"已生成修订版 V{revision}，等待价格进入新的计划入场区间"
+                reason = f"已生成修订版 V{revision}，等待价格接近新的最优入场价"
                 return original.model_copy(update={
                     "confidence": refreshed.confidence,
                     "score": refreshed.score,
                     "score_breakdown": refreshed.score_breakdown,
                     "history_policy": refreshed.history_policy,
                     "entry_range": refreshed.entry_range,
+                    "optimal_entry_price": refreshed.optimal_entry_price,
                     "stop_loss": refreshed.stop_loss,
                     "take_profit": refreshed.take_profit,
                     "leverage": leverage,
@@ -880,15 +905,15 @@ def refresh_decision_plan(
         if reward_risk >= MIN_REMAINING_REWARD_RISK:
             status = "executable"
             executable = True
-            reason = f"价格进入原入场区间，最新评分 {refreshed.score} 分，剩余盈亏比 {reward_risk:.2f}"
+            reason = f"价格进入最优入场价的有效触发范围，最新评分 {refreshed.score} 分，剩余盈亏比 {reward_risk:.2f}"
         else:
-            reason = f"价格虽进入原入场区间，但剩余盈亏比 {reward_risk:.2f} 低于 {MIN_REMAINING_REWARD_RISK:.1f}"
+            reason = f"价格虽接近最优入场价，但剩余盈亏比 {reward_risk:.2f} 低于 {MIN_REMAINING_REWARD_RISK:.1f}"
     elif original.direction == "LONG" and current_price > entry_high:
-        reason = "价格高于原入场区间，等待回踩，禁止追涨"
+        reason = "价格高于最优入场价的有效触发范围，等待回踩，禁止追涨"
     elif original.direction == "SHORT" and current_price < entry_low:
-        reason = "价格低于原入场区间，等待反弹，禁止追空"
+        reason = "价格低于最优入场价的有效触发范围，等待反弹，禁止追空"
     else:
-        reason = "价格已穿过原入场区间但尚未触及止损，等待重新进入计划区间"
+        reason = "价格已穿过最优入场价但尚未触及止损，等待重新接近计划价"
 
     return keep_plan_with_review(
         decision_status=status,
@@ -1049,6 +1074,7 @@ def analyze_market(
     entry_range, stop_loss, take_profit = build_execution_levels(
         market, direction, risk, indicators
     )
+    optimal_entry_price = calculate_optimal_entry_price(market, direction, entry_range, indicators)
     leverage = 3 if risk == "medium" else 2
     position_sizing = calculate_position_sizing(
         total_amount=total_amount,
@@ -1058,6 +1084,7 @@ def analyze_market(
         entry_range=entry_range,
         stop_loss=stop_loss,
         leverage=leverage,
+        optimal_entry_price=optimal_entry_price,
         risk_multiplier=history_risk_multiplier,
     )
     generated_at = datetime.now(UTC).isoformat()
@@ -1066,7 +1093,7 @@ def analyze_market(
     elif direction == "WAIT":
         status_reason = "均线方向明确，但当前评分尚未达到可执行标准"
     else:
-        status_reason = "已生成固定交易计划，等待价格进入计划入场区间"
+        status_reason = "已生成固定交易计划，等待价格接近最优入场价"
     return AnalysisResponse(
         symbol=symbol,
         instrument=f"{symbol}-PERP",
@@ -1075,6 +1102,7 @@ def analyze_market(
         score=score,
         score_breakdown=score_breakdown,
         entry_range=entry_range,
+        optimal_entry_price=optimal_entry_price,
         stop_loss=stop_loss,
         take_profit=take_profit,
         leverage=leverage,

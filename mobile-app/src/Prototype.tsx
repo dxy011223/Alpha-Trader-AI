@@ -12,16 +12,12 @@ import {
   PieChartIcon,
   ReaderIcon,
 } from "@radix-ui/react-icons";
-import {
-  CandlestickSeries,
-  ColorType,
-  HistogramSeries,
-  LineSeries,
-  createChart,
-  type CandlestickData,
-  type HistogramData,
-  type LineData,
-  type UTCTimestamp,
+import type {
+  CandlestickData,
+  HistogramData,
+  IChartApi,
+  LineData,
+  UTCTimestamp,
 } from "lightweight-charts";
 import {
   cancelExecution,
@@ -285,9 +281,19 @@ function MarketChart({ symbol, interval, candles }: { symbol: AssetSymbol; inter
 
   useEffect(() => {
     if (!containerRef.current) return;
+    let chart: IChartApi | null = null;
+    let disposed = false;
 
-    // 使用成熟图表库绘制真实 K 线，避免将行情图做成不可交互的装饰图片。
-    const chart = createChart(containerRef.current, {
+    // 仅进入市场页时加载图表库，避免登录页和其他功能承担 K 线依赖体积。
+    void import("lightweight-charts").then(({
+      CandlestickSeries,
+      ColorType,
+      HistogramSeries,
+      LineSeries,
+      createChart,
+    }) => {
+      if (disposed || !containerRef.current) return;
+      chart = createChart(containerRef.current, {
       autoSize: true,
       height: 164,
       layout: {
@@ -308,9 +314,9 @@ function MarketChart({ symbol, interval, candles }: { symbol: AssetSymbol; inter
       },
       handleScale: false,
       handleScroll: false,
-    });
+      });
 
-    const candleSeries = chart.addSeries(CandlestickSeries, {
+      const candleSeries = chart.addSeries(CandlestickSeries, {
       upColor: "#34d399",
       downColor: "#ff685b",
       borderVisible: false,
@@ -319,33 +325,37 @@ function MarketChart({ symbol, interval, candles }: { symbol: AssetSymbol; inter
       priceLineColor: "#f7be43",
       priceLineWidth: 1,
     });
-    candleSeries.setData(chartData.candles);
+      candleSeries.setData(chartData.candles);
 
-    const fastAverage = chart.addSeries(LineSeries, {
+      const fastAverage = chart.addSeries(LineSeries, {
       color: "#f7be43",
       lineWidth: 1,
       priceLineVisible: false,
       lastValueVisible: false,
     });
-    fastAverage.setData(chartData.ma12);
+      fastAverage.setData(chartData.ma12);
 
-    const slowAverage = chart.addSeries(LineSeries, {
+      const slowAverage = chart.addSeries(LineSeries, {
       color: "#5b9cf6",
       lineWidth: 1,
       priceLineVisible: false,
       lastValueVisible: false,
     });
-    slowAverage.setData(chartData.ma24);
+      slowAverage.setData(chartData.ma24);
 
-    const volumeSeries = chart.addSeries(HistogramSeries, {
+      const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: "volume" },
       priceScaleId: "volume",
     });
-    volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-    volumeSeries.setData(chartData.volumes);
-    chart.timeScale().fitContent();
+      volumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+      volumeSeries.setData(chartData.volumes);
+      chart.timeScale().fitContent();
+    });
 
-    return () => chart.remove();
+    return () => {
+      disposed = true;
+      chart?.remove();
+    };
   }, [chartData]);
 
   return <div className="market-chart" ref={containerRef} aria-label={`${symbol} ${interval} K 线图`} />;
@@ -397,6 +407,21 @@ function formatPrice(value: number) {
     minimumFractionDigits: fractionDigits,
     maximumFractionDigits: fractionDigits,
   }).format(value);
+}
+
+function getOptimalEntryPrice(decision: { optimal_entry_price?: number | null; entry_range: number[] }) {
+  const explicit = Number(decision.optimal_entry_price);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const validEntries = decision.entry_range.filter((price) => Number.isFinite(price) && price > 0);
+  return validEntries.length > 0
+    ? validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length
+    : 0;
+}
+
+function startVisibleInterval(callback: () => void, delay: number) {
+  return window.setInterval(() => {
+    if (document.visibilityState !== "hidden") callback();
+  }, delay);
 }
 
 function formatLocalDate(value: Date) {
@@ -504,7 +529,7 @@ function DecisionMarketChartCard({ selection, platform }: { selection: DecisionM
         });
     };
     refresh();
-    const intervalId = window.setInterval(refresh, 30_000);
+    const intervalId = startVisibleInterval(refresh, 30_000);
 
     return () => {
       window.clearInterval(intervalId);
@@ -612,7 +637,7 @@ function MarketScreen({
     };
     refreshMarket();
     // 后端恢复后自动重新连接，避免用户停留在降级状态。
-    const intervalId = window.setInterval(refreshMarket, 30_000);
+    const intervalId = startVisibleInterval(refreshMarket, 30_000);
 
     return () => {
       window.clearInterval(intervalId);
@@ -634,7 +659,7 @@ function MarketScreen({
         });
     };
     refreshAnalysis();
-    const intervalId = window.setInterval(refreshAnalysis, 60_000);
+    const intervalId = startVisibleInterval(refreshAnalysis, 60_000);
 
     return () => {
       window.clearInterval(intervalId);
@@ -644,7 +669,7 @@ function MarketScreen({
 
   const direction = analysis?.direction ?? "WAIT";
   const confidence = analysis?.confidence ?? 0;
-  const entryRange = analysis?.entry_range.map(formatPrice).join("–") ?? "--";
+  const optimalEntry = analysis ? formatPrice(getOptimalEntryPrice(analysis)) : "--";
   const stopLoss = analysis ? formatPrice(analysis.stop_loss) : "--";
   const takeProfit = analysis?.take_profit.map(formatPrice).join(" / ") ?? "--";
 
@@ -876,7 +901,7 @@ function MarketScreen({
           <p>{analysis?.reasons[0] ?? "策略决策暂不可用，请稍后刷新重试。"}</p>
         </div>
         <div className="decision-metrics">
-          <div><span>入场区间</span><strong>{entryRange}</strong></div>
+          <div><span>最优入场价</span><strong>{optimalEntry}</strong></div>
           <div><span>止损</span><strong className="loss">{stopLoss}</strong></div>
           <div><span>止盈目标</span><strong>{takeProfit}</strong></div>
           <div><span>建议杠杆</span><strong>{analysis ? `${analysis.leverage}×` : "--"}</strong></div>
@@ -901,7 +926,7 @@ function MarketScreen({
 
 function getOpportunity(score: number) {
   if (score >= 90) return { label: "强交易机会", tone: "strong", hint: "信号完整，仍需按计划控制风险" };
-  if (score >= 70) return { label: "可交易", tone: "tradable", hint: "条件基本成立，等待进入计划区间" };
+  if (score >= 70) return { label: "可交易", tone: "tradable", hint: "条件基本成立，等待接近最优入场价" };
   if (score >= 50) return { label: "观察", tone: "watch", hint: "证据不足，暂不执行" };
   return { label: "禁止交易", tone: "blocked", hint: "风险或结构不满足开仓要求" };
 }
@@ -1047,7 +1072,7 @@ function DecisionScreen({
       }
     };
     void refresh(forceRefresh);
-    const intervalId = window.setInterval(() => void refresh(), 30_000);
+    const intervalId = startVisibleInterval(() => void refresh(), 30_000);
 
     return () => {
       window.clearInterval(intervalId);
@@ -1077,7 +1102,6 @@ function DecisionScreen({
   const decisionExecutable = analysis?.is_executable === true;
   const decisionStatusLabel = getDecisionStatusLabel(analysis);
   const opportunity = getOpportunity(score);
-  const entryRange = analysis?.entry_range ?? [0, 0];
   const stopLoss = analysis?.stop_loss ?? 0;
   const takeProfit = analysis?.take_profit ?? [0, 0];
   const leverage = analysis?.leverage ?? 0;
@@ -1092,11 +1116,11 @@ function DecisionScreen({
   const stopDistancePercent = (positionSizing?.stop_distance_rate ?? 0) * 100;
   const riskBudgetPercent = (positionSizing?.risk_budget_rate ?? 0) * 100;
   const risk = analysis ? riskLabels[analysis.risk] : "未生成";
-  const entryMid = (entryRange[0] + entryRange[1]) / 2;
-  const riskDistance = Math.abs(entryMid - stopLoss);
-  const rewardDistance = Math.abs(takeProfit[0] - entryMid);
+  const optimalEntryPrice = analysis ? getOptimalEntryPrice(analysis) : 0;
+  const riskDistance = Math.abs(optimalEntryPrice - stopLoss);
+  const rewardDistance = Math.abs(takeProfit[0] - optimalEntryPrice);
   const rewardRisk = riskDistance > 0 ? (rewardDistance / riskDistance).toFixed(1) : "--";
-  const entryRangeLabel = analysis ? entryRange.map(formatPrice).join(" – ") : "--";
+  const optimalEntryLabel = analysis ? formatPrice(optimalEntryPrice) : "--";
   const stopLossLabel = analysis ? formatPrice(stopLoss) : "--";
   const takeProfitLabels = analysis ? takeProfit.map(formatPrice) : ["--", "--"];
   const referencePriceLabel = analysis?.reference_price ? formatPrice(analysis.reference_price) : "--";
@@ -1193,7 +1217,7 @@ function DecisionScreen({
             </button>
           </div>
         </div>
-        <div className="opportunity-switcher" role="tablist" aria-label="AI 机会排名">
+        <div className="opportunity-switcher" role="tablist" aria-label="策略机会排名">
           {visibleCandidates.length > 0 ? visibleCandidates.map((candidate, index) => {
             const candidateIsExecuting = activeDecisions.some((item) => item.analysis.symbol === candidate.symbol);
             return (
@@ -1217,7 +1241,7 @@ function DecisionScreen({
               <span>{scanError ?? "机会扫描暂时不可用"}</span>
               <button type="button" onClick={requestManualRefresh}>重新扫描</button>
             </div>
-          ) : <div className="opportunity-loading">正在等待 AI 扫描并计算完整决策…</div>}
+          ) : <div className="opportunity-loading">正在等待策略引擎扫描并计算完整决策…</div>}
         </div>
       </section>
 
@@ -1268,7 +1292,7 @@ function DecisionScreen({
       </section>
 
       <div className="decision-filter-row">
-        <div><strong>{activeSymbol}-PERP</strong><span>{isExecuting ? "决策执行中" : selectionMode === "auto" ? "AI 当前优选" : "手动查看"}</span></div>
+        <div><strong>{activeSymbol}-PERP</strong><span>{isExecuting ? "决策执行中" : selectionMode === "auto" ? "策略当前优选" : "手动查看"}</span></div>
         <div className="timeframes" aria-label="选择分析周期">
           {(["1m", "5m", "1h", "4h", "1d"] as MarketInterval[]).map((item) => (
             <button
@@ -1303,7 +1327,7 @@ function DecisionScreen({
           </div>
         </div>
         <div className="decision-confidence-row">
-          <span>模型置信度</span><i><b style={{ width: `${confidence}%` }} /></i><strong>{confidence}%</strong>
+          <span>综合置信度</span><i><b style={{ width: `${confidence}%` }} /></i><strong>{confidence}%</strong>
         </div>
         {historyPolicy && (
           <div className="decision-history-policy" aria-label="历史决策策略">
@@ -1323,15 +1347,15 @@ function DecisionScreen({
         <div className="decision-section-title"><div><span>01</span><h2 id="execution-plan-title">执行计划{decisionRevision > 1 ? ` · V${decisionRevision}` : ""}</h2></div><em>{isExecuting ? "快照已锁定" : decisionStatusLabel}</em></div>
         {decisionRevision > 1 && previousRevision && (
           <div className="decision-revision-note">
-            <strong>因错过原入场区间重新报价</strong>
-            <span>原 V{previousRevision.revision} 入场 {previousRevision.entry_range.map(formatPrice).join(" – ")} · 止损 {formatPrice(previousRevision.stop_loss)}</span>
+            <strong>因错过原最优入场价重新报价</strong>
+            <span>原 V{previousRevision.revision} 最优入场 {formatPrice(getOptimalEntryPrice(previousRevision))} · 止损 {formatPrice(previousRevision.stop_loss)}</span>
             <small>{analysis?.revision_reason}</small>
           </div>
         )}
         <div className="execution-grid">
           <div><span>决策参考价</span><strong>{referencePriceLabel}</strong></div>
           <div><span>当前复核价</span><strong>{currentPriceLabel}</strong></div>
-          <div className="wide"><span>建议入场区间</span><strong>{entryRangeLabel}</strong></div>
+          <div className="wide"><span>最优入场价</span><strong>{optimalEntryLabel}</strong></div>
           <div><span>结构止损</span><strong className="loss">{stopLossLabel}</strong></div>
           <div><span>建议杠杆</span><strong>{leverage}×</strong></div>
           <div><span>止盈目标 1</span><strong>{takeProfitLabels[0]}</strong></div>
@@ -1410,8 +1434,8 @@ function DecisionScreen({
         </div>
         <div className="execution-confirm-risk">
           <strong>请确认风险边界</strong>
-          <span>计划入场 {entryRangeLabel} · 结构止损 {stopLossLabel}</span>
-          <small>{simulationEnabled ? "确认后按计划中间价模拟开仓，触发首个止盈或止损时自动结算盈亏。" : "确认后将固定当前决策并同步到持仓页，仅用于执行跟踪，不会向交易所下单。"}</small>
+          <span>最优入场 {optimalEntryLabel} · 结构止损 {stopLossLabel}</span>
+          <small>{simulationEnabled ? "确认后在最优入场价的有效触发范围内模拟开仓，触发首个止盈或止损时自动结算盈亏。" : "确认后将固定当前决策并同步到持仓页，仅用于执行跟踪，不会向交易所下单。"}</small>
         </div>
         <div className="execution-confirm-actions">
           <button type="button" onClick={() => setExecutionConfirmationOpen(false)}>取消</button>
@@ -1518,7 +1542,7 @@ function SecondaryScreen({
       .then(setPositionMonitors)
       .catch(() => undefined);
     refresh();
-    const intervalId = window.setInterval(refresh, 30_000);
+    const intervalId = startVisibleInterval(refresh, 30_000);
     return () => {
       window.clearInterval(intervalId);
       controller.abort();
@@ -1913,7 +1937,7 @@ function SecondaryScreen({
               </div>
             )}
             <div className="position-levels">
-              <div><span>计划入场</span><strong>{activePosition.entry_range.map(formatPrice).join(" – ")}</strong></div>
+              <div><span>最优入场</span><strong>{formatPrice(getOptimalEntryPrice(activePosition))}</strong></div>
               <div><span>{simulationWallet.enabled ? "当前有效止损" : "结构止损"}</span><strong className="loss">{formatPrice(simulatedTrade?.effectiveStopLoss ?? activePosition.stop_loss)}</strong></div>
               <div><span>止盈目标</span><strong>{simulatedTrade?.firstTargetHit ? `TP1 已完成 / ${formatPrice(activePosition.take_profit[1] ?? activePosition.take_profit[0])}` : activePosition.take_profit.map(formatPrice).join(" / ")}</strong></div>
             </div>
@@ -1985,11 +2009,12 @@ function SecondaryScreen({
                 <div><span>手续费</span><strong className="loss">{simulated ? formatUsdc(trade.fee) : formatMoney(trade.fee)}</strong></div>
                 <div><span>净盈亏</span><strong className={trade.net_pnl < 0 ? "loss" : "profit"}>{simulated ? formatUsdc(trade.net_pnl) : formatMoney(trade.net_pnl)}</strong></div>
                 {simulated && <div><span>资金费</span><strong className={(trade.funding_fee ?? 0) > 0 ? "loss" : "profit"}>{formatUsdc(trade.funding_fee ?? 0)}</strong></div>}
+                {simulated && <div><span>标准化收益</span><strong className={(trade.r_multiple ?? 0) < 0 ? "loss" : "profit"}>{(trade.r_multiple ?? 0).toFixed(2)}R</strong></div>}
               </div>
               <div className="review-plan-summary">
                 <span>原决策计划</span>
-                <p>入场 {decision.entry_range.map(formatPrice).join(" – ")} · 止损 {formatPrice(decision.stop_loss)} · {decision.leverage}×</p>
-                {simulated && <small>计划中点 {formatPrice(trade.planned_entry_price ?? trade.entry_price)} · 触发价 {formatPrice(trade.trigger_price ?? trade.entry_price)} · 滑点后成交 {formatPrice(trade.entry_price)}</small>}
+                <p>最优入场 {formatPrice(getOptimalEntryPrice(decision))} · 止损 {formatPrice(decision.stop_loss)} · {decision.leverage}×</p>
+                {simulated && <small>计划价 {formatPrice(trade.planned_entry_price ?? trade.entry_price)} · 触发价 {formatPrice(trade.trigger_price ?? trade.entry_price)} · 滑点后成交 {formatPrice(trade.entry_price)}</small>}
                 <small>{decision.reasons[0]}</small>
               </div>
               <div className="review-data-note">
@@ -2336,7 +2361,7 @@ function TradingPrototype() {
       }
     };
     void refreshServerWallets();
-    const intervalId = window.setInterval(() => void refreshServerWallets(), 30_000);
+    const intervalId = startVisibleInterval(() => void refreshServerWallets(), 30_000);
     return () => {
       window.clearInterval(intervalId);
       controller.abort();

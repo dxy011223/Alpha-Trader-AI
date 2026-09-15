@@ -394,16 +394,19 @@ def test_atr_execution_levels_use_pullback_entries_and_fixed_reward_risk():
         market, "WAIT", "low", indicators
     )
 
-    long_mid = sum(long_entry) / 2
-    short_mid = sum(short_entry) / 2
+    long_optimal = services.calculate_optimal_entry_price(market, "LONG", long_entry, indicators)
+    short_indicators = _aligned_indicators("SHORT", atr14=2, atr_percent=2)
+    short_optimal = services.calculate_optimal_entry_price(market, "SHORT", short_entry, short_indicators)
     assert long_entry == [98.5, 99.5]
+    assert long_optimal == 99.5
     assert long_stop < long_entry[0] < long_entry[1] < long_targets[0] < long_targets[1]
-    assert (long_targets[0] - long_mid) / (long_mid - long_stop) == pytest.approx(2)
-    assert (long_targets[1] - long_mid) / (long_mid - long_stop) == pytest.approx(3)
+    assert (long_targets[0] - long_optimal) / (long_optimal - long_stop) == pytest.approx(2)
+    assert (long_targets[1] - long_optimal) / (long_optimal - long_stop) == pytest.approx(3)
     assert short_entry == [100.5, 101.5]
+    assert short_optimal == 100.5
     assert short_targets[1] < short_targets[0] < short_entry[0] < short_entry[1] < short_stop
-    assert (short_mid - short_targets[0]) / (short_stop - short_mid) == pytest.approx(2)
-    assert (short_mid - short_targets[1]) / (short_stop - short_mid) == pytest.approx(3)
+    assert (short_optimal - short_targets[0]) / (short_stop - short_optimal) == pytest.approx(2)
+    assert (short_optimal - short_targets[1]) / (short_stop - short_optimal) == pytest.approx(3)
     assert wait_entry == wait_targets == [100, 100]
     assert wait_stop == 100
 
@@ -417,8 +420,10 @@ def test_execution_levels_keep_percentage_fallback_without_atr():
     entry, stop, targets = services.build_execution_levels(market, "LONG", "low")
 
     assert entry == [99.2, 99.7]
-    assert stop == 98
-    assert targets == [103.5, 107.2]
+    optimal = services.calculate_optimal_entry_price(market, "LONG", entry)
+    assert optimal == 99.45
+    assert stop == 97.461
+    assert targets == [103.428, 105.417]
 
 
 def test_decision_plan_keeps_original_levels_and_only_executes_inside_entry_range():

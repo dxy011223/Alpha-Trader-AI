@@ -47,6 +47,7 @@ export interface SimulatedCompletedTrade extends CompletedTradeRecord {
   funding_fee?: number;
   slippage_rate?: number;
   first_target_hit?: boolean;
+  r_multiple?: number;
   planned_entry_price?: number;
   trigger_price?: number;
 }
@@ -216,6 +217,7 @@ export function buildSimulationSignalKey(
     analysis.generated_at || "legacy",
     analysis.symbol,
     analysis.direction,
+    stablePrice(analysis.optimal_entry_price ?? 0),
     analysis.entry_range.map(stablePrice).join("-"),
     stablePrice(analysis.stop_loss),
     analysis.take_profit.map(stablePrice).join("-"),
@@ -254,13 +256,15 @@ export function openSimulatedTrade(
   if (analysis.direction === "WAIT") throw new Error("等待信号不能开启模拟交易");
   const validEntries = analysis.entry_range.filter((price) => Number.isFinite(price) && price > 0);
   if (validEntries.length === 0) throw new Error("决策缺少有效入场价格");
-  const plannedEntry = validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
+  const explicitEntry = Number(analysis.optimal_entry_price);
+  const plannedEntry = Number.isFinite(explicitEntry) && explicitEntry > 0
+    ? explicitEntry : validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
   const entryLow = Math.min(...validEntries);
   const entryHigh = Math.max(...validEntries);
   const currentPrice = Number(analysis.current_price);
   const hasCurrentPrice = Number.isFinite(currentPrice) && currentPrice > 0;
   if (hasCurrentPrice && (currentPrice < entryLow || currentPrice > entryHigh)) {
-    throw new Error("当前价格尚未进入决策入场区间");
+    throw new Error("当前价格尚未进入最优入场价的有效触发范围");
   }
   const triggerPrice = hasCurrentPrice ? currentPrice : plannedEntry;
   const entryPrice = applyEntrySlippage(triggerPrice, analysis.direction);
@@ -340,6 +344,8 @@ function completeSimulatedTrade(
   const fundingFee = fundingPaymentAt(trade, now);
   const netPnl = grossPnl - fee - fundingFee;
   const exitPnlPercent = netPnl / trade.allocatedAmount * 100;
+  const initialRisk = Math.abs(trade.entryPrice - trade.analysis.stop_loss)
+    * (trade.initialSize ?? trade.size);
   return {
     id: trade.id,
     decision_id: trade.id,
@@ -369,6 +375,7 @@ function completeSimulatedTrade(
     funding_fee: fundingFee,
     slippage_rate: SIMULATION_SLIPPAGE_RATE,
     first_target_hit: trade.firstTargetHit === true,
+    r_multiple: initialRisk > 0 ? netPnl / initialRisk : 0,
     max_favorable_excursion_percent: Math.max(
       trade.maxFavorableExcursionPercent ?? 0,
       exitPnlPercent,

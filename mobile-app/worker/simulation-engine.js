@@ -60,6 +60,8 @@ function completeTrade(trade, plannedExitPrice, exitReason, now) {
   const fundingFee = fundingPaymentAt(trade, now);
   const netPnl = grossPnl - fee - fundingFee;
   const pnlPercent = trade.allocatedAmount > 0 ? netPnl / trade.allocatedAmount * 100 : 0;
+  const initialRisk = Math.abs(trade.entryPrice - trade.analysis.stop_loss)
+    * (trade.initialSize ?? trade.size);
   return {
     id: trade.id,
     decision_id: trade.id,
@@ -89,6 +91,7 @@ function completeTrade(trade, plannedExitPrice, exitReason, now) {
     funding_fee: fundingFee,
     slippage_rate: SIMULATION_SLIPPAGE_RATE,
     first_target_hit: trade.firstTargetHit === true,
+    r_multiple: initialRisk > 0 ? netPnl / initialRisk : 0,
     max_favorable_excursion_percent: Math.max(trade.maxFavorableExcursionPercent ?? 0, pnlPercent),
     max_adverse_excursion_percent: Math.min(trade.maxAdverseExcursionPercent ?? 0, pnlPercent),
   };
@@ -102,11 +105,13 @@ export function openServerSimulatedTrade(analysis, timeframe, referenceBalance, 
     ? analysis.entry_range.map(Number).filter((price) => Number.isFinite(price) && price > 0)
     : [];
   if (validEntries.length === 0) throw new Error("决策缺少有效入场价格");
-  const plannedEntryPrice = validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
+  const explicitEntry = Number(analysis.optimal_entry_price);
+  const plannedEntryPrice = Number.isFinite(explicitEntry) && explicitEntry > 0
+    ? explicitEntry : validEntries.reduce((sum, price) => sum + price, 0) / validEntries.length;
   const triggerPrice = Number(analysis.current_price);
   if (!Number.isFinite(triggerPrice) || triggerPrice <= 0
     || triggerPrice < Math.min(...validEntries) || triggerPrice > Math.max(...validEntries)) {
-    throw new Error("当前价格尚未进入决策入场区间");
+    throw new Error("当前价格尚未进入最优入场价的有效触发范围");
   }
   const entryPrice = applyEntrySlippage(triggerPrice, analysis.direction);
   const requestedMargin = Number(analysis.position_sizing?.margin_amount)

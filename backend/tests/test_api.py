@@ -17,6 +17,33 @@ AUTH_HEADERS = {"Authorization": "Bearer test-owner-token-abcdefghijklmnopqrstuv
 client = TestClient(app, headers=AUTH_HEADERS)
 
 
+def test_readiness_check_reports_dependency_failures(monkeypatch):
+    class BrokenConnection:
+        def __enter__(self):
+            raise RuntimeError("数据库不可用")
+
+        def __exit__(self, *_args):
+            return False
+
+    class HealthyRedis:
+        def ping(self):
+            return True
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("app.main.engine.connect", lambda: BrokenConnection())
+    monkeypatch.setattr("app.main.Redis.from_url", lambda *_args, **_kwargs: HealthyRedis())
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "degraded",
+        "checks": {"database": "error", "redis": "ok"},
+    }
+
+
 def test_market_snapshot():
     response = client.get("/api/v1/market/BTC")
     assert response.status_code == 200
@@ -75,6 +102,10 @@ def test_ai_analysis_has_risk_controls(monkeypatch):
         "app.api.read_capital_settings",
         lambda: type("Capital", (), {"total_amount": 10_000})(),
     )
+    monkeypatch.setattr(
+        "app.api.read_current_strategy",
+        lambda: ("v-test", {"min_trade_score": 79, "trend_weight": 35}),
+    )
     response = client.post("/api/v1/ai/analyze", json={"symbol": "BTC", "timeframe": "4h"})
     payload = response.json()
     assert response.status_code == 200
@@ -86,7 +117,8 @@ def test_ai_analysis_has_risk_controls(monkeypatch):
     assert payload["source"] in {"live", "demo"}
     assert payload["analysis_engine"] == "rules"
     assert payload["analysis_model"] is None
-    assert payload["strategy_version"].startswith("v")
+    assert payload["strategy_version"] == "v-test"
+    assert payload["strategy_parameters"]["min_trade_score"] == 79
     assert sum(
         payload["strategy_parameters"][f"{factor}_weight"]
         for factor in ("trend", "structure", "capital", "macro", "news")
@@ -283,6 +315,10 @@ def test_ai_opportunities_are_ranked(monkeypatch):
     monkeypatch.setattr("app.market_scanner.get_live_markets", fake_get_live_markets)
     monkeypatch.setattr("app.market_scanner.get_candles", fake_get_candles)
     monkeypatch.setattr(
+        "app.market_scanner.read_current_strategy",
+        lambda: ("v-scan-test", {"min_trade_score": 78}),
+    )
+    monkeypatch.setattr(
         "app.market_scanner.read_capital_settings",
         lambda: type("Capital", (), {"total_amount": 10_000})(),
     )
@@ -297,10 +333,13 @@ def test_ai_opportunities_are_ranked(monkeypatch):
         [item["score"] for item in payload["opportunities"]], reverse=True
     )
     assert all(item["analysis_engine"] == "rules" for item in payload["opportunities"])
+    assert all(item["strategy_version"] == "v-scan-test" for item in payload["opportunities"])
+    assert all(item["strategy_parameters"]["min_trade_score"] == 78 for item in payload["opportunities"])
     top_opportunity = payload["opportunities"][0]
     assert top_opportunity["entry_range"][0] != top_opportunity["entry_range"][1]
+    assert top_opportunity["entry_range"][0] <= top_opportunity["optimal_entry_price"] <= top_opportunity["entry_range"][1]
     assert top_opportunity["stop_loss"] < top_opportunity["entry_range"][0]
-    assert maximum_candle_requests <= 2
+    assert maximum_candle_requests <= 3
 
 
 def test_ai_opportunities_exclude_markets_without_complete_candles(monkeypatch):

@@ -19,6 +19,7 @@ from app.simulation_wallet import read_simulation_wallet, write_simulation_walle
 from app.strategy_versions import (
     build_strategy_optimization_context,
     list_strategy_versions,
+    read_current_strategy,
     record_daily_performance,
 )
 from app.services import MarketPlatform, analyze_market, calculate_technical_indicators, get_candles, get_live_market, get_live_wallet, get_user_fills_by_time, parse_history_policy, refresh_decision_plan
@@ -337,6 +338,7 @@ async def ai_analyze(
     if market is None:
         raise HTTPException(status_code=404, detail="暂不支持该交易品种")
     total_amount = owner_capital or read_capital_settings().total_amount
+    strategy_version, strategy_parameters = await asyncio.to_thread(read_current_strategy)
     indicators = calculate_technical_indicators(candles)
     if indicators.atr_percent is not None:
         market = market.model_copy(update={"volatility": indicators.atr_percent})
@@ -345,6 +347,8 @@ async def ai_analyze(
         market,
         total_amount,
         indicators,
+        strategy_version=strategy_version,
+        strategy_parameters=strategy_parameters,
         history_policy=parse_history_policy(
             history_policy_header, payload.platform
         ),

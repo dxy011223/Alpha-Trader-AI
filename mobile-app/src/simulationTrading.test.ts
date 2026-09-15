@@ -110,19 +110,20 @@ describe("模拟交易", () => {
     expect(trade.unrealizedPnl).toBeCloseTo(-0.2);
   });
 
-  it("使用入场区间内的实际触发价成交，区间外拒绝开仓", () => {
+  it("使用最优入场价作为计划价，并仅在内部有效触发范围内成交", () => {
     const executable = {
       ...analysis("LONG"),
       entry_range: [100, 104],
+      optimal_entry_price: 101,
       current_price: 103,
     };
     const trade = openSimulatedTrade(executable, "1h", 1_000, 1);
 
-    expect(trade.plannedEntryPrice).toBe(102);
+    expect(trade.plannedEntryPrice).toBe(101);
     expect(trade.triggerPrice).toBe(103);
     expect(trade.entryPrice).toBeCloseTo(103 * (1 + SIMULATION_SLIPPAGE_RATE));
     expect(() => openSimulatedTrade({ ...executable, current_price: 105 }, "1h", 1_000, 2))
-      .toThrow("当前价格尚未进入决策入场区间");
+      .toThrow("当前价格尚未进入最优入场价的有效触发范围");
   });
 
   it("按计划和修订版本生成稳定信号键", () => {
@@ -169,6 +170,7 @@ describe("模拟交易", () => {
     expect(secondTarget.completedTrade!.exit_price).toBeLessThan(130);
     expect(secondTarget.completedTrade!.fee).toBeGreaterThan(0);
     expect(secondTarget.completedTrade!.net_pnl).toBeLessThan(secondTarget.completedTrade!.gross_pnl);
+    expect(secondTarget.completedTrade!.r_multiple).toBeGreaterThan(0);
   });
 
   it("TP1 后回撤按保本止损结束剩余仓位", () => {

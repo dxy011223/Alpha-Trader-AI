@@ -149,6 +149,7 @@ def build_ai_decision_context(
         score=0,
         score_breakdown={"trend": 0, "structure": 0, "capital": 0, "macro": 0, "news": 0},
         entry_range=[price, price],
+        optimal_entry_price=price,
         stop_loss=price,
         take_profit=[price, price],
         leverage=1,
@@ -198,6 +199,7 @@ def _apply_model_decision(
         raise ValueError("AI 可执行方向未达到当前策略评分阈值")
 
     entry_range = sorted(decision.entry_range)
+    optimal_entry_price = sum(entry_range) / 2
     take_profit = decision.take_profit
     if entry_range[0] <= 0:
         raise ValueError("AI 入场区间必须为正数")
@@ -219,8 +221,7 @@ def _apply_model_decision(
         if sizing.margin_amount != 0 or sizing.position_value != 0 or sizing.max_loss_amount != 0:
             raise ValueError("AI 观望决策不得分配仓位")
     else:
-        entry_mid = sum(entry_range) / 2
-        expected_stop_rate = abs(entry_mid - decision.stop_loss) / entry_mid
+        expected_stop_rate = abs(optimal_entry_price - decision.stop_loss) / optimal_entry_price
         expected_position_value = sizing.margin_amount * decision.leverage
         if sizing.margin_amount <= 0 or sizing.position_value <= 0:
             raise ValueError("AI 可执行决策必须给出有效仓位")
@@ -254,6 +255,7 @@ def _apply_model_decision(
         "score": score,
         "score_breakdown": breakdown,
         "entry_range": entry_range,
+        "optimal_entry_price": optimal_entry_price,
         "stop_loss": decision.stop_loss,
         "take_profit": take_profit,
         "leverage": decision.leverage,

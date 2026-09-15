@@ -6,12 +6,16 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import PositionMonitorRecord
-from app.schemas import ExecutionStateResponse, MarketSnapshot, PositionMonitorResponse
-from app.services import get_live_market
+from app.schemas import AnalysisRequest, AnalysisResponse, ExecutionStateResponse, MarketSnapshot, PositionMonitorResponse
+from app.services import analyze_market, calculate_technical_indicators, get_candles, get_live_market
 from app.trade_records import read_active_executions
 
 
-def _evaluate(state: ExecutionStateResponse, market: MarketSnapshot) -> tuple[str, float, str]:
+def _evaluate(
+    state: ExecutionStateResponse,
+    market: MarketSnapshot,
+    refreshed: AnalysisResponse | None = None,
+) -> tuple[str, float, str]:
     position = state.position
     direction_multiplier = 1 if position.direction == "LONG" else -1
     unrealized = (market.price - position.planned_entry) * position.planned_size * direction_multiplier
@@ -31,6 +35,21 @@ def _evaluate(state: ExecutionStateResponse, market: MarketSnapshot) -> tuple[st
             return "REDUCE", unrealized, "价格已触及第一止盈目标，建议分批减仓"
         if market.price <= position.planned_entry * 0.98:
             return "ADJUST_SL", unrealized, "浮盈达到约 2%，建议把止损下移至成本附近"
+    if refreshed is not None and refreshed.indicators is not None:
+        indicators = refreshed.indicators
+        ema_values = (indicators.ema20, indicators.ema50, indicators.ema200)
+        if all(value is not None for value in ema_values):
+            ema20, ema50, ema200 = ema_values
+            current_direction = (
+                "LONG" if ema20 > ema50 > ema200
+                else "SHORT" if ema20 < ema50 < ema200
+                else "WAIT"
+            )
+            if current_direction not in ("WAIT", position.direction):
+                return "EXIT", unrealized, "最新 EMA20/50/200 已形成反向排列，原决策趋势假设失效"
+            score_drop = state.decision.analysis.score - refreshed.score
+            if current_direction == "WAIT" and score_drop >= 10:
+                return "REDUCE", unrealized, f"最新均线方向不明确且评分下降 {score_drop} 分，建议降低风险敞口"
     return "HOLD", unrealized, "价格仍在计划风险边界内，继续观察"
 
 
@@ -75,15 +94,42 @@ def _save_monitor(
 
 async def monitor_active_positions(platform: str | None = None) -> list[PositionMonitorResponse]:
     states = await asyncio.to_thread(read_active_executions, platform)
-    markets = await asyncio.gather(*(
-        get_live_market(state.position.symbol, state.decision.analysis.platform)
-        for state in states
-    ))
+
+    async def load_state_market(state: ExecutionStateResponse):
+        return await asyncio.gather(
+            get_live_market(state.position.symbol, state.decision.analysis.platform),
+            get_candles(
+                state.position.symbol,
+                state.decision.timeframe,
+                220,
+                state.decision.analysis.platform,
+            ),
+        )
+
+    snapshots = await asyncio.gather(*(load_state_market(state) for state in states))
     results = []
-    for state, market in zip(states, markets, strict=True):
+    for state, (market, candles) in zip(states, snapshots, strict=True):
         if market is None:
             continue
-        action, unrealized, reason = _evaluate(state, market)
+        indicators = calculate_technical_indicators(candles)
+        refreshed = None
+        if all(value is not None for value in (indicators.ema20, indicators.ema50, indicators.ema200)):
+            if indicators.atr_percent is not None:
+                market = market.model_copy(update={"volatility": indicators.atr_percent})
+            refreshed = analyze_market(
+                AnalysisRequest(
+                    symbol=state.position.symbol,
+                    timeframe=state.decision.timeframe,
+                    platform=state.decision.analysis.platform,
+                ),
+                market,
+                state.decision.total_amount,
+                indicators,
+                strategy_version=state.decision.analysis.strategy_version,
+                strategy_parameters=state.decision.analysis.strategy_parameters,
+                history_policy=state.decision.analysis.history_policy,
+            )
+        action, unrealized, reason = _evaluate(state, market, refreshed)
         results.append(await asyncio.to_thread(
             _save_monitor,
             state,
@@ -91,6 +137,6 @@ async def monitor_active_positions(platform: str | None = None) -> list[Position
             action,
             unrealized,
             reason,
-            state.decision.analysis.score,
+            refreshed.score if refreshed is not None else state.decision.analysis.score,
         ))
     return results

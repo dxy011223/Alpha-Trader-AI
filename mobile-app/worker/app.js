@@ -25,6 +25,7 @@ const SIMULATION_EXECUTOR_WALLET_LIMIT = 30;
 const SIMULATION_MARKET_TIMEOUT_MS = 12_000;
 const SIMULATION_OPPORTUNITY_TIMEOUT_MS = 30_000;
 const SIMULATION_SCHEDULER_INTERVAL_MS = 60_000;
+const SCHEDULED_DECISION_PLATFORMS = ["hyperliquid", "binance", "okx"];
 
 function appendVary(headers, value) {
   const values = (headers.get("vary") || "").split(",").map((item) => item.trim().toLowerCase());
@@ -615,9 +616,12 @@ async function readHistoryPolicy(env, ownerId, timeframe) {
       const identity = String(row.trade_id || trade.id);
       if (seen.has(identity)) continue;
       const plannedLoss = Number(trade?.analysis?.position_sizing?.max_loss_amount);
-      const rMultiple = plannedLoss > 0
-        ? clamp(netPnl / plannedLoss, -2, 2)
-        : netPnl > 0 ? 1 : netPnl < 0 ? -1 : 0;
+      const storedRMultiple = Number(trade.r_multiple);
+      const rMultiple = Number.isFinite(storedRMultiple)
+        ? clamp(storedRMultiple, -2, 2)
+        : plannedLoss > 0
+          ? clamp(netPnl / plannedLoss, -2, 2)
+          : netPnl > 0 ? 1 : netPnl < 0 ? -1 : 0;
       const closedAt = Date.parse(trade.closed_at || row.occurred_at || "") || 0;
       seen.set(identity, { direction, netPnl, rMultiple, closedAt });
       grouped.set(platform, seen);
@@ -929,6 +933,7 @@ function simulationSignalKey(analysis, timeframe, platform) {
     analysis?.generated_at || "legacy",
     analysis?.symbol,
     analysis?.direction,
+    stableSimulationPrice(analysis?.optimal_entry_price || 0),
     (analysis?.entry_range || []).map(stableSimulationPrice).join("-"),
     stableSimulationPrice(analysis?.stop_loss),
     (analysis?.take_profit || []).map(stableSimulationPrice).join("-"),
@@ -1183,7 +1188,7 @@ async function executeSimulationWallet(env, ctx, row, now, cache) {
         entry_price: trade.entryPrice,
       }));
     } catch {
-      // 价格离开入场区间或决策字段不完整时安全跳过，等待下一次重新扫描。
+      // 价格离开最优入场价的内部触发带或决策字段不完整时安全跳过，等待下一次重新扫描。
     }
   }
 
@@ -1262,6 +1267,50 @@ async function runScheduledSimulation(env, ctx) {
   for (let index = 0; index < rows.length; index += 5) {
     await Promise.all(rows.slice(index, index + 5).map(executeClaimedWallet));
   }
+}
+
+async function runScheduledDecisionScan(env, ctx, now = Date.now()) {
+  if (!env.DB || !String(env.OWNER_API_TOKEN || "").trim()) return;
+  const ownerId = (await digest(String(env.OWNER_API_TOKEN).trim())).slice(0, 24);
+  const capital = await readCapital(env, ownerId);
+  if (!capital) return;
+  const minute = Math.floor(now / 60_000);
+  const platform = SCHEDULED_DECISION_PLATFORMS[minute % SCHEDULED_DECISION_PLATFORMS.length];
+  const timeframe = "4h";
+  // 已启用的模拟钱包会在同一轮执行中扫描机会，避免重复拉取相同行情。
+  const simulationScan = await env.DB.prepare(`
+    SELECT 1 AS enabled
+    FROM owner_simulation_wallets
+    WHERE owner_id = ? AND platform = ? AND enabled = 1 AND auto_timeframe = ?
+    LIMIT 1
+  `).bind(ownerId, platform, timeframe).first();
+  if (simulationScan) return;
+  const jobKey = `${ownerId}:decision-scan:${platform}:${timeframe}`;
+  const leaseUntil = Math.floor(now / 1000) + 55;
+  const lease = await env.DB.prepare(`
+    INSERT INTO scheduled_job_leases (job_key, lease_until, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(job_key) DO UPDATE SET
+      lease_until = excluded.lease_until,
+      updated_at = excluded.updated_at
+    WHERE scheduled_job_leases.lease_until <= ?
+  `).bind(jobKey, leaseUntil, new Date(now).toISOString(), Math.floor(now / 1000)).run();
+  if (Number(lease?.meta?.changes ?? 0) === 0) return;
+  const historyPolicy = await readHistoryPolicy(env, ownerId, timeframe);
+  const headers = new Headers({
+    "x-alpha-owner-capital": String(capital.total_amount),
+    "x-alpha-owner-id": ownerId,
+  });
+  if (historyPolicy) headers.set("x-alpha-history-policy", JSON.stringify(historyPolicy));
+  const response = await baseWorker.fetch(new Request(
+    `https://scheduled-scan.invalid/api/v1/ai/opportunities?platform=${platform}&timeframe=${timeframe}&limit=4&force_refresh=true`,
+    { headers },
+  ), env, ctx);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.detail || `${platform} 定时决策扫描失败：${response.status}`);
+  }
+  console.log(`${platform} 定时决策扫描完成`);
 }
 
 export class SimulationScheduler {
@@ -1406,12 +1455,8 @@ async function handleRequest(request, env, ctx) {
         const historyPolicy = await readHistoryPolicy(
           env, auth.ownerId, await readRequestTimeframe(request, url),
         );
-        const proxied = await proxyBackend(
-          request, env, true, capital?.total_amount, historyPolicy,
-        );
-        if (proxied?.ok || (proxied && proxied.status < 500)) return proxied;
-        if (proxied) console.error("完整后端决策暂时不可用，切换到边缘规则引擎");
         if (!capital) return json({ detail: "资金设置数据库尚未配置" }, 503);
+        // 决策固定由边缘规则引擎生成，避免后端休眠与恢复时切换到另一套计划。
         const headers = new Headers(request.headers);
         headers.set("x-alpha-owner-capital", String(capital.total_amount));
         headers.set("x-alpha-owner-id", auth.ownerId);
@@ -1437,7 +1482,14 @@ export default {
     const response = await handleRequest(request, env, ctx);
     return withAppCors(request, withHtmlNoStore(request, response));
   },
-  async scheduled(_controller, env, ctx) {
+  async scheduled(controller, env, ctx) {
+    const scheduledAt = Number(controller?.scheduledTime);
+    const now = Number.isFinite(scheduledAt) ? scheduledAt : Date.now();
+    try {
+      await runScheduledDecisionScan(env, ctx, now);
+    } catch (error) {
+      console.error("定时决策扫描失败，继续处理模拟交易", error);
+    }
     await runScheduledSimulation(env, ctx);
   },
 };

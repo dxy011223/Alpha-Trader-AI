@@ -60,6 +60,7 @@ export interface AnalysisResponse {
     news: number;
   };
   entry_range: number[];
+  optimal_entry_price?: number | null;
   stop_loss: number;
   take_profit: number[];
   leverage: number;
@@ -94,6 +95,7 @@ export interface AnalysisResponse {
   source: "live" | "demo";
   funding_rate?: number | null;
   analysis_engine: "openai" | "rules";
+  decision_engine_version?: string;
   analysis_model: string | null;
   decision_schema_version?: "ai_full_v1" | null;
   platform: MarketPlatform;
@@ -132,6 +134,7 @@ export interface AnalysisResponse {
     revision: number;
     reference_price: number | null;
     entry_range: number[];
+    optimal_entry_price?: number | null;
     stop_loss: number;
     take_profit: number[];
     leverage: number;

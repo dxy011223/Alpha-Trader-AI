@@ -9,6 +9,7 @@ function analysis(symbol: string, platform = "hyperliquid") {
     score: 80,
     score_breakdown: { trend: 24, structure: 20, capital: 16, macro: 12, news: 8 },
     entry_range: [99, 100],
+    optimal_entry_price: 99.5,
     stop_loss: 95,
     take_profit: [108, 115],
     leverage: 3,
@@ -41,7 +42,7 @@ function analysis(symbol: string, platform = "hyperliquid") {
     generated_at: "2026-09-13T00:00:00Z",
     decision_status: "executable",
     is_executable: true,
-    status_reason: "价格进入原入场区间，信号仍然有效。",
+    status_reason: "价格进入最优入场价的有效触发范围，信号仍然有效。",
   };
 }
 
@@ -406,7 +407,10 @@ test("决策页展示固定参考价、当前复核价和可执行状态", async
   await expect(page.getByText("决策参考价")).toBeVisible();
   await expect(page.getByText("当前复核价")).toBeVisible();
   await expect(page.getByRole("button", { name: /开始执行/ })).toBeEnabled();
-  await expect(page.getByText("价格进入原入场区间，信号仍然有效。")).toBeVisible();
+  await expect(page.getByText("价格进入最优入场价的有效触发范围，信号仍然有效。")).toBeVisible();
+  const optimalEntryCard = page.locator(".execution-grid .wide").filter({ hasText: "最优入场价" });
+  await expect(optimalEntryCard.getByText("最优入场价", { exact: true })).toBeVisible();
+  await expect(optimalEntryCard.getByText("99.50", { exact: true })).toBeVisible();
 });
 
 test("决策页展示错过入场后的修订版本和原计划", async ({ page }) => {
@@ -418,6 +422,7 @@ test("决策页展示错过入场后的修订版本和原计划", async ({ page 
       revision: 1,
       reference_price: 101,
       entry_range: [98, 99],
+      optimal_entry_price: 98.5,
       stop_loss: 94,
       take_profit: [107, 114],
       leverage: 3,
@@ -443,8 +448,8 @@ test("决策页展示错过入场后的修订版本和原计划", async ({ page 
   await page.locator(".bottom-nav button").nth(1).click();
 
   await expect(page.getByRole("heading", { name: "执行计划 · V2" })).toBeVisible();
-  await expect(page.getByText("因错过原入场区间重新报价")).toBeVisible();
-  await expect(page.getByText(/原 V1 入场/)).toBeVisible();
+  await expect(page.getByText("因错过原最优入场价重新报价")).toBeVisible();
+  await expect(page.getByText(/原 V1 最优入场/)).toBeVisible();
 });
 
 test("缺少访问令牌时显示账号密码登录且不发送 AI 扫描请求", async ({ page }) => {

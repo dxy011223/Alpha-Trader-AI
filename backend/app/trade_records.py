@@ -95,8 +95,10 @@ def create_execution(payload: ExecutionCreate, wallet_address: str | None = None
 
         allocated = Decimal(str(analysis.position_sizing.margin_amount))
         position_value = Decimal(str(analysis.position_sizing.position_value))
-        entry_mid = Decimal(str(sum(analysis.entry_range[:2]) / 2))
-        planned_size = position_value / entry_mid if entry_mid > 0 else Decimal("0")
+        planned_entry = Decimal(str(
+            analysis.optimal_entry_price or sum(analysis.entry_range[:2]) / 2
+        ))
+        planned_size = position_value / planned_entry if planned_entry > 0 else Decimal("0")
         now = datetime.now(UTC)
         decision = TrackedDecision(
             symbol=analysis.symbol,
@@ -117,7 +119,7 @@ def create_execution(payload: ExecutionCreate, wallet_address: str | None = None
             wallet_address=wallet_address,
             symbol=analysis.symbol,
             direction=analysis.direction,
-            planned_entry=entry_mid,
+            planned_entry=planned_entry,
             planned_size=planned_size,
             leverage=analysis.leverage,
             margin_amount=allocated,

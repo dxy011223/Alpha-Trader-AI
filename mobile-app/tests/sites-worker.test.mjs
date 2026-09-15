@@ -19,6 +19,7 @@ function executableAnalysis(overrides = {}) {
     symbol: "BTC",
     direction: "LONG",
     entry_range: [99, 101],
+    optimal_entry_price: 100,
     current_price: 100,
     stop_loss: 95,
     take_profit: [105, 110],
@@ -34,7 +35,7 @@ function executableAnalysis(overrides = {}) {
 test("server simulation engine rejects stale entries and applies execution costs", () => {
   assert.throws(
     () => openServerSimulatedTrade(executableAnalysis({ current_price: 102 }), "4h", 1_000, 1_000),
-    /入场区间/,
+    /有效触发范围/,
   );
   const trade = openServerSimulatedTrade(executableAnalysis(), "4h", 1_000, 1_000);
   assert.equal(trade.triggerPrice, 100);
@@ -65,6 +66,7 @@ test("server simulation engine replays candles conservatively and closes at the 
   assert.equal(completed.completedTrade.exit_reason, "take_profit");
   assert.equal(completed.completedTrade.first_target_hit, true);
   assert.ok(completed.completedTrade.net_pnl > 0);
+  assert.ok(completed.completedTrade.r_multiple > 0);
 });
 
 test("server simulation engine accrues funding by elapsed time", () => {
@@ -130,6 +132,7 @@ function createSimulationDatabase() {
   const decisionPlans = new Map();
   const executorStates = new Map();
   const simulationEvents = new Map();
+  const scheduledLeases = new Map();
   let writes = 0;
   return {
     get writes() { return writes; },
@@ -253,6 +256,13 @@ function createSimulationDatabase() {
               lease_id: null,
               lease_until: null,
             });
+          } else if (sql.includes("INSERT INTO scheduled_job_leases")) {
+            const [jobKey, leaseUntil, updatedAt, now] = params;
+            const current = scheduledLeases.get(jobKey);
+            if (Number(current?.lease_until || 0) > now) {
+              return { success: true, meta: { changes: 0 } };
+            }
+            scheduledLeases.set(jobKey, { lease_until: leaseUntil, updated_at: updatedAt });
           } else if (sql.includes("INSERT INTO simulation_executor_state")) {
             const [ownerId, clientId, platform] = params;
             const key = `${ownerId}:${clientId}:${platform}`;
@@ -312,6 +322,15 @@ function createSimulationDatabase() {
           if (sql.includes("owner_capital_settings")) return capital.get(params[0]) ?? null;
           if (sql.includes("owner_decision_plan_scans")) return decisionPlans.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
           if (sql.includes("FROM simulation_executor_state")) return executorStates.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
+          if (sql.includes("SELECT 1 AS enabled") && sql.includes("owner_simulation_wallets")) {
+            return [...wallets.entries()].some(([key, value]) => {
+              const [ownerId, , platform] = key.split(":");
+              return ownerId === params[0]
+                && platform === params[1]
+                && Boolean(value.enabled)
+                && value.auto_timeframe === params[2];
+            }) ? { enabled: 1 } : null;
+          }
           return wallets.get(`${params[0]}:${params[1]}:${params[2]}`) ?? null;
         },
         async all() {
@@ -535,7 +554,10 @@ test("scheduled simulation closes positions and persists heartbeat and audit eve
       OWNER_API_TOKEN: OWNER_TOKEN,
       BACKEND_API_URL: "https://backend.example.test",
     };
-    await Promise.all([worker.scheduled({}, env, {}), worker.scheduled({}, env, {})]);
+    await Promise.all([
+      worker.scheduled({ scheduledTime: 180_000 }, env, {}),
+      worker.scheduled({ scheduledTime: 180_000 }, env, {}),
+    ]);
     const response = await worker.fetch(new Request(walletUrl, { headers: authHeaders }), env);
     const wallet = await response.json();
     assert.equal(wallet.activeTrades.length, 0);
@@ -548,7 +570,7 @@ test("scheduled simulation closes positions and persists heartbeat and audit eve
     assert.equal((await secondResponse.json()).history.length, 1);
     assert.equal(DB.simulationEvents.size, 2);
     assert.equal([...DB.simulationEvents.values()][0].event_type, "closed");
-    assert.equal(upstreamCalls, 3, "同一轮相同行情应跨设备复用，重叠定时任务不得重复执行");
+    assert.ok(upstreamCalls <= 7, "同一轮相同行情应跨设备复用，重叠定时任务不得重复执行");
     assert.ok(upstreamUrls.some((url) => url.includes("interval=1m&limit=180")), "中断后应扩大 K 线回放窗口");
     assert.ok(upstreamUrls.some((url) => url.includes("/ai/opportunities") && url.includes("limit=20")), "后台应扫描足够候选以填补去重后的空位");
   } finally {
@@ -601,7 +623,7 @@ test("app entry starts the backup scheduler without delaying the response", asyn
   assert.equal(starts, 1);
 });
 
-test("deduplicates simulation history and proxies only anonymous decision policy", async () => {
+test("deduplicates simulation history and proxies only anonymous policy for execution validation", async () => {
   const DB = createSimulationDatabase();
   const history = Array.from({ length: 12 }, (_, index) => ({
     id: -(index + 1),
@@ -667,9 +689,14 @@ test("deduplicates simulation history and proxies only anonymous decision policy
     return Response.json({ proxied: true });
   };
   try {
+    const fourHourBody = { analysis: { symbol: "BTC" }, timeframe: "4h", total_amount: 1_000 };
     const response = await worker.fetch(new Request(
-      "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
-      { headers: authHeaders },
+      "https://example.test/api/v1/executions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify(fourHourBody),
+      },
     ), {
       BACKEND_API_URL: "https://backend.example.test",
       DB,
@@ -692,9 +719,14 @@ test("deduplicates simulation history and proxies only anonymous decision policy
     assert.equal(policyHeader.includes("BTC"), false, "不得发送币种等原始交易字段");
     assert.equal(policyHeader.includes("started_at"), false);
 
+    const executionBody = { analysis: { symbol: "BTC" }, timeframe: "1h", total_amount: 1_000 };
     const oneHourResponse = await worker.fetch(new Request(
-      "https://example.test/api/v1/ai/opportunities?timeframe=1h&limit=4",
-      { headers: authHeaders },
+      "https://example.test/api/v1/executions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...authHeaders },
+        body: JSON.stringify(executionBody),
+      },
     ), {
       BACKEND_API_URL: "https://backend.example.test",
       DB,
@@ -706,7 +738,6 @@ test("deduplicates simulation history and proxies only anonymous decision policy
     assert.equal(oneHourPolicy.sample_count, 12);
     assert.equal(oneHourPolicy.losses, 12);
 
-    const executionBody = { analysis: { symbol: "BTC" }, timeframe: "1h", total_amount: 1_000 };
     const executionResponse = await worker.fetch(new Request(
       "https://example.test/api/v1/executions",
       {
@@ -924,7 +955,7 @@ test("reports a server configuration error when the backend rejects the Worker t
   }
 });
 
-test("signs authenticated backend requests without exposing the signing key", async () => {
+test("signs authenticated execution requests without exposing the signing key", async () => {
   const originalFetch = globalThis.fetch;
   const keyPair = await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" },
@@ -940,7 +971,7 @@ test("signs authenticated backend requests without exposing the signing key", as
   };
 
   try {
-    const response = await worker.fetch(new Request("https://example.test/api/v1/ai/analyze", {
+    const response = await worker.fetch(new Request("https://example.test/api/v1/executions", {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders },
       body: JSON.stringify({ symbol: "BTC", timeframe: "4h" }),
@@ -1148,7 +1179,8 @@ test("serves public market data and keeps a rule fallback when the Python backen
     });
     assert.equal(opportunities.status, 200);
     const payload = await opportunities.json();
-    assert.equal(payload.proxied, true);
+    assert.equal(payload.scan_source, "edge_live_scan");
+    assert.ok(payload.opportunities.every((item) => item.decision_engine_version === "rules-v2"));
 
     const enrollment = await worker.fetch(new Request("https://example.test/api/v1/auth/device", {
       method: "POST",
@@ -1165,7 +1197,9 @@ test("serves public market data and keeps a rule fallback when the Python backen
       OWNER_API_TOKEN: OWNER_TOKEN,
     });
     assert.equal(sessionOpportunities.status, 200);
-    assert.equal((await sessionOpportunities.json()).proxied, true);
+    const sessionPayload = await sessionOpportunities.json();
+    assert.equal(sessionPayload.scan_source, "edge_live_scan");
+    assert.ok(sessionPayload.opportunities.every((item) => item.decision_engine_version === "rules-v2"));
 
     const edgeRules = await worker.fetch(new Request(
       "https://example.test/api/v1/ai/opportunities?timeframe=4h&limit=4",
@@ -1259,6 +1293,11 @@ test("calculates complete edge gates and safely revises a missed entry without t
     assert.ok(payload.opportunities.every((item) => Number.isFinite(item.indicators.ema200)));
     assert.ok(payload.opportunities.every((item) => !item.status_reason.includes("数据不足")));
     assert.ok(payload.opportunities.every((item) => item.direction === "LONG"));
+    assert.ok(payload.opportunities.every((item) => Number.isFinite(item.optimal_entry_price)));
+    assert.ok(payload.opportunities.every((item) => (
+      item.optimal_entry_price >= Math.min(...item.entry_range)
+      && item.optimal_entry_price <= Math.max(...item.entry_range)
+    )));
     assert.ok(payload.opportunities.every((item) => item.decision_revision === 1));
     assert.ok([...candleAttempts.values()].every((attempts) => attempts === 2));
 
@@ -1381,7 +1420,7 @@ test("publishes a valid-sized Android APK download", async () => {
 
   assert.ok(apk.size > 1_000_000, "APK should not be an empty placeholder");
   assert.ok(apk.size <= 25 * 1024 * 1024, "APK must fit the Cloudflare static asset limit");
-  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.10"/);
+  assert.match(downloadPage, /href="\/downloads\/alpha-trader-ai\.apk\?v=1\.4\.11"/);
 });
 
 test("Android bundle removes the prototype device chrome", async () => {

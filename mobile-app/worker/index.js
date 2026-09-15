@@ -2,6 +2,7 @@ const HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info";
 const BINANCE_FUTURES_URL = "https://fapi.binance.com";
 const OKX_API_URL = "https://www.okx.com";
 const CORE_SYMBOLS = ["BTC", "ETH", "SOL", "HYPE"];
+const DECISION_ENGINE_VERSION = "rules-v2";
 const STRATEGY_PARAMETERS = {
   min_trade_score: 70,
   trend_weight: 30,
@@ -22,7 +23,9 @@ const MAX_TARGET_PROGRESS = 0.5;
 const CANDLE_REQUEST_MAX_ATTEMPTS = 3;
 const CANDLE_RETRY_BASE_MS = 400;
 const CANDLE_RETRY_MAX_MS = 3_000;
-const CANDLE_FETCH_CONCURRENCY = 2;
+const CANDLE_FETCH_CONCURRENCY = 3;
+const INDICATOR_CANDIDATE_MINIMUM = 24;
+const INDICATOR_CANDIDATE_MULTIPLIER = 6;
 const CANDLE_RETRIABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const DECISION_SCAN_CACHE_MS = 360_000;
 const TECHNICAL_RULES = {
@@ -395,12 +398,13 @@ function roundPrice(value) {
   return Number(value.toFixed(digits));
 }
 
-function positionSizing({ direction, confidence, risk, entryRange, stopLoss, leverage, totalAmount, riskMultiplier = 1 }) {
+function positionSizing({ direction, confidence, risk, entryRange, optimalEntryPrice, stopLoss, leverage, totalAmount, riskMultiplier = 1 }) {
   const marginCapRate = 0.3;
   const empty = { risk_budget_rate: 0, risk_budget_amount: 0, stop_distance_rate: 0, margin_amount: 0, position_value: 0, max_loss_amount: 0, margin_cap_rate: marginCapRate, capped: false };
   if (direction === "WAIT" || leverage <= 0) return empty;
-  const entryMid = (entryRange[0] + entryRange[1]) / 2;
-  const stopDistanceRate = entryMid > 0 ? Math.abs(entryMid - stopLoss) / entryMid : 0;
+  const entryPrice = Number(optimalEntryPrice) > 0
+    ? Number(optimalEntryPrice) : (entryRange[0] + entryRange[1]) / 2;
+  const stopDistanceRate = entryPrice > 0 ? Math.abs(entryPrice - stopLoss) / entryPrice : 0;
   if (stopDistanceRate <= 0) return empty;
   const baseRiskRate = { low: 0.01, medium: 0.0075, high: 0.005 }[risk] ?? 0.005;
   const riskBudgetRate = baseRiskRate * Math.max(0, Math.min(confidence, 100)) / 100
@@ -418,10 +422,18 @@ function positionSizing({ direction, confidence, risk, entryRange, stopLoss, lev
   };
 }
 
+function calculateOptimalEntryPrice(market, direction, entryRange, indicators) {
+  if (direction === "WAIT" || entryRange.length < 2) return roundPrice(market.price);
+  const [entryLow, entryHigh] = [...entryRange].sort((left, right) => left - right);
+  const ema20 = Number(indicators?.ema20);
+  const target = Number.isFinite(ema20) && ema20 > 0 ? ema20 : (entryLow + entryHigh) / 2;
+  return roundPrice(Math.max(entryLow, Math.min(entryHigh, target)));
+}
+
 function buildExecutionLevels(market, direction, risk, indicators) {
   if (direction === "WAIT") {
     const reference = roundPrice(market.price);
-    return { entryRange: [reference, reference], stopLoss: reference, takeProfit: [reference, reference] };
+    return { entryRange: [reference, reference], optimalEntryPrice: reference, stopLoss: reference, takeProfit: [reference, reference] };
   }
   if (indicators?.atr14 > 0) {
     const atr = Math.max(market.price * 0.0025, Math.min(market.price * 0.03, indicators.atr14));
@@ -430,27 +442,34 @@ function buildExecutionLevels(market, direction, risk, indicators) {
       roundPrice(market.price - sign * atr * 0.75),
       roundPrice(market.price - sign * atr * 0.25),
     ].sort((left, right) => left - right);
-    const entryMid = (entryRange[0] + entryRange[1]) / 2;
+    const optimalEntryPrice = calculateOptimalEntryPrice(market, direction, entryRange, indicators);
     const riskDistance = atr * 1.25;
-    const stopLoss = roundPrice(entryMid - sign * riskDistance);
+    const stopLoss = roundPrice(optimalEntryPrice - sign * riskDistance);
     return {
       entryRange,
+      optimalEntryPrice,
       stopLoss,
       takeProfit: [
-        roundPrice(entryMid + sign * riskDistance * 2),
-        roundPrice(entryMid + sign * riskDistance * 3),
+        roundPrice(optimalEntryPrice + sign * riskDistance * 2),
+        roundPrice(optimalEntryPrice + sign * riskDistance * 3),
       ],
     };
   }
   const stopDistance = { low: 0.02, medium: 0.026, high: 0.035 }[risk] ?? 0.035;
-  return direction === "SHORT" ? {
-    entryRange: [roundPrice(market.price * 1.003), roundPrice(market.price * 1.008)],
-    stopLoss: roundPrice(market.price * (1 + stopDistance)),
-    takeProfit: [roundPrice(market.price * 0.965), roundPrice(market.price * 0.928)],
-  } : {
-    entryRange: [roundPrice(market.price * 0.992), roundPrice(market.price * 0.997)],
-    stopLoss: roundPrice(market.price * (1 - stopDistance)),
-    takeProfit: [roundPrice(market.price * 1.035), roundPrice(market.price * 1.072)],
+  const sign = direction === "LONG" ? 1 : -1;
+  const entryRange = direction === "LONG"
+    ? [roundPrice(market.price * 0.992), roundPrice(market.price * 0.997)]
+    : [roundPrice(market.price * 1.003), roundPrice(market.price * 1.008)];
+  const optimalEntryPrice = calculateOptimalEntryPrice(market, direction, entryRange, indicators);
+  const riskDistance = optimalEntryPrice * stopDistance;
+  return {
+    entryRange,
+    optimalEntryPrice,
+    stopLoss: roundPrice(optimalEntryPrice - sign * riskDistance),
+    takeProfit: [
+      roundPrice(optimalEntryPrice + sign * riskDistance * 2),
+      roundPrice(optimalEntryPrice + sign * riskDistance * 3),
+    ],
   };
 }
 
@@ -530,16 +549,16 @@ function analyzeMarket(market, totalAmount, indicators, historyPolicy = null) {
   const effectiveThreshold = Math.max(50, Math.min(90, STRATEGY_PARAMETERS.min_trade_score + thresholdAdjustment));
   if (score < effectiveThreshold) direction = "WAIT";
   const risk = market.volatility > 6 ? "high" : market.volatility > 3 ? "medium" : "low";
-  const { entryRange, stopLoss, takeProfit } = buildExecutionLevels(market, direction, risk, indicators);
+  const { entryRange, optimalEntryPrice, stopLoss, takeProfit } = buildExecutionLevels(market, direction, risk, indicators);
   const leverage = risk === "medium" ? 3 : 2;
   const generatedAt = new Date().toISOString();
   return {
     symbol: market.symbol, instrument: `${market.symbol}-PERP`, direction, confidence: score, score,
-    score_breakdown: scoreBreakdown, entry_range: entryRange, stop_loss: stopLoss,
+    score_breakdown: scoreBreakdown, entry_range: entryRange, optimal_entry_price: optimalEntryPrice, stop_loss: stopLoss,
     take_profit: takeProfit,
     leverage, risk,
     position_sizing: positionSizing({
-      direction, confidence: score, risk, entryRange, stopLoss, leverage, totalAmount,
+      direction, confidence: score, risk, entryRange, optimalEntryPrice, stopLoss, leverage, totalAmount,
       riskMultiplier: Number(historyPolicy?.risk_multiplier || 1),
     }),
     indicators,
@@ -555,6 +574,7 @@ function analyzeMarket(market, totalAmount, indicators, historyPolicy = null) {
     platform: market.platform || "hyperliquid",
     funding_rate: market.funding_rate,
     analysis_engine: "rules",
+    decision_engine_version: DECISION_ENGINE_VERSION,
     analysis_model: null,
     decision_schema_version: null,
     strategy_version: "v1",
@@ -572,7 +592,7 @@ function analyzeMarket(market, totalAmount, indicators, historyPolicy = null) {
     is_executable: false,
     status_reason: direction === "WAIT"
       ? failures.length > 0 ? `技术准入未通过：${failures.join("；")}` : "均线方向明确，但当前评分尚未达到可执行标准"
-      : "已生成固定交易计划，等待价格进入计划入场区间",
+      : "已生成固定交易计划，等待价格接近最优入场价",
   };
 }
 
@@ -589,6 +609,7 @@ function refreshDecisionPlan(
     confidence: refreshed.score,
     risk: original.risk,
     entryRange: original.entry_range,
+    optimalEntryPrice: original.optimal_entry_price,
     stopLoss: original.stop_loss,
     leverage: original.leverage,
     totalAmount,
@@ -669,9 +690,10 @@ function refreshDecisionPlan(
     const targetProgress = targetDistance > 0 ? missedDistance / targetDistance : 1;
     const atr14 = Number(refreshed.indicators?.atr14);
     const withinAtr = Number.isFinite(atr14) && atr14 > 0 && missedDistance <= atr14 * MAX_MISSED_ENTRY_ATR;
-    const newEntryMid = (refreshed.entry_range[0] + refreshed.entry_range[1]) / 2;
-    const newRiskDistance = Math.abs(newEntryMid - refreshed.stop_loss);
-    const newRewardDistance = Math.abs(refreshed.take_profit[0] - newEntryMid);
+    const newEntryPrice = Number(refreshed.optimal_entry_price)
+      || (refreshed.entry_range[0] + refreshed.entry_range[1]) / 2;
+    const newRiskDistance = Math.abs(newEntryPrice - refreshed.stop_loss);
+    const newRewardDistance = Math.abs(refreshed.take_profit[0] - newEntryPrice);
     const newRewardRisk = newRiskDistance > 0 ? newRewardDistance / newRiskDistance : 0;
     const revision = Number(original.decision_revision || 1);
     const canReprice = missedEntryCount >= MISSED_ENTRY_CONFIRMATIONS
@@ -687,6 +709,7 @@ function refreshDecisionPlan(
         revision,
         reference_price: original.reference_price ?? null,
         entry_range: original.entry_range,
+        optimal_entry_price: original.optimal_entry_price ?? null,
         stop_loss: original.stop_loss,
         take_profit: original.take_profit,
         leverage: original.leverage,
@@ -698,12 +721,13 @@ function refreshDecisionPlan(
         archive_reason: "missed_entry",
         revision_reason: original.revision_reason ?? null,
       };
-      const reason = `已生成修订版 V${nextRevision}，等待价格进入新的计划入场区间`;
+      const reason = `已生成修订版 V${nextRevision}，等待价格接近新的最优入场价`;
       return {
         ...original,
         ...refreshed,
         plan_id: original.plan_id,
         entry_range: refreshed.entry_range,
+        optimal_entry_price: refreshed.optimal_entry_price,
         stop_loss: refreshed.stop_loss,
         take_profit: refreshed.take_profit,
         leverage,
@@ -712,6 +736,7 @@ function refreshDecisionPlan(
           confidence: refreshed.score,
           risk: refreshed.risk,
           entryRange: refreshed.entry_range,
+          optimalEntryPrice: refreshed.optimal_entry_price,
           stopLoss: refreshed.stop_loss,
           leverage,
           totalAmount,
@@ -731,7 +756,7 @@ function refreshDecisionPlan(
         reasons: [reason, revisionReason, ...refreshed.reasons],
       };
     }
-    if (revision >= MAX_DECISION_REVISIONS) statusReason = "已达到最多两次重新报价（V3）上限，等待回踩当前计划区间";
+    if (revision >= MAX_DECISION_REVISIONS) statusReason = "已达到最多两次重新报价（V3）上限，等待回踩当前最优入场价";
     else if (targetProgress >= MAX_TARGET_PROGRESS) statusReason = `原目标路径已完成 ${(targetProgress * 100).toFixed(1)}%，禁止追价重新报价`;
     else if (!withinAtr) statusReason = "价格偏离超过 0.5 ATR 或 ATR 数据不足，等待回踩";
     else if (missedEntryCount < MISSED_ENTRY_CONFIRMATIONS) statusReason = "首次确认错过入场，等待下一次复核后再决定是否重新报价";
@@ -745,16 +770,16 @@ function refreshDecisionPlan(
     if (rewardRisk >= MIN_REMAINING_REWARD_RISK) {
       decisionStatus = "executable";
       isExecutable = true;
-      statusReason = `价格进入原入场区间，最新评分 ${refreshed.score} 分，剩余盈亏比 ${rewardRisk.toFixed(2)}`;
+      statusReason = `价格进入最优入场价的有效触发范围，最新评分 ${refreshed.score} 分，剩余盈亏比 ${rewardRisk.toFixed(2)}`;
     } else {
-      statusReason = `价格虽进入原入场区间，但剩余盈亏比 ${rewardRisk.toFixed(2)} 低于 ${MIN_REMAINING_REWARD_RISK}`;
+      statusReason = `价格虽接近最优入场价，但剩余盈亏比 ${rewardRisk.toFixed(2)} 低于 ${MIN_REMAINING_REWARD_RISK}`;
     }
   } else if (original.direction === "LONG" && currentPrice > entryHigh) {
-    statusReason = "价格高于原入场区间，等待回踩，禁止追涨";
+    statusReason = "价格高于最优入场价的有效触发范围，等待回踩，禁止追涨";
   } else if (original.direction === "SHORT" && currentPrice < entryLow) {
-    statusReason = "价格低于原入场区间，等待反弹，禁止追空";
+    statusReason = "价格低于最优入场价的有效触发范围，等待反弹，禁止追空";
   } else {
-    statusReason = "价格已穿过原入场区间但尚未触及止损，等待重新进入计划区间";
+    statusReason = "价格已穿过最优入场价但尚未触及止损，等待重新接近计划价";
   }
 
   return {
@@ -879,10 +904,19 @@ async function handleApi(request, url, env) {
       });
     }
     const markets = await getMarkets(platform);
-    const eligible = markets.filter((market) => market.volume >= 500_000 && market.open_interest >= 250_000);
+    const eligible = markets.filter((market) => market.volume >= 500_000
+      && (platform !== "hyperliquid" || market.open_interest >= 250_000));
+    const maximumLogVolume = Math.max(1, ...eligible.map((market) => Math.log1p(Math.max(Number(market.volume) || 0, 0))));
+    const maximumChange = Math.max(1, ...eligible.map((market) => Math.abs(Number(market.change_24h) || 0)));
     const indicatorCandidates = [...eligible]
-      .sort((left, right) => right.volume - left.volume || Math.abs(right.change_24h) - Math.abs(left.change_24h))
-      .slice(0, Math.max(limit * 2, 12));
+      .sort((left, right) => {
+        const priority = (market) => (
+          Math.log1p(Math.max(Number(market.volume) || 0, 0)) / maximumLogVolume * 0.7
+          + Math.abs(Number(market.change_24h) || 0) / maximumChange * 0.3
+        );
+        return priority(right) - priority(left);
+      })
+      .slice(0, Math.max(limit * INDICATOR_CANDIDATE_MULTIPLIER, INDICATOR_CANDIDATE_MINIMUM));
     const candlesBySymbol = new Map();
     const analyzed = await mapWithConcurrency(indicatorCandidates, CANDLE_FETCH_CONCURRENCY, async (market) => {
       const candles = await getCandles(market.symbol, timeframe, 205, platform) || [];
@@ -893,7 +927,7 @@ async function handleApi(request, url, env) {
     const refreshed = analyzed
       .filter(hasCompleteTrendData)
       .sort((a, b) => b.score - a.score)
-      .slice(0, Math.max(limit * 2, 12));
+      .slice(0, Math.max(limit * INDICATOR_CANDIDATE_MULTIPLIER, INDICATOR_CANDIDATE_MINIMUM));
     if (refreshed.length === 0) {
       const previousOpportunities = (previous?.opportunities || [])
         .filter(hasCompleteTrendData)

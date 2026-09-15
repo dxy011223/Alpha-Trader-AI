@@ -92,6 +92,7 @@ class DecisionRevisionSnapshot(BaseModel):
     revision: int = Field(ge=1, le=3)
     reference_price: float | None = None
     entry_range: list[float]
+    optimal_entry_price: float | None = None
     stop_loss: float
     take_profit: list[float]
     leverage: int
@@ -138,6 +139,7 @@ class AnalysisResponse(BaseModel):
     score: int = Field(ge=0, le=100)
     score_breakdown: ScoreBreakdown
     entry_range: list[float]
+    optimal_entry_price: float | None = None
     stop_loss: float
     take_profit: list[float]
     leverage: int
@@ -150,6 +152,7 @@ class AnalysisResponse(BaseModel):
     platform: Literal["hyperliquid", "binance", "okx"] = "hyperliquid"
     funding_rate: float | None = None
     analysis_engine: Literal["openai", "rules"] = "rules"
+    decision_engine_version: str = "rules-v2"
     analysis_model: str | None = None
     decision_schema_version: Literal["ai_full_v1"] | None = None
     strategy_version: str = "v1"
@@ -168,7 +171,7 @@ class AnalysisResponse(BaseModel):
         "watching", "confirming", "missed_entry", "executable", "invalidated", "target_reached"
     ] = "watching"
     is_executable: bool = False
-    status_reason: str = "等待进入计划入场区间"
+    status_reason: str = "等待价格接近最优入场价"
 
 
 class OpportunityScanResponse(BaseModel):

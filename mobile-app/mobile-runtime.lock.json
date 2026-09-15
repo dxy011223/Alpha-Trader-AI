@@ -26,5 +26,5 @@
   "public/assets/android/navigation-bar.svg": "077a782a3b6c2915fc518dfb4bba825c8c5861b2572f9522a7024902b9cb2850",
   "public/assets/status/status-icons.svg": "1a8bd4207cf34532ae514bdcdca693acc9a2b8ebc9d3182dc163c3e9ddcc4823",
   "public/assets/status/ios-status-icons.svg": "40e218b274d0973d519b50f42884e6e05ef0f2b6a0e46e102fda54218784466d",
-  "worker/index.js": "1ff5e723bcf48dbfbfdbc24696e12457cd17b4368c99c09437c3b34686dd31a3"
+  "worker/index.js": "237ddc6766057607a1589c37873a954137dc52d1d1f38628a9376282d9d15c98"
 }
